@@ -1,0 +1,2 @@
+#!/bin/bash
+tmux list-sessions -F '#{session_name}  (#{session_windows} win)  #{?session_attached,ATTACHED,idle}' 2>/dev/null || echo "no sessions yet"

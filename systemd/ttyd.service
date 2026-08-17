@@ -1,0 +1,17 @@
+[Unit]
+Description=ttyd web terminal -> named tmux/claude sessions
+After=network.target
+
+[Service]
+User=ubuntu
+Group=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/home/ubuntu/Code
+# -a exposes ?arg=<session> to the launched command (tmux-web attaches that session)
+ExecStart=/usr/bin/ttyd -p 7681 -i 127.0.0.1 -W -a -t fontSize=14 /usr/local/bin/tmux-web
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

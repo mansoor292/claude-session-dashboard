@@ -1,0 +1,8 @@
+#!/bin/bash
+# Launched by ttyd with -a (url-arg). ttyd passes ?arg=<name> as $1, so
+# https://term.<domain>/?arg=claude-07 attaches that specific session.
+S="${1:-claude-01}"
+# sanitize: only allow safe session-name chars
+S="$(echo "$S" | tr -cd 'A-Za-z0-9_-' | cut -c1-40)"
+[ -z "$S" ] && S="claude-01"
+exec tmux new-session -A -s "$S" -c "${CODE_ROOT:-$HOME/Code}"

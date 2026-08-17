@@ -1,0 +1,62 @@
+# Caddyfile for the Claude dev box.
+#
+# Serves a wildcard subdomain (*.dev.example.com) with a single Let's Encrypt
+# wildcard cert obtained over DNS-01. Any local port NNNN is auto-exposed at
+# https://pNNNN.dev.example.com.
+#
+# Replace before use:
+#   you@example.com          -> your ACME contact email
+#   dev.example.com          -> your own wildcard domain (one label under it)
+#   $2a$14$REPLACE_WITH_...   -> `caddy hash-password` bcrypt hash for basic auth
+#
+# DNS-01 needs the caddy-dns/route53 plugin (or your DNS provider's plugin):
+#   caddy add-package github.com/caddy-dns/route53
+# and AWS creds for a scoped IAM user in the caddy.service environment
+# (NEVER commit those — see README).
+
+{
+	email you@example.com
+}
+
+*.dev.example.com {
+	tls {
+		dns route53
+		propagation_delay 20s
+		resolvers 8.8.8.8 1.1.1.1
+	}
+
+	# code-server (VS Code in the browser)
+	@code host code.dev.example.com
+	handle @code {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	# session dashboard
+	@sessions host sessions.dev.example.com
+	handle @sessions {
+		basic_auth {
+			admin $2a$14$REPLACE_WITH_YOUR_BCRYPT_HASH
+		}
+		reverse_proxy 127.0.0.1:5000
+	}
+
+	# ttyd web terminal
+	@term host term.dev.example.com
+	handle @term {
+		basic_auth {
+			admin $2a$14$REPLACE_WITH_YOUR_BCRYPT_HASH
+		}
+		reverse_proxy 127.0.0.1:7681
+	}
+
+	# https://pNNNN.dev.example.com -> 127.0.0.1:NNNN  (serve any dev app by port)
+	# NOTE: some Caddy builds lack host_regexp; header_regexp on Host works everywhere.
+	@portproxy header_regexp phost Host ^p([0-9]+)\.dev\.example\.com$
+	handle @portproxy {
+		reverse_proxy 127.0.0.1:{re.phost.1}
+	}
+
+	handle {
+		respond "Claude dev box. sessions.* | term.* | code.* | pNNNN.* to serve a local port." 200
+	}
+}

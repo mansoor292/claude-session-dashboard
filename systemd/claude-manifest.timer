@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically capture spawned sessions into the restore manifest
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+AccuracySec=20s
+
+[Install]
+WantedBy=timers.target

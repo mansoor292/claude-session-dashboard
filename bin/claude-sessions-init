@@ -1,0 +1,9 @@
+#!/bin/bash
+# Pre-create N independent named tmux sessions (claude-01..claude-NN) at boot so
+# web clients only ever attach (avoids a create-on-every-connection race).
+DIR="${CODE_ROOT:-$HOME/Code}"
+N="${1:-20}"
+for i in $(seq -w 1 "$N"); do
+  S="claude-$i"
+  tmux has-session -t "$S" 2>/dev/null || tmux new-session -d -s "$S" -c "$DIR"
+done

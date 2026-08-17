@@ -1,0 +1,3 @@
+#!/bin/bash
+# claude-grid [name]  -> attach/create a named tmux session (default claude-01)
+exec tmux new-session -A -s "${1:-claude-01}" -c "${CODE_ROOT:-$HOME/Code}"

@@ -1,0 +1,8 @@
+[Unit]
+Description=Sync the Claude session restore manifest from live sessions
+
+[Service]
+Type=oneshot
+User=ubuntu
+Environment=HOME=/home/ubuntu
+ExecStart=/usr/bin/python3 /home/ubuntu/manifest-sync.py

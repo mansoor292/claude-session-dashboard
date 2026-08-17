@@ -1,0 +1,11 @@
+# Never commit real secrets or host-local state
+.env
+*.pem
+*.key
+relaunch_sessions.tsv
+relaunch.log
+node_modules/
+.worktrees/
+
+# Your live Caddyfile (has your bcrypt hash / real domain) — keep only the .example
+caddy/Caddyfile
