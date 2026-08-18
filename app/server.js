@@ -249,6 +249,7 @@ http.createServer((req,res)=>{
         const rcState={sent:false};
         const answer=()=>{ try{ const pane=tmux(['capture-pane','-p','-t',name]);
           if(/trust this folder/.test(pane)) tmux(['send-keys','-t',name,'1','Enter']);
+          else if(/Bypass Permissions mode/.test(pane) && /Yes, I accept/.test(pane)) tmux(['send-keys','-t',name,'2','Enter']);   // one-time per new config dir
           else if(/Teleport to Repo|Resume full session|Enter to confirm/.test(pane)) tmux(['send-keys','-t',name,'Enter']);
           else if(mode==='teleport' && !rcState.sent && !/remote-control is active/.test(pane) && /(Session resumed|bypass permissions on)/i.test(pane)){ tmux(['send-keys','-t',name,'/remote-control','Enter']); rcState.sent=true; } }catch{} };
         const sched = (mode==='teleport') ? [4000,7000,10000,13000,16000,19000,22000,25000,28000,32000,36000,40000,45000,50000,55000] : [4000,7000,10000];
