@@ -166,6 +166,45 @@ Visit `https://sessions.dev.example.com`.
   in tmux and is surfaced at `claude.ai/code/<bridge>`. Teleport is a one-way handoff —
   after it, the local copy is independent of the original cloud session.
 
+### Serving a localhost app from a session through Caddy
+
+Anything a session listens on is instantly reachable on the web — no config change, no
+restart. Caddy matches the host `pNNNN.<domain>` and reverse-proxies it to
+`127.0.0.1:NNNN`, so the subdomain is just `p` + the port number.
+
+From inside any session (a Claude session's Bash, or a plain shell):
+
+```bash
+npm run dev -- --port 3000        # Vite/Next/etc.
+# or: python3 -m http.server 8000
+# or: any server bound to a local port
+```
+
+Then open it over TLS at:
+
+```
+https://p3000.<your-domain>       # p8000.<your-domain>, etc.
+```
+
+How it's wired (`caddy/Caddyfile.example`):
+
+```caddyfile
+@portproxy header_regexp phost Host ^p([0-9]+)\.dev\.example\.com$
+handle @portproxy {
+    reverse_proxy 127.0.0.1:{re.phost.1}
+}
+```
+
+Notes:
+
+- **Bind to `127.0.0.1`** (or `0.0.0.0`) — Caddy proxies from localhost, so `127.0.0.1`
+  is enough and keeps the app off the public interface except through Caddy.
+- **Any port works**; the wildcard cert already covers `pNNNN.<domain>`, so it's HTTPS
+  with no per-app setup.
+- **These `pNNNN` hosts are NOT behind basic auth** in the template (unlike `sessions.`
+  and `term.`). Treat whatever you serve as public — add auth in your app, or a
+  `basic_auth` block on the `@portproxy` handler, if it's sensitive.
+
 ---
 
 ## Multiple Claude accounts (spillover to a second plan)
