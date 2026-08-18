@@ -51,6 +51,7 @@ function transcriptMtime(dir, sessionId, cwd){
 const NCPU = os.cpus().length;
 
 const tmux = (a) => { try { return execFileSync('tmux', a, {encoding:'utf8'}); } catch { return ''; } };
+const hasSession = (n) => { try { execFileSync('tmux', ['has-session','-t','='+n], {stdio:'ignore'}); return true; } catch { return false; } };
 const git = (a) => { try { return {code:0, out: execFileSync('git', a, {encoding:'utf8'})}; } catch(e){ return {code: e.status||1, out: ((e.stdout||'')+(e.stderr||''))}; } };
 function removeWorktree(w){
   if(!w || w.indexOf(CODE_ROOT+'/.worktrees/')!==0 || w.indexOf('..')>=0) return {ok:false,err:'not a managed worktree'};
@@ -212,7 +213,7 @@ http.createServer((req,res)=>{
     res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({bridge})); }
   if(u.pathname==='/api/accounts'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(accounts().map(a=>({id:a.id,label:a.label})))); }
   if(req.method==='POST'&&u.pathname==='/api/spawn'){
-    const repo=(u.searchParams.get('repo')||''); const name=clean(u.searchParams.get('name'))||('sess-'+Math.floor(Date.now()/1000));
+    const repo=(u.searchParams.get('repo')||''); let name=clean(u.searchParams.get('name'))||('sess-'+Math.floor(Date.now()/1000));
     const mreq=u.searchParams.get('mode');
     const mode=(mreq==='shell'||mreq==='teleport')?mreq:'claude';
     const worktree=u.searchParams.get('worktree')==='1';
@@ -225,6 +226,7 @@ http.createServer((req,res)=>{
     let ok, cwd, branch=null, err=null;
     if(mode==='teleport'){ cwd=CODE_ROOT; ok=true; }   // teleport self-selects (and clones) its repo; run from ~/Code
     else { ok = repo.startsWith(CODE_ROOT+'/') && !repo.includes('..') && fs.existsSync(repo); cwd=repo; }
+    if(ok){ const b0=name; let k=2; while(hasSession(name)){ name=b0+'-'+k; k++; } }   // guarantee a unique session name
     if(ok && worktree && mode!=='teleport'){
       if(!fs.existsSync(repo+'/.git')){ ok=false; err='not a git repo \u2014 worktree needs git'; }
       else{
@@ -238,7 +240,7 @@ http.createServer((req,res)=>{
       }
     }
     if(mode==='teleport' && !sid){ ok=false; err='cloud session id or claude.ai/code URL required'; }
-    if(ok && !tmux(['has-session','-t',name])){
+    if(ok){
       if(mode==='shell'){
         tmux(['new-session','-d','-s',name,'-c',cwd].concat(envArgs));
       } else {
@@ -408,7 +410,7 @@ loadRepos();
 async function loadAccounts(){try{const a=await(await fetch('/api/accounts')).json();const sel=document.getElementById('m_account');const row=document.getElementById('m_acctrow');if(sel){sel.innerHTML=a.map(function(x){return '<option value="'+x.id+'">'+x.label+'</option>';}).join('');}if(row)row.style.display=(a.length>1)?'':'none';}catch(e){}}
 loadAccounts();
 async function pollBridge(name){for(var i=0;i<14;i++){try{var j=await(await fetch('/api/bridge?name='+encodeURIComponent(name))).json();if(j.bridge)return j.bridge;}catch(e){}await new Promise(function(r){setTimeout(r,1500);});}return null;}
-async function doSpawn(){var mode=document.getElementById('m_mode').value;var repo=document.getElementById('m_repo').value;if(mode!=='teleport'&&!repo){alert('No repo found under ~/Code');return;}var wt=(mode==='teleport')?0:(document.getElementById('m_wt').checked?1:0);var name=(document.getElementById('m_name').value||'').trim();if(!name){alert('Enter a session name');return;}var session='';if(mode==='teleport'){session=(document.getElementById('m_session').value||'').trim();if(!session){alert('Paste the cloud session id or claude.ai/code URL to teleport');return;}}var win=null;if(mode==='claude'){win=window.open('about:blank','_blank');if(win){try{win.document.write('<title>Connecting…</title><body style="font:16px system-ui;padding:2rem;color:#334155">Launching <b>'+name+'</b> — opening its live claude.ai session…</body>');}catch(e){}}}else if(mode==='teleport'){win=window.open('${TERM}/?arg='+encodeURIComponent(name),'_blank');}var account=((document.getElementById('m_account')||{}).value)||'primary';var q='/api/spawn?repo='+encodeURIComponent(repo)+'&name='+encodeURIComponent(name)+'&mode='+mode+'&worktree='+wt+'&account='+encodeURIComponent(account)+(session?('&session='+encodeURIComponent(session)):'');var r=await(await fetch(q,{method:'POST'})).json();if(!r.ok){if(win)win.close();alert('Could not start session'+(r.err?': '+r.err:''));return;}if(win&&mode==='claude'){var b=await pollBridge(name);win.location=b?('https://claude.ai/code/'+b):('${TERM}/?arg='+encodeURIComponent(name));}closeModal();setTimeout(function(){location.reload();},1200);}
+async function doSpawn(){var mode=document.getElementById('m_mode').value;var repo=document.getElementById('m_repo').value;if(mode!=='teleport'&&!repo){alert('No repo found under ~/Code');return;}var wt=(mode==='teleport')?0:(document.getElementById('m_wt').checked?1:0);var name=(document.getElementById('m_name').value||'').trim();if(!name){alert('Enter a session name');return;}var session='';if(mode==='teleport'){session=(document.getElementById('m_session').value||'').trim();if(!session){alert('Paste the cloud session id or claude.ai/code URL to teleport');return;}}var win=(mode==='claude'||mode==='teleport')?window.open('about:blank','_blank'):null;if(win){try{win.document.write('<title>Launching…</title><body style="font:16px system-ui;padding:2rem;color:#334155">Launching <b>'+name+'</b>…</body>');}catch(e){}}var account=((document.getElementById('m_account')||{}).value)||'primary';var q='/api/spawn?repo='+encodeURIComponent(repo)+'&name='+encodeURIComponent(name)+'&mode='+mode+'&worktree='+wt+'&account='+encodeURIComponent(account)+(session?('&session='+encodeURIComponent(session)):'');var r=await(await fetch(q,{method:'POST'})).json();if(!r.ok){if(win)win.close();alert('Could not start session'+(r.err?': '+r.err:''));return;}if(win){var nm=r.name||name;if(mode==='claude'&&account==='primary'){var b=await pollBridge(nm);win.location=b?('https://claude.ai/code/'+b):('${TERM}/?arg='+encodeURIComponent(nm));}else{win.location='${TERM}/?arg='+encodeURIComponent(nm);}}closeModal();setTimeout(function(){location.reload();},1200);}
 async function killSession(n,e){e.stopPropagation();const c=document.querySelector('.card[data-name="'+CSS.escape(n)+'"]');const cwd=c?(c.dataset.cwd||''):'';const isWt=cwd.indexOf('/.worktrees/')>=0;if(!confirm('Kill session "'+n+'"?'))return;let wt=0;if(isWt){wt=confirm('This session runs in a git worktree:\\n'+cwd+'\\n\\nAlso remove the worktree and its branch?\\nUncommitted changes there will be lost.')?1:0;}let url='/api/kill?name='+encodeURIComponent(n);if(wt)url+='&worktree=1&cwd='+encodeURIComponent(cwd);await fetch(url,{method:'POST'});if(c)c.remove();}
 async function tick(){try{const d=await(await fetch('/api/sessions')).json();DATA=d;
  if(VIEW==='list'){renderList();return;}
