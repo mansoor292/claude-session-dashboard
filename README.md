@@ -6,12 +6,17 @@ over a single wildcard domain.
 
 You get:
 
-- **A session dashboard** (`app/server.js`) — a live grid of every session with its
-  Claude-set title, last output, and status. One click opens the session in a browser
-  terminal. A **+ Session** modal spawns a new **Claude** or plain **shell** session in
-  any repo, optionally isolated in its own **git worktree + branch**. Killing a
-  worktree-backed session offers to remove its worktree and branch.
-- **A CPU/RAM monitor** at `/monitor` (task-manager style).
+- **A session dashboard** (`app/server.js`) — a live **grid or sortable list** of every
+  session with its Claude-set title, last output, status, and **per-session CPU/RAM**.
+  One click opens the session in a browser terminal or its live claude.ai view.
+- **A + Session launcher** that spawns a **Claude**, plain **shell**, or **Teleport**
+  (pull a running cloud session down to the box) session in any repo — optionally
+  isolated in its own **git worktree + branch**, and under any of your Claude accounts.
+- **Launch-and-open** — starting a Claude session drops you straight into its live
+  `claude.ai/code` session once remote-control registers.
+- **Multi-account** — run sessions under a second (or third) Claude plan on the same box
+  via per-account `CLAUDE_CONFIG_DIR`; the dashboard tags each session with its account.
+- **A CPU/RAM monitor** at `/monitor` (whole-box, task-manager style).
 - **A web terminal** (ttyd) that attaches any named session by URL.
 - **VS Code in the browser** (code-server).
 - **Port publishing** — a local app on port `NNNN` is instantly live at
@@ -41,7 +46,7 @@ Encrypt **wildcard** cert (DNS-01), behind HTTP basic auth.
    │                     │
    │                     └── tmux-web → `tmux new-session -A -s <arg>`  (attach by name)
    │
-   └── reads: `tmux list-sessions` + ~/.claude/sessions/*.json
+   └── reads: tmux + ~/.claude*/sessions/*.json (all accounts) + transcript mtimes + /proc
        writes: spawn/kill tmux sessions, create/remove git worktrees
 ```
 
@@ -134,11 +139,57 @@ Visit `https://sessions.dev.example.com`.
 
 ## Using it
 
-- **Spawn a session** — click **+ Session**, choose Claude vs Shell, pick a repo,
-  optionally tick **worktree**, name it, Launch.
-- **Open a session** — click a card; it opens in the web terminal.
+- **Spawn a session** — click **+ Session**, choose the **Type** (Claude / Shell /
+  Teleport), pick a repo, optionally tick **worktree**, name it, Launch.
+  - *Claude* opens a live `claude.ai/code` tab once remote-control registers.
+  - *Shell* is a plain `bash` session (no Claude).
+  - *Teleport* pulls a running cloud session onto the box — paste its session id or
+    `claude.ai/code` URL; teleport self-selects (and clones) the matching repo.
+- **Grid ⇄ List** — toggle in the header. List is sortable by name, repo, launched,
+  **last used**, **CPU**, and **Mem** (click a column header).
+- **Open a session** — click a card/row; it opens in the web terminal (or claude.ai
+  for a remote-controlled session).
+- **Kill a session** — the ✕; a worktree-backed session offers to remove its worktree
+  and branch too.
 - **Serve a dev app** — run it on any port `NNNN`; it's live at `https://pNNNN.<domain>`.
-- **Open a repo in VS Code** — the `‹/› VS Code` link on each card.
+- **Open a repo in VS Code** — the `‹/› VS Code` link on each card/row.
+
+### How a few things work
+
+- **Per-session CPU/RAM** — the dashboard sums the whole process tree under each
+  session's tmux panes (RSS for memory; interval-sampled `/proc` ticks for CPU, shown
+  top-style as % of one core). Shown in the **list** view only.
+- **"Last used"** reflects *any* access path (terminal, remote-control, claude.ai,
+  mobile) — it's the max of tmux `session_activity` and the conversation transcript's
+  mtime, so a session you only drive from the web still updates.
+- **Launch-and-open / teleport** use Claude Code's remote-control: a local session runs
+  in tmux and is surfaced at `claude.ai/code/<bridge>`. Teleport is a one-way handoff —
+  after it, the local copy is independent of the original cloud session.
+
+---
+
+## Multiple Claude accounts (spillover to a second plan)
+
+Claude's login is scoped to one account per config dir (`~/.claude`). To run sessions
+under a **second** account on the same box — e.g. to keep going when the first hits its
+usage limit — give that account its own config dir:
+
+```bash
+# on the box, log the second account in once (interactive OAuth):
+CLAUDE_CONFIG_DIR=~/.claude-max2 claude      # then run /login as the 2nd account
+```
+
+The dashboard **auto-discovers** any `~/.claude-<name>` dir that has credentials (the
+`<name>` becomes the account's label). Once a second account exists:
+
+- the **+ Session** modal gains an **Account** picker (hidden while there's only one),
+- each session shows a small **account badge**, and
+- spawning under an account injects `CLAUDE_CONFIG_DIR` into that session so it runs on —
+  and is billed to — that plan, and appears in that account's claude.ai.
+
+Sessions from all accounts show together in one dashboard. Note this is one OS user, so
+the accounts share the filesystem — fine for your own plans, not hard isolation between
+different people.
 
 ---
 

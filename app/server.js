@@ -6,8 +6,8 @@ const { URL } = require('url');
 const path = require('path');
 const PORT = 5000;
 const HOMEDIR = process.env.HOME || '/home/ubuntu';
-// Base wildcard domain the box is served on, e.g. dev.example.com.
-// Set DEV_DOMAIN (and optionally the *_URL overrides) to your own.
+// Base wildcard domain the box is served on, e.g. dev.example.com. Set DEV_DOMAIN
+// (and optionally the *_URL overrides) to your own — see .env.example.
 const DOMAIN = process.env.DEV_DOMAIN || 'dev.example.com';
 const TERM = process.env.TERM_URL || ('https://term.' + DOMAIN);   // ttyd web terminal
 const CODE = process.env.CODE_URL || ('https://code.' + DOMAIN);   // code-server
@@ -29,6 +29,25 @@ function repos(){
   return out.sort((a,b)=>a.name.localeCompare(b.name));
 }
 const SESS_DIR = HOMEDIR + '/.claude/sessions';
+const HOME_DIR = HOMEDIR;
+// Each Claude account = one config dir. Primary is ~/.claude; extra accounts live in
+// ~/.claude-<name> (created by: CLAUDE_CONFIG_DIR=~/.claude-<name> claude  then /login).
+function accounts(){
+  const out=[{id:'primary', dir:HOME_DIR+'/.claude', label:'primary'}];
+  try{ for(const e of fs.readdirSync(HOME_DIR,{withFileTypes:true})){
+    if(e.isDirectory() && /^\.claude-[A-Za-z0-9_-]+$/.test(e.name) && fs.existsSync(HOME_DIR+'/'+e.name+'/.credentials.json'))
+      out.push({id:e.name.slice(8), dir:HOME_DIR+'/'+e.name, label:e.name.slice(8)});
+  }}catch{}
+  return out;
+}
+function accountDir(id){ const a=accounts().find(x=>x.id===id); return a?a.dir:HOME_DIR+'/.claude'; }
+// True "last used" = the conversation transcript's mtime; it updates on EVERY message
+// regardless of access path (terminal, remote-control, claude.ai, mobile) — unlike tmux
+// session_activity, which only sees local pane I/O.
+function transcriptMtime(dir, sessionId, cwd){
+  if(!sessionId || !cwd) return 0;
+  try{ return Math.floor(fs.statSync(dir+'/projects/'+cwd.replace(/\//g,'-')+'/'+sessionId+'.jsonl').mtimeMs/1000); }catch{ return 0; }
+}
 const NCPU = os.cpus().length;
 
 const tmux = (a) => { try { return execFileSync('tmux', a, {encoding:'utf8'}); } catch { return ''; } };
@@ -75,35 +94,86 @@ function stats(){
   return {cpu:cpuPct, ncpu:NCPU, memTotal, memUsed, memAvail, swapTotal, swapUsed, load, up, procs};
 }
 
+// ---- per-session CPU/RAM: sum each tmux session's whole process tree ----
+const CLK_TCK = 100;                 // USER_HZ on Linux
+let _uPrev = null;                   // { t: ms, ticks: {pid: utime+stime} }
+function _readProcs(){
+  const stat = {}, rssB = {}, children = {};
+  let pids; try { pids = fs.readdirSync('/proc').filter(f=>/^\d+$/.test(f)); } catch { return null; }
+  for (const pid of pids) {
+    let s; try { s = fs.readFileSync('/proc/'+pid+'/stat','utf8'); } catch { continue; }
+    const rp = s.lastIndexOf(')'); if (rp < 0) continue;
+    const rest = s.slice(rp+2).split(' ');       // fields after comm: state=0 ppid=1 ... utime=11 stime=12
+    const ppid = +rest[1]||0, ticks = (+rest[11]||0)+(+rest[12]||0);
+    stat[pid] = { ppid, ticks };
+    (children[ppid] = children[ppid] || []).push(+pid);
+    try { rssB[pid] = (+fs.readFileSync('/proc/'+pid+'/statm','utf8').split(' ')[1]||0) * 4096; } catch { rssB[pid] = 0; }
+  }
+  return { stat, rssB, children };
+}
+function usage(){
+  const snap = _readProcs(); if (!snap) return {};
+  const now = Date.now();
+  const dt = _uPrev ? (now - _uPrev.t)/1000 : 0;
+  const panes = tmux(['list-panes','-a','-F','#{session_name}\t#{pane_pid}']).trim();
+  const sess = {};
+  if (panes) for (const l of panes.split('\n')) { const [nm,pp]=l.split('\t'); if(nm) (sess[nm]=sess[nm]||[]).push(+pp); }
+  const out = {};
+  for (const nm in sess) {
+    const seen = new Set(); const stack = sess[nm].slice();
+    while (stack.length) { const pid = stack.pop(); if (seen.has(pid)) continue; seen.add(pid); for (const k of (snap.children[pid]||[])) stack.push(k); }
+    let mem = 0, deltaTicks = 0;
+    for (const pid of seen) {
+      const st = snap.stat[pid]; if (!st) continue;
+      mem += snap.rssB[pid] || 0;
+      if (_uPrev && _uPrev.ticks[pid] != null) { const d = st.ticks - _uPrev.ticks[pid]; if (d > 0) deltaTicks += d; }
+    }
+    let cpu = (_uPrev && dt > 0) ? (deltaTicks / CLK_TCK / dt * 100) : 0;
+    cpu = Math.max(0, Math.min(cpu, NCPU*100));
+    out[nm] = { mem: Math.round(mem/1048576), cpu: Math.round(cpu) };
+  }
+  const ticksMap = {}; for (const pid in snap.stat) ticksMap[pid] = snap.stat[pid].ticks;
+  _uPrev = { t: now, ticks: ticksMap };
+  return out;
+}
 function sessions(){
-  const out = tmux(['list-sessions','-F','#{session_name}\t#{session_windows}\t#{session_attached}']).trim();
+  const out = tmux(['list-sessions','-F','#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{session_activity}']).trim();
   const tsess = !out ? [] : out.split('\n').map(l=>{
-    const [name,wins,att]=l.split('\t');
+    const [name,wins,att,created,activity]=l.split('\t');
     const info=tmux(['display-message','-p','-t',name,'#{pane_current_command}\t#{pane_title}\t#{pane_current_path}']).trim();
     const [cmd='',rawTitle='',cwd='']=info.split('\t');
     const title=(rawTitle&&rawTitle!==HOST)?rawTitle:'';
     const cap=tmux(['capture-pane','-p','-t',name,'-S','-14']).replace(/\s+$/,'');
     const lines=cap.split('\n').map(s=>s.replace(/\s+$/,'')).filter(s=>s.length);
-    return {name,wins:+wins,attached:att==='1',cmd,title,cwd,preview:lines.slice(-3).join('\n'),running:/^(claude|node|python|vim|nano|ssh|git)/.test(cmd)};
+    return {name,wins:+wins,attached:att==='1',cmd,title,cwd,created:+created||0,activity:+activity||0,preview:lines.slice(-3).join('\n'),running:/^(claude|node|python|vim|nano|ssh|git)/.test(cmd)};
   });
   const tnames = new Set(tsess.map(x=>x.name));
   const rc = [];
-  try {
-    for (const f of fs.readdirSync(SESS_DIR)) {
+  const meta = {};   // tmux name -> {account, bridge}
+  for (const a of accounts()) {
+    let files=[]; try { files = fs.readdirSync(a.dir+'/sessions'); } catch { continue; }
+    for (const f of files) {
       if (!f.endsWith('.json')) continue;
-      let d; try { d = JSON.parse(fs.readFileSync(SESS_DIR+'/'+f,'utf8')); } catch { continue; }
-      if (!d.pid || !fs.existsSync('/proc/'+d.pid)) continue;   // process alive?
-      if (!d.bridgeSessionId) continue;                          // remote-control only
+      let d; try { d = JSON.parse(fs.readFileSync(a.dir+'/sessions/'+f,'utf8')); } catch { continue; }
+      const alive = d.pid && fs.existsSync('/proc/'+d.pid);
       const tname = (d.tmux||'').split(':')[0];
-      if (tname && tnames.has(tname)) continue;                  // already shown via tmux
+      const lu = transcriptMtime(a.dir, d.sessionId, d.cwd);
+      if (tname && tnames.has(tname)) { if(!meta[tname]) meta[tname]={account:a.id, bridge:d.bridgeSessionId||null, lastUsed:lu}; else if(lu>(meta[tname].lastUsed||0)) meta[tname].lastUsed=lu; continue; }
+      if (!alive || !d.bridgeSessionId) continue;                // rc-hosted needs alive + registered
       const nm = tname || d.name || ('rc-'+d.pid);
       if (tnames.has(nm)) continue;
       tnames.add(nm);
-      rc.push({name:nm, rc:true, bridge:d.bridgeSessionId, cwd:d.cwd||'',
+      let st; try{ st=fs.statSync(a.dir+'/sessions/'+f); }catch{ st=null; }
+      const fileAct = st?Math.floor(st.mtimeMs/1000):0;
+      rc.push({name:nm, rc:true, account:a.id, bridge:d.bridgeSessionId, cwd:d.cwd||'',
         title:(d.nameSource && d.nameSource!=='derived')?(d.name||''):'',
-        cmd:'remote-control host', status:d.status||'', wins:1, attached:false, running:true, preview:''});
+        cmd:'remote-control host', status:d.status||'', wins:1, attached:false, running:true, preview:'',
+        created: st?Math.floor((st.birthtimeMs||st.mtimeMs)/1000):0, activity: Math.max(fileAct, lu)});
     }
-  } catch {}
+  }
+  const use = usage();
+  tsess.forEach(s=>{ const m=meta[s.name]; s.account = m?m.account:'primary'; s.bridge = m?m.bridge:null; if(m && m.lastUsed>s.activity) s.activity=m.lastUsed; const u=use[s.name]; s.mem = u?u.mem:0; s.cpu = u?u.cpu:0; });
+  rc.forEach(s=>{ s.mem = 0; s.cpu = 0; });
   return tsess.concat(rc).sort((a,b)=>a.name.localeCompare(b.name));
 }
 const gb = b => (b/1073741824);
@@ -119,6 +189,7 @@ const CSS=`*{box-sizing:border-box;margin:0}body{font-family:-apple-system,Blink
  .modal[hidden]{display:none}
  .sheet{background:#0f172a;border:1px solid rgba(148,163,184,.25);border-radius:16px;padding:22px;width:min(430px,92vw);box-shadow:0 24px 70px rgba(0,0,0,.55);display:flex;flex-direction:column;gap:13px}
  .sheettitle{font-size:16px;font-weight:700;color:#e2e8f0}
+ .fldhint{text-transform:none;letter-spacing:0;font-weight:400;font-size:11px;color:#64748b;margin-top:4px}
  .fld{display:flex;flex-direction:column;gap:6px;color:#94a3b8;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em}
  .fld input,.fld select{background:rgba(15,23,42,.85);color:#e2e8f0;border:1px solid rgba(148,163,184,.32);border-radius:10px;padding:9px 11px;font-size:13.5px;font-weight:400;text-transform:none;letter-spacing:0}
  .repowrap{display:flex;gap:12px;align-items:center}
@@ -132,13 +203,29 @@ http.createServer((req,res)=>{
   const u=new URL(req.url,'http://x');
   if(req.method==='POST'&&u.pathname==='/api/new'){ const n=clean(u.searchParams.get('name'))||('session-'+Math.floor(Date.now()/1000)); tmux(['new-session','-d','-s',n,'-c',DIR]); res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({ok:true,name:n})); }
   if(u.pathname==='/api/repos'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(repos())); }
+  if(u.pathname==='/api/bridge'){ const nm=clean(u.searchParams.get('name')); let bridge=null;
+    for(const a of accounts()){ let files=[]; try{ files=fs.readdirSync(a.dir+'/sessions'); }catch{ continue; }
+      for(const f of files){ if(!f.endsWith('.json'))continue;
+        let d; try{ d=JSON.parse(fs.readFileSync(a.dir+'/sessions/'+f,'utf8')); }catch{ continue; }
+        if((d.tmux||'').split(':')[0]===nm && d.bridgeSessionId){ bridge=d.bridgeSessionId; break; } }
+      if(bridge) break; }
+    res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({bridge})); }
+  if(u.pathname==='/api/accounts'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(accounts().map(a=>({id:a.id,label:a.label})))); }
   if(req.method==='POST'&&u.pathname==='/api/spawn'){
     const repo=(u.searchParams.get('repo')||''); const name=clean(u.searchParams.get('name'))||('sess-'+Math.floor(Date.now()/1000));
-    const mode=(u.searchParams.get('mode')==='shell')?'shell':'claude';
+    const mreq=u.searchParams.get('mode');
+    const mode=(mreq==='shell'||mreq==='teleport')?mreq:'claude';
     const worktree=u.searchParams.get('worktree')==='1';
-    let ok = repo.startsWith(CODE_ROOT+'/') && !repo.includes('..') && fs.existsSync(repo);
-    let cwd=repo, branch=null, err=null;
-    if(ok && worktree){
+    const account=(u.searchParams.get('account')||'primary');
+    const cfgDir=accountDir(account);
+    const envArgs=(account!=='primary')?['-e','CLAUDE_CONFIG_DIR='+cfgDir]:[];
+    let sid=(u.searchParams.get('session')||'').trim();
+    if(sid.includes('/')) sid=(sid.split(/[?#]/)[0].split('/').filter(Boolean).pop())||'';
+    sid=sid.replace(/[^A-Za-z0-9_-]/g,'').slice(0,120);
+    let ok, cwd, branch=null, err=null;
+    if(mode==='teleport'){ cwd=CODE_ROOT; ok=true; }   // teleport self-selects (and clones) its repo; run from ~/Code
+    else { ok = repo.startsWith(CODE_ROOT+'/') && !repo.includes('..') && fs.existsSync(repo); cwd=repo; }
+    if(ok && worktree && mode!=='teleport'){
       if(!fs.existsSync(repo+'/.git')){ ok=false; err='not a git repo \u2014 worktree needs git'; }
       else{
         const wtBase=CODE_ROOT+'/.worktrees'; try{fs.mkdirSync(wtBase,{recursive:true});}catch{}
@@ -150,18 +237,25 @@ http.createServer((req,res)=>{
         else cwd=wtPath;
       }
     }
+    if(mode==='teleport' && !sid){ ok=false; err='cloud session id or claude.ai/code URL required'; }
     if(ok && !tmux(['has-session','-t',name])){
       if(mode==='shell'){
-        tmux(['new-session','-d','-s',name,'-c',cwd]);
+        tmux(['new-session','-d','-s',name,'-c',cwd].concat(envArgs));
       } else {
-        tmux(['new-session','-d','-s',name,'-c',cwd, CLAUDE_BIN+" --remote-control '"+name+"' --dangerously-skip-permissions"]);
+        const cmd = (mode==='teleport')
+          ? CLAUDE_BIN+" --teleport '"+sid+"' --remote-control '"+name+"' --dangerously-skip-permissions"
+          : CLAUDE_BIN+" --remote-control '"+name+"' --dangerously-skip-permissions";
+        tmux(['new-session','-d','-s',name,'-c',cwd].concat(envArgs).concat([cmd]));
+        const rcState={sent:false};
         const answer=()=>{ try{ const pane=tmux(['capture-pane','-p','-t',name]);
           if(/trust this folder/.test(pane)) tmux(['send-keys','-t',name,'1','Enter']);
-          else if(/Resume full session|Enter to confirm/.test(pane)) tmux(['send-keys','-t',name,'Enter']); }catch{} };
-        [4000,7000,10000].forEach(t=>setTimeout(answer,t));
+          else if(/Teleport to Repo|Resume full session|Enter to confirm/.test(pane)) tmux(['send-keys','-t',name,'Enter']);
+          else if(mode==='teleport' && !rcState.sent && !/remote-control is active/.test(pane) && /(Session resumed|bypass permissions on)/i.test(pane)){ tmux(['send-keys','-t',name,'/remote-control','Enter']); rcState.sent=true; } }catch{} };
+        const sched = (mode==='teleport') ? [4000,7000,10000,13000,16000,19000,22000,25000,28000,32000,36000,40000,45000,50000,55000] : [4000,7000,10000];
+        sched.forEach(t=>setTimeout(answer,t));
       }
     }
-    res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({ok,name,mode,cwd,branch,err}));
+    res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({ok,name,mode,cwd,sid,branch,err}));
   }
   if(req.method==='POST'&&u.pathname==='/api/kill'){ const n=clean(u.searchParams.get('name')); const rmwt=u.searchParams.get('worktree')==='1'; const cwd=u.searchParams.get('cwd')||''; if(n) tmux(['kill-session','-t',n]); let wt=null; if(rmwt) wt=removeWorktree(cwd); res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({ok:true,wt})); }
   if(u.pathname==='/api/sessions'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(sessions())); }
@@ -216,8 +310,10 @@ render(INIT);tick();setInterval(tick,2000);
 
   // ---- Sessions page ----
   const s=sessions();
-  const rccard=x=>`<div class="card rc" data-name="${esc(x.name)}"><div class=body onclick="window.open('https://claude.ai/code/${esc(x.bridge)}','_blank')"><div class=row><span class=name>${esc(x.name)}</span><span class="pill rc">RC</span></div><div class=ctitle ${x.title?'':'hidden'}>${esc(x.title)}</div><div class=cmd>▶ ${esc(x.cmd)}${x.status?' · '+esc(x.status):''}</div><pre class=preview><span class=e>rc-hosted · not in tmux · opens in claude.ai</span></pre><div class=meta>claude.ai ↗ <a class=vscode href="${CODE}/?folder=${encodeURIComponent(x.cwd||HOMEDIR)}" target=_blank rel=noopener onclick="event.stopPropagation()">‹/› VS Code</a></div></div></div>`;
-  const card=x=> x.rc ? rccard(x) : `<div class="card ${x.attached?'on':''}" data-name="${esc(x.name)}" data-cwd="${esc(x.cwd||'')}"><button class=kill title="kill session" onclick="killSession('${esc(x.name)}',event)">✕</button><div class=body onclick="open_('${encodeURIComponent(x.name)}')"><div class=row><span class=name>${esc(x.name)}</span><span class="pill ${x.attached?'live':'idle'}">${x.attached?'LIVE':'idle'}</span></div><div class=ctitle ${x.title?'':'hidden'}>${esc(x.title)}</div><div class=cmd>${x.running?'▶':'○'} ${esc(x.cmd||'shell')}</div><pre class=preview>${esc(x.preview)||'<span class=e>— no output yet —</span>'}</pre><div class=meta>${x.wins} win · open ↗ <a class=vscode href="${CODE}/?folder=${encodeURIComponent(x.cwd||HOMEDIR)}" target=_blank rel=noopener onclick="event.stopPropagation()">‹/› VS Code</a></div></div></div>`;
+  const multiAcct = accounts().length>1;
+  const acctBadge = x => (multiAcct && x.account) ? `<span class="pill acct">${esc(x.account)}</span>` : '';
+  const rccard=x=>`<div class="card rc" data-name="${esc(x.name)}"><div class=body onclick="window.open('https://claude.ai/code/${esc(x.bridge)}','_blank')"><div class=row><span class=name>${esc(x.name)}</span>${acctBadge(x)}<span class="pill rc">RC</span></div><div class=ctitle ${x.title?'':'hidden'}>${esc(x.title)}</div><div class=cmd>▶ ${esc(x.cmd)}${x.status?' · '+esc(x.status):''}</div><pre class=preview><span class=e>rc-hosted · not in tmux · opens in claude.ai</span></pre><div class=meta>claude.ai ↗ <a class=vscode href="${CODE}/?folder=${encodeURIComponent(x.cwd||HOMEDIR)}" target=_blank rel=noopener onclick="event.stopPropagation()">‹/› VS Code</a></div></div></div>`;
+  const card=x=> x.rc ? rccard(x) : `<div class="card ${x.attached?'on':''}" data-name="${esc(x.name)}" data-cwd="${esc(x.cwd||'')}"><button class=kill title="kill session" onclick="killSession('${esc(x.name)}',event)">✕</button><div class=body onclick="open_('${encodeURIComponent(x.name)}')"><div class=row><span class=name>${esc(x.name)}</span>${acctBadge(x)}<span class="pill ${x.attached?'live':'idle'}">${x.attached?'LIVE':'idle'}</span></div><div class=ctitle ${x.title?'':'hidden'}>${esc(x.title)}</div><div class=cmd>${x.running?'▶':'○'} ${esc(x.cmd||'shell')}</div><pre class=preview>${esc(x.preview)||'<span class=e>— no output yet —</span>'}</pre><div class=meta>${x.wins} win · open ↗ <a class=vscode href="${CODE}/?folder=${encodeURIComponent(x.cwd||HOMEDIR)}" target=_blank rel=noopener onclick="event.stopPropagation()">‹/› VS Code</a>${x.bridge?` · <a class=vscode href="https://claude.ai/code/${esc(x.bridge)}" target=_blank rel=noopener onclick="event.stopPropagation()">claude.ai ↗</a>`:''}</div></div></div>`;
   res.writeHead(200,{'Content-Type':'text/html'});
   res.end(`<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Claude Sessions</title>
 <style>${CSS}
@@ -233,6 +329,8 @@ render(INIT);tick();setInterval(tick,2000);
 .pill.live{color:#22c55e;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4)}
 .pill.idle{color:#64748b;background:rgba(100,116,139,.12);border:1px solid rgba(100,116,139,.3)}
  .pill.rc{color:#a78bfa;background:rgba(167,139,250,.14);border:1px solid rgba(167,139,250,.45)}
+ .pill.acct{color:#fbbf24;background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.4);margin-left:6px}
+ .lname .pill.acct{margin-left:8px;vertical-align:middle}
  .card.rc{border-color:rgba(167,139,250,.3)}
 .ctitle{margin-top:7px;font-size:15px;font-weight:650;color:#e2e8f0;line-height:1.3;word-break:break-word}.ctitle[hidden]{display:none}
 .cmd{margin-top:7px;font-size:12px;color:#7dd3fc;font-family:ui-monospace,Menlo,monospace}
@@ -240,29 +338,83 @@ render(INIT);tick();setInterval(tick,2000);
 .preview .e{color:#475569}.meta{margin-top:9px;color:#94a3b8;font-size:11.5px}
  .vscode{margin-left:8px;color:#38bdf8;text-decoration:none;font-weight:600}
  .vscode:hover{text-decoration:underline}
+ .viewtoggle{display:inline-flex;border:1px solid rgba(148,163,184,.32);border-radius:10px;overflow:hidden;margin-right:4px}
+ .viewbtn{background:transparent;color:#94a3b8;border:0;padding:8px 12px;font-size:12.5px;cursor:pointer}
+ .viewbtn.on{background:rgba(56,189,248,.16);color:#7dd3fc}
+ .viewbtn+.viewbtn{border-left:1px solid rgba(148,163,184,.32)}
+ .ltbl{width:100%;margin-top:22px;border-collapse:collapse;font-size:13px}
+ .ltbl th,.ltbl td{text-align:left;padding:10px 12px;border-bottom:1px solid rgba(148,163,184,.14)}
+ .ltbl thead th{color:#94a3b8;font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:700;position:sticky;top:0;background:#0b1220;user-select:none}
+ .ltbl th.sortable{cursor:pointer}
+ .ltbl th.sortable:hover{color:#e2e8f0}
+ .ltbl th.sortable::after{content:'';opacity:.35;margin-left:6px}
+ .ltbl th.sortable.asc::after{content:'▲';opacity:.9}
+ .ltbl th.sortable.desc::after{content:'▼';opacity:.9}
+ .ltbl tbody tr{cursor:pointer}
+ .ltbl tbody tr:hover{background:rgba(56,189,248,.07)}
+ .lname .lopen{font-weight:640;color:#e2e8f0}
+ .lname .lsub{display:block;color:#64748b;font-size:11px;margin-top:2px;font-family:ui-monospace,Menlo,monospace}
+ .lrepo{color:#7dd3fc;font-family:ui-monospace,Menlo,monospace}
+ .ltbl td.num{color:#cbd5e1;font-variant-numeric:tabular-nums;white-space:nowrap}
+ #listwrap{overflow-x:auto}
+ .cpuval{font-variant-numeric:tabular-nums}
+ .cpuval.mid{color:#fbbf24}
+ .cpuval.hi{color:#f87171;font-weight:600}
+ .lact{white-space:nowrap;text-align:right}
+ .lact .vs{color:#38bdf8;text-decoration:none;font-weight:600;margin-right:10px}
+ .lact .lkill{width:24px;height:24px;border-radius:7px;border:1px solid rgba(248,113,113,.35);background:rgba(248,113,113,.12);color:#f87171;font-size:12px;cursor:pointer;padding:0;line-height:1}
+ .lact .lkill:hover{background:#ef4444;color:#fff;border-color:#ef4444}
 </style></head><body><div class=wrap>
 <header><div><h1>🧠 Claude Sessions</h1><span class=sub>${s.length} sessions · refreshes every 4s</span></div>
-<div class=nav><a href="/" class=on>Sessions</a><a href="/monitor">📊 Monitor</a><button class=add onclick=openModal()>+ Session</button></div></header>
-<div class=grid id=g>${s.map(card).join('')}</div></div>
+<div class=nav><a href="/" class=on>Sessions</a><a href="/monitor">📊 Monitor</a><span class=viewtoggle><button class=viewbtn data-v=grid onclick="setView('grid')">▦ Grid</button><button class=viewbtn data-v=list onclick="setView('list')">☰ List</button></span><button class=add onclick=openModal()>+ Session</button></div></header>
+<div class=grid id=g>${s.map(card).join('')}</div>
+<div id=listwrap style="display:none"><table class=ltbl><thead><tr><th class=sortable data-k=name onclick="setSort('name')">Name</th><th class=sortable data-k=repo onclick="setSort('repo')">Repo</th><th class=sortable data-k=launch onclick="setSort('launch')">Launched</th><th class=sortable data-k=used onclick="setSort('used')">Last used</th><th class=sortable data-k=cpu onclick="setSort('cpu')">CPU</th><th class=sortable data-k=mem onclick="setSort('mem')">Mem</th><th>Status</th><th></th></tr></thead><tbody id=ltbody></tbody></table></div></div>
 <div id=modal class=modal hidden onclick="if(event.target===this)closeModal()"><div class=sheet>
 <div class=sheettitle>New session</div>
 <label class=fld>Name<input id=m_name type=text oninput="this.dataset.touched=1" placeholder="session name"></label>
-<label class=fld>Type<select id=m_mode><option value="claude">Claude</option><option value="shell">Shell</option></select></label>
-<label class=fld>Repo<span class=repowrap><select id=m_repo onchange="syncName()"></select><label class=wtlbl title="isolated git worktree + branch"><input type=checkbox id=m_wt> worktree</label></span></label>
+<label class=fld id=m_acctrow style="display:none">Account<select id=m_account></select><span class=fldhint>which Claude login (Max plan) runs this session</span></label>
+<label class=fld>Type<select id=m_mode onchange="onModeChange()"><option value="claude">Claude</option><option value="shell">Shell</option><option value="teleport">Teleport (cloud → box)</option></select></label>
+<label class=fld id=m_sessrow style="display:none">Cloud session<input id=m_session type=text placeholder="session id or claude.ai/code URL"><span class=fldhint>pull a running cloud session down to this box · pick the matching repo below</span></label>
+<label class=fld id=m_reporow>Repo<span class=repowrap><select id=m_repo onchange="syncName()"></select><label class=wtlbl title="isolated git worktree + branch"><input type=checkbox id=m_wt> worktree</label></span></label>
 <div class=sheetbtns><button class=ghost onclick="closeModal()">Cancel</button><button class=add onclick="doSpawn()">Launch</button></div>
 </div></div>
 <script>
 function open_(n){window.open('${TERM}/?arg='+n,'_blank');}
-function openModal(){const m=document.getElementById('modal');m.hidden=false;const n=document.getElementById('m_name');delete n.dataset.touched;syncName();setTimeout(function(){n.focus();},30);}
+var CODEBASE='${CODE}';
+var HOMEBASE='${HOMEDIR}';
+var MULTIACCT = ${accounts().length>1};
+var DATA = ${JSON.stringify(s).replace(/</g,'\\u003c')};
+var VIEW = localStorage.getItem('view')||'grid';
+var SORT = localStorage.getItem('sortk')||'used';
+var DIR  = localStorage.getItem('sortd')||'desc';
+function repoOf(x){var c=x.cwd||'';if(!c)return '';var p=c.split('/').filter(Boolean);return p[p.length-1]||'';}
+function fmtAgo(sec){if(!sec)return '—';var d=Date.now()/1000-sec;if(d<0)d=0;if(d<60)return Math.floor(d)+'s';if(d<3600)return Math.floor(d/60)+'m';if(d<86400)return Math.floor(d/3600)+'h';return Math.floor(d/86400)+'d';}
+function fmtWhen(sec){if(!sec)return 'unknown';return new Date(sec*1000).toLocaleString();}
+function fmtMem(mb){if(!mb)return '—';return mb>=1024?(mb/1024).toFixed(1)+' GB':mb+' MB';}
+function fmtCpu(x){if(x.rc)return '—';var p=x.cpu||0;var cls=p>=80?'hi':(p>=25?'mid':'');return '<span class="cpuval '+cls+'">'+p+'%</span>';}
+function esc2(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function sortData(a){var k=SORT,dir=DIR==='asc'?1:-1;return a.slice().sort(function(p,q){var x,y;if(k==='name'){x=(p.title||p.name||'').toLowerCase();y=(q.title||q.name||'').toLowerCase();}else if(k==='repo'){x=repoOf(p).toLowerCase();y=repoOf(q).toLowerCase();}else if(k==='launch'){x=p.created||0;y=q.created||0;}else if(k==='cpu'){x=p.cpu||0;y=q.cpu||0;}else if(k==='mem'){x=p.mem||0;y=q.mem||0;}else{x=p.activity||0;y=q.activity||0;}return x<y?-1*dir:(x>y?1*dir:0);});}
+function renderList(){var tb=document.getElementById('ltbody');if(!tb)return;var arr=sortData(DATA);tb.innerHTML=arr.map(function(x){var st=x.rc?'RC':(x.attached?'LIVE':'idle');var pc='pill '+(x.rc?'rc':(x.attached?'live':'idle'));return '<tr data-name="'+esc2(x.name)+'" data-cwd="'+esc2(x.cwd||'')+'" data-rc="'+(x.rc?'1':'')+'" data-bridge="'+esc2(x.bridge||'')+'"><td class=lname><span class=lopen>'+esc2(x.title||x.name)+'</span>'+((MULTIACCT&&x.account)?' <span class="pill acct">'+esc2(x.account)+'</span>':'')+'<span class=lsub>'+esc2(x.name)+'</span></td><td class=lrepo>'+esc2(repoOf(x)||'—')+'</td><td class=num title="'+esc2(fmtWhen(x.created))+'">'+fmtAgo(x.created)+'</td><td class=num title="'+esc2(fmtWhen(x.activity))+'">'+fmtAgo(x.activity)+'</td><td class="num cpu">'+fmtCpu(x)+'</td><td class=num>'+fmtMem(x.mem)+'</td><td><span class="'+pc+'">'+st+'</span></td><td class=lact>'+(x.bridge?'<a class=vs href="https://claude.ai/code/'+esc2(x.bridge)+'" target=_blank rel=noopener title="claude.ai">◎</a>':'')+'<a class=vs href="'+CODEBASE+'/?folder='+encodeURIComponent(x.cwd||HOMEBASE)+'" target=_blank rel=noopener title="VS Code">‹/›</a>'+(x.rc?'':'<button class=lkill title="kill">✕</button>')+'</td></tr>';}).join('');document.querySelectorAll('th.sortable').forEach(function(th){var k=th.dataset.k;th.classList.remove('asc','desc');if(SORT===k)th.classList.add(DIR);});}
+function setView(v){VIEW=v;localStorage.setItem('view',v);var g=document.getElementById('g'),l=document.getElementById('listwrap');if(g)g.style.display=(v==='grid')?'':'none';if(l)l.style.display=(v==='list')?'':'none';document.querySelectorAll('.viewbtn').forEach(function(b){b.classList.toggle('on',b.dataset.v===v);});if(v==='list')renderList();}
+function setSort(k){if(SORT===k){DIR=(DIR==='asc')?'desc':'asc';}else{SORT=k;DIR=(k==='name'||k==='repo')?'asc':'desc';}localStorage.setItem('sortk',SORT);localStorage.setItem('sortd',DIR);renderList();}
+function killByName(name,cwd,ev){if(ev)ev.stopPropagation();var isWt=(cwd||'').indexOf('/.worktrees/')>=0;if(!confirm('Kill session "'+name+'"?'))return;var wt=0;if(isWt){wt=confirm('This session runs in a git worktree:\\n'+cwd+'\\n\\nAlso remove the worktree and its branch?\\nUncommitted changes there will be lost.')?1:0;}var url='/api/kill?name='+encodeURIComponent(name);if(wt)url+='&worktree=1&cwd='+encodeURIComponent(cwd);fetch(url,{method:'POST'});DATA=DATA.filter(function(z){return z.name!==name;});var c=document.querySelector('.card[data-name="'+CSS.escape(name)+'"]');if(c)c.remove();renderList();}
+function openModal(){const m=document.getElementById('modal');m.hidden=false;const n=document.getElementById('m_name');delete n.dataset.touched;syncName();onModeChange();setTimeout(function(){n.focus();},30);}
+function onModeChange(){var mo=document.getElementById('m_mode').value;var row=document.getElementById('m_sessrow');if(row)row.style.display=(mo==='teleport')?'':'none';var rr=document.getElementById('m_reporow');if(rr)rr.style.display=(mo==='teleport')?'none':'';var wl=document.querySelector('.wtlbl');if(wl)wl.style.display=(mo==='teleport')?'none':'';}
 function closeModal(){document.getElementById('modal').hidden=true;}
 function syncName(){const sel=document.getElementById('m_repo');const n=document.getElementById('m_name');if(sel&&sel.value&&n&&!n.dataset.touched)n.value=sel.value.split('/').pop();}
 async function loadRepos(){try{const r=await(await fetch('/api/repos')).json();const sel=document.getElementById('m_repo');if(sel){sel.innerHTML=r.map(x=>'<option value="'+x.path+'">'+x.name+'</option>').join('');syncName();}}catch(e){}}
 loadRepos();
-async function doSpawn(){const repo=document.getElementById('m_repo').value;if(!repo){alert('No repo found under ~/Code');return;}const mode=document.getElementById('m_mode').value;const wt=document.getElementById('m_wt').checked?1:0;const name=(document.getElementById('m_name').value||'').trim();if(!name){alert('Enter a session name');return;}const q='/api/spawn?repo='+encodeURIComponent(repo)+'&name='+encodeURIComponent(name)+'&mode='+mode+'&worktree='+wt;const r=await(await fetch(q,{method:'POST'})).json();if(!r.ok){alert('Could not start session'+(r.err?': '+r.err:''));return;}closeModal();setTimeout(function(){location.reload();},1500);}
+async function loadAccounts(){try{const a=await(await fetch('/api/accounts')).json();const sel=document.getElementById('m_account');const row=document.getElementById('m_acctrow');if(sel){sel.innerHTML=a.map(function(x){return '<option value="'+x.id+'">'+x.label+'</option>';}).join('');}if(row)row.style.display=(a.length>1)?'':'none';}catch(e){}}
+loadAccounts();
+async function pollBridge(name){for(var i=0;i<14;i++){try{var j=await(await fetch('/api/bridge?name='+encodeURIComponent(name))).json();if(j.bridge)return j.bridge;}catch(e){}await new Promise(function(r){setTimeout(r,1500);});}return null;}
+async function doSpawn(){var mode=document.getElementById('m_mode').value;var repo=document.getElementById('m_repo').value;if(mode!=='teleport'&&!repo){alert('No repo found under ~/Code');return;}var wt=(mode==='teleport')?0:(document.getElementById('m_wt').checked?1:0);var name=(document.getElementById('m_name').value||'').trim();if(!name){alert('Enter a session name');return;}var session='';if(mode==='teleport'){session=(document.getElementById('m_session').value||'').trim();if(!session){alert('Paste the cloud session id or claude.ai/code URL to teleport');return;}}var win=null;if(mode==='claude'){win=window.open('about:blank','_blank');if(win){try{win.document.write('<title>Connecting…</title><body style="font:16px system-ui;padding:2rem;color:#334155">Launching <b>'+name+'</b> — opening its live claude.ai session…</body>');}catch(e){}}}else if(mode==='teleport'){win=window.open('${TERM}/?arg='+encodeURIComponent(name),'_blank');}var account=((document.getElementById('m_account')||{}).value)||'primary';var q='/api/spawn?repo='+encodeURIComponent(repo)+'&name='+encodeURIComponent(name)+'&mode='+mode+'&worktree='+wt+'&account='+encodeURIComponent(account)+(session?('&session='+encodeURIComponent(session)):'');var r=await(await fetch(q,{method:'POST'})).json();if(!r.ok){if(win)win.close();alert('Could not start session'+(r.err?': '+r.err:''));return;}if(win&&mode==='claude'){var b=await pollBridge(name);win.location=b?('https://claude.ai/code/'+b):('${TERM}/?arg='+encodeURIComponent(name));}closeModal();setTimeout(function(){location.reload();},1200);}
 async function killSession(n,e){e.stopPropagation();const c=document.querySelector('.card[data-name="'+CSS.escape(n)+'"]');const cwd=c?(c.dataset.cwd||''):'';const isWt=cwd.indexOf('/.worktrees/')>=0;if(!confirm('Kill session "'+n+'"?'))return;let wt=0;if(isWt){wt=confirm('This session runs in a git worktree:\\n'+cwd+'\\n\\nAlso remove the worktree and its branch?\\nUncommitted changes there will be lost.')?1:0;}let url='/api/kill?name='+encodeURIComponent(n);if(wt)url+='&worktree=1&cwd='+encodeURIComponent(cwd);await fetch(url,{method:'POST'});if(c)c.remove();}
-async function tick(){try{const d=await(await fetch('/api/sessions')).json();if(d.length!==document.querySelectorAll('.card').length){location.reload();return;}
+async function tick(){try{const d=await(await fetch('/api/sessions')).json();DATA=d;
+ if(VIEW==='list'){renderList();return;}
+ if(d.length!==document.querySelectorAll('.card').length){location.reload();return;}
  d.forEach(x=>{const c=document.querySelector('.card[data-name="'+CSS.escape(x.name)+'"]');if(!c||x.rc)return;const p=c.querySelector('.pill');p.className='pill '+(x.attached?'live':'idle');p.textContent=x.attached?'LIVE':'idle';c.classList.toggle('on',x.attached);const ct=c.querySelector('.ctitle');if(x.title){ct.textContent=x.title;ct.hidden=false;}else{ct.hidden=true;}c.querySelector('.cmd').textContent=(x.running?'▶ ':'○ ')+(x.cmd||'shell');c.querySelector('.preview').textContent=x.preview||'— no output yet —';});
 }catch(e){}}
 setInterval(tick,4000);
+(function(){var tb=document.getElementById('ltbody');if(tb){tb.addEventListener('click',function(e){var tr=e.target.closest('tr');if(!tr)return;var name=tr.dataset.name;if(e.target.closest('.lkill')){killByName(name,tr.dataset.cwd,e);return;}if(e.target.closest('.vs'))return;if(tr.dataset.rc){window.open('https://claude.ai/code/'+tr.dataset.bridge,'_blank');}else{open_(encodeURIComponent(name));}});}setView(VIEW);})();
 </script></body></html>`);
 }).listen(PORT,'127.0.0.1',()=>console.log('dashboard on '+PORT));
