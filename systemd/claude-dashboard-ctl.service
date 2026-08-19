@@ -1,0 +1,16 @@
+[Unit]
+Description=Dashboard control Claude session (hidden, admin tmux socket)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=ubuntu
+Group=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/session-dashboard/bin/dashboard-ctl.sh
+
+[Install]
+WantedBy=multi-user.target

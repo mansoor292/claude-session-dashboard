@@ -9,3 +9,4 @@ node_modules/
 
 # Your live Caddyfile (has your bcrypt hash / real domain) — keep only the .example
 caddy/Caddyfile
+__pycache__/

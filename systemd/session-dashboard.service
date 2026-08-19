@@ -9,7 +9,7 @@ Environment=HOME=/home/ubuntu
 # Point the dashboard at your own wildcard domain:
 Environment=DEV_DOMAIN=dev.example.com
 WorkingDirectory=/home/ubuntu/session-dashboard
-ExecStart=/usr/bin/node server.js
+ExecStart=/usr/bin/node app/server.js
 Restart=always
 RestartSec=2
 
