@@ -146,7 +146,7 @@ function sessions(){
     const cap=tmux(['capture-pane','-p','-t',name,'-S','-14']).replace(/\s+$/,'');
     const lines=cap.split('\n').map(s=>s.replace(/\s+$/,'')).filter(s=>s.length);
     return {name,wins:+wins,attached:att==='1',cmd,title,cwd,created:+created||0,activity:+activity||0,preview:lines.slice(-3).join('\n'),running:/^(claude|node|python|vim|nano|ssh|git)/.test(cmd)};
-  });
+  }).filter(x=>!(x.name||'').startsWith('_'));   // '_'-prefixed = hidden/internal (e.g. the dashboard's own control session)
   const tnames = new Set(tsess.map(x=>x.name));
   const rc = [];
   const meta = {};   // tmux name -> {account, bridge}
@@ -161,6 +161,7 @@ function sessions(){
       if (tname && tnames.has(tname)) { if(!meta[tname]) meta[tname]={account:a.id, bridge:d.bridgeSessionId||null, lastUsed:lu}; else if(lu>(meta[tname].lastUsed||0)) meta[tname].lastUsed=lu; continue; }
       if (!alive || !d.bridgeSessionId) continue;                // rc-hosted needs alive + registered
       const nm = tname || d.name || ('rc-'+d.pid);
+      if (nm.startsWith('_')) continue;                          // hidden/internal session
       if (tnames.has(nm)) continue;
       tnames.add(nm);
       let st; try{ st=fs.statSync(a.dir+'/sessions/'+f); }catch{ st=null; }

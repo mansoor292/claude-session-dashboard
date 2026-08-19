@@ -80,18 +80,21 @@ Encrypt **wildcard** cert (DNS-01), behind HTTP basic auth.
 
 ### 1. The dashboard app
 
-```bash
-mkdir -p ~/session-dashboard
-cp app/server.js ~/session-dashboard/server.js
-```
-
-Configure it via environment (see `.env.example`) — at minimum set your domain:
+The app has **no dependencies** — a single file using only Node built-ins. You can copy
+it out, or **run it straight from a clone of this repo** (recommended — the repo then *is*
+the deploy: edit `app/server.js`, restart the service, done):
 
 ```bash
-export DEV_DOMAIN=dev.example.com   # or set it in the systemd unit
+git clone https://github.com/<you>/claude-session-dashboard ~/session-dashboard
+# service runs: node app/server.js   (see systemd/session-dashboard.service)
 ```
 
-The app has **no dependencies** — it's a single file using only Node built-ins.
+Configure via environment (see `.env.example`) — at minimum set your domain, e.g. in the
+systemd unit: `Environment=DEV_DOMAIN=dev.example.com`.
+
+> **Hidden sessions:** any tmux session whose name starts with `_` is excluded from the
+> dashboard grid and from boot-restore. Use this for a control/meta session (e.g. one that
+> edits the dashboard itself), ideally on a separate tmux socket so it's fully out of view.
 
 ### 2. Helper scripts
 

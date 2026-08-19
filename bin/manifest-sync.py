@@ -12,6 +12,7 @@ for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
     try: d = json.load(open(f))
     except Exception: continue
     name = (d.get("tmux","") or "").split(":")[0]
+    if name.startswith("_"): continue             # hidden/internal session (e.g. dashboard control session)
     sid, cwd, pid = d.get("sessionId"), d.get("cwd"), d.get("pid")
     if not (name and sid and cwd): continue      # tmux-bound only (skips rc-hosted cloud sessions)
     if name == "rc-host": continue                # skip the claude rc env host itself
