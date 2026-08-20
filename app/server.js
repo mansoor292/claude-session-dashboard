@@ -138,7 +138,12 @@ function stats(){
     const out = execFileSync('ps',['-eo','pid,%cpu,%mem,rss,comm','--sort=-%cpu'],{encoding:'utf8'}).trim().split('\n').slice(1,16);
     procs = out.map(l=>{const p=l.trim().split(/\s+/); return {pid:p[0],cpu:+p[1],mem:+p[2],rss:+p[3]*1024,comm:p.slice(4).join(' ')};});
   }catch{}
-  return {cpu:cpuPct, ncpu:NCPU, memTotal, memUsed, memAvail, swapTotal, swapUsed, load, up, procs};
+  // Root fs — /home is on the same device here. bavail is what a normal user can
+  // actually claim, so used% is measured against total-minus-reserve, like df.
+  let diskTotal=0, diskUsed=0, diskAvail=0;
+  try{ const st=fs.statfsSync('/');
+    diskTotal=st.blocks*st.bsize; diskAvail=st.bavail*st.bsize; diskUsed=(st.blocks-st.bfree)*st.bsize; }catch{}
+  return {cpu:cpuPct, ncpu:NCPU, memTotal, memUsed, memAvail, swapTotal, swapUsed, diskTotal, diskUsed, diskAvail, load, up, procs};
 }
 
 // ---- per-session CPU/RAM: sum each tmux session's whole process tree ----
@@ -442,11 +447,13 @@ const col=(p)=>p<50?'#22c55e':p<80?'#f59e0b':'#ef4444';
 function gb(b){return (b/1073741824).toFixed(1);}
 function render(d){try{
  const memPct=d.memTotal?d.memUsed/d.memTotal*100:0, swapPct=d.swapTotal?d.swapUsed/d.swapTotal*100:0;
+ const diskPct=d.diskTotal?d.diskUsed/(d.diskUsed+d.diskAvail)*100:0;
  document.getElementById('meta').textContent=d.ncpu+' vCPU · up '+fmtUp(d.up)+' · load '+d.load.map(x=>x.toFixed(2)).join(' ');
  document.getElementById('gauges').innerHTML=[
   card('CPU',d.cpu.toFixed(0)+'%',d.cpu,'load '+d.load[0].toFixed(2)+' over '+d.ncpu+' cores'),
   card('Memory',memPct.toFixed(0)+'%',memPct,gb(d.memUsed)+' / '+gb(d.memTotal)+' GB used · '+gb(d.memAvail)+'G free'),
   card('Swap',d.swapTotal?swapPct.toFixed(0)+'%':'—',swapPct,d.swapTotal?(gb(d.swapUsed)+' / '+gb(d.swapTotal)+' GB'):'no swap'),
+  card('Disk',d.diskTotal?diskPct.toFixed(0)+'%':'—',diskPct,d.diskTotal?(gb(d.diskUsed)+' / '+gb(d.diskTotal)+' GB used · '+gb(d.diskAvail)+'G free'):'unavailable'),
   card('Load (1m)',d.load[0].toFixed(2),Math.min(100,d.load[0]/d.ncpu*100),'1/5/15: '+d.load.map(x=>x.toFixed(2)).join(' / '))
  ].join('');
  document.getElementById('procs').innerHTML=d.procs.map(p=>'<tr><td>'+p.pid+'</td><td class=cmd>'+p.comm+'</td><td>'+p.cpu.toFixed(1)+'<span class=mini><i style="width:'+Math.min(100,p.cpu)+'%;background:'+col(p.cpu)+'"></i></span></td><td>'+p.mem.toFixed(1)+'</td><td>'+gb(p.rss)+'G</td></tr>').join('');
