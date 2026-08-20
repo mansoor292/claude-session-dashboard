@@ -68,12 +68,29 @@ def sessions():
         alive = bool(pid and os.path.exists("/proc/%d" % pid))
         cur = out.get(name)
         if cur is None or (alive and not cur["alive"]):
-            out[name] = {"alive": alive, "status": d.get("status") or ""}
+            out[name] = {"alive": alive, "status": d.get("status") or "",
+                         "bridge": d.get("bridgeSessionId") or ""}
     return out
 
 def tmux_has(name):
     return subprocess.run([TMUX, "-L", SOCKET, "has-session", "-t", "=" + name],
                           capture_output=True).returncode == 0
+
+def ensure_bridge(name, wait=30):
+    """A delivered reply only shows up in claude.ai if the session is bridged.
+
+    Without Remote Control the message still lands in the pane and the transcript, but it
+    is invisible from the web/phone — so turn RC on before delivering rather than after.
+    """
+    if sessions().get(name, {}).get("bridge"): return True
+    subprocess.run([TMUX, "-L", SOCKET, "send-keys", "-t", name, "-l", "/remote-control"], check=False)
+    time.sleep(0.4)
+    subprocess.run([TMUX, "-L", SOCKET, "send-keys", "-t", name, "Enter"], check=False)
+    for _ in range(wait):
+        time.sleep(1)
+        if sessions().get(name, {}).get("bridge"): return True
+    return False
+
 
 def deliver(name, text):
     """Type one line into the session, then Enter. Newlines would submit early, so flatten."""
@@ -151,7 +168,9 @@ def cmd_list(a):
     for rid, t in sorted(reg["threads"].items()):
         s = live.get(t["session"], {})
         state = "alive/" + (s.get("status") or "?") if s.get("alive") else ("shell" if tmux_has(t["session"]) else "GONE")
-        print("%-14s -> %-28s [%s]  last=%s  %s" % (rid, t["session"], state, t.get("last_comment_id"), (t.get("title") or "")[:40]))
+        web = ("https://claude.ai/code/" + s["bridge"]) if s.get("bridge") else "not in claude.ai"
+        print("%-14s -> %-24s [%s]  last=%s  %s\n%s%s" % (rid, t["session"], state, t.get("last_comment_id"),
+              (t.get("title") or "")[:40], " " * 20, web))
 
 def cmd_unregister(a):
     reg = load(); rid = recording_id(a.recording)
@@ -237,8 +256,12 @@ def cmd_watch(a):
         if a.dry_run:
             print("   would deliver to %s: %s" % (sess, msg[:200]))
         else:
+            if not ensure_bridge(sess):
+                print("!! %s: no Remote Control bridge — delivering, but it will not show in claude.ai" % sess)
             deliver(sess, msg)
-            print("-> %s: delivered %d comment(s), through %s" % (sess, len(fresh), fresh[-1]["id"]))
+            bridge = sessions().get(sess, {}).get("bridge") or ""
+            where = "  https://claude.ai/code/" + bridge if bridge else ""
+            print("-> %s: delivered %d comment(s), through %s%s" % (sess, len(fresh), fresh[-1]["id"], where))
             t["last_comment_id"] = max(int(c["id"]) for c in fresh); dirty = True
     if dirty and not a.dry_run: save(reg)
 
