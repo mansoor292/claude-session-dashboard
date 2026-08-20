@@ -158,7 +158,49 @@ def cmd_unregister(a):
     if reg["threads"].pop(rid, None): save(reg); print("stopped watching", rid)
     else: print("not registered:", rid)
 
+def cmd_adopt(a):
+    """Pick up threads a session posted without registering.
+
+    Sessions reach for `basecamp messages create` directly, so registration cannot rely
+    on them remembering. Every post made through bc-threads carries the footer naming
+    its session, which is enough to reconstruct the mapping after the fact.
+    """
+    reg, live, found = load(), sessions(), 0
+    # A session touches Basecamp two ways: it starts a thread (message), or it answers on
+    # someone else's (comment). Both carry the footer, so both are adoptable.
+    cand = []
+    for m in bc("messages", "list", "--all-projects", "--limit", str(a.limit), check=False) or []:
+        cand.append((str(m.get("id") or ""), m.get("content") or "", m.get("title") or "",
+                     m.get("app_url") or "", (m.get("bucket") or {}).get("id")))
+    for c in bc("comments", "list", "--all-projects", "--limit", str(a.limit), check=False) or []:
+        par = c.get("parent") or {}
+        cand.append((str(par.get("id") or ""), c.get("content") or "", par.get("title") or "",
+                     par.get("app_url") or "", (c.get("bucket") or {}).get("id")))
+    for rid, body, title, url, bucket in cand:
+        if not rid or rid in reg["threads"] or FOOTER not in body: continue
+        tail = detag(body).split(FOOTER)[-1].strip().split()
+        if not tail: continue
+        sess = tail[0]
+        # Do not accumulate mappings to sessions that no longer exist.
+        if sess not in live and not tmux_has(sess):
+            if a.verbose: print("skip %s: session %s is gone" % (rid, sess))
+            continue
+        comments = bc("comments", "list", rid, check=False) or []
+        reg["threads"][rid] = {
+            "session": sess, "project": bucket, "title": title, "url": url,
+            "last_comment_id": max([int(x["id"]) for x in comments] or [0]),
+            "ours": [], "registered": int(time.time()), "adopted": True,
+        }
+        found += 1
+        print("adopted %s -> %s  %s" % (rid, sess, title[:50]))
+    if found: save(reg)
+    elif a.verbose: print("nothing new to adopt")
+
+
 def cmd_watch(a):
+    if not a.no_adopt:
+        try: cmd_adopt(argparse.Namespace(limit=a.adopt_limit, verbose=False))
+        except Exception as e: print("!! adopt failed: %s" % e)
     reg, live = load(), sessions()
     if not reg["threads"]:
         if a.verbose: print("no threads registered")
@@ -212,7 +254,11 @@ sp = sub.add_parser("reply"); sp.add_argument("recording"); sp.add_argument("tex
 sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_reply)
 sp = sub.add_parser("list"); sp.set_defaults(fn=cmd_list)
 sp = sub.add_parser("unregister"); sp.add_argument("recording"); sp.set_defaults(fn=cmd_unregister)
+sp = sub.add_parser("adopt"); sp.add_argument("-n", "--limit", type=int, default=50)
+sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_adopt)
 sp = sub.add_parser("watch"); sp.add_argument("--once", action="store_true"); sp.add_argument("--dry-run", action="store_true")
+sp.add_argument("--no-adopt", action="store_true", help="skip the auto-registration sweep")
+sp.add_argument("--adopt-limit", type=int, default=50)
 sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_watch)
 
 a = p.parse_args()
