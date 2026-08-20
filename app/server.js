@@ -290,7 +290,7 @@ http.createServer((req,res)=>{
   if(req.method==='POST'&&u.pathname==='/api/branch'){
     const parent=clean(u.searchParams.get('name'));
     const carry=u.searchParams.get('carry')!=='0';   // fork the transcript too (default)
-    let ok=true, err=null, name=null, cwd=null, branch=null, carried=false, dirty=false;
+    let ok=true, err=null, name=null, cwd=null, branch=null, carried=false, dirty=false, mainRepo=null, pbranch='';
     const ps=parent?claudeSession(parent):null;
     const pcwd=(ps&&ps.cwd)||(parent&&hasSession(parent)?tmux(['display-message','-p','-t',parent,'#{pane_current_path}']).trim():'');
     if(!parent||!hasSession(parent)){ ok=false; err='no such session'; }
@@ -301,10 +301,12 @@ http.createServer((req,res)=>{
       if(headr.code!==0){ ok=false; err='repo has no commits to branch from'; }
       else{
         const head=headr.out.trim();
+        pbranch=git(['-C',pcwd,'rev-parse','--abbrev-ref','HEAD']).out.trim();
         dirty=git(['-C',pcwd,'status','--porcelain']).out.trim().length>0;   // uncommitted work stays with the parent
         const g=git(['-C',pcwd,'rev-parse','--git-common-dir']);
         let common=g.out.trim(); if(common && common[0]!=='/') common=path.resolve(pcwd,common);
-        const repoName=path.basename(path.dirname(common));
+        mainRepo=path.dirname(common);
+        const repoName=path.basename(mainRepo);
         const wtBase=CODE_ROOT+'/.worktrees'; try{fs.mkdirSync(wtBase,{recursive:true});}catch{}
         const b0=parent.replace(/-b\d*$/,'');   // branching a branch keeps one suffix, not a chain
         let r=null;
@@ -330,9 +332,21 @@ http.createServer((req,res)=>{
         try{ if(fs.existsSync(src)){ fs.mkdirSync(dstDir,{recursive:true}); fs.copyFileSync(src,dstDir+'/'+ps.sid+'.jsonl'); carried=true; } }catch{}
       }
       const envArgs=(account!=='primary')?['-e','CLAUDE_CONFIG_DIR='+cfgDir]:[];
-      const cmd = carried
+      const note=[
+        'You are a FORK of the session "'+parent+'"'+(carried?' and carry its conversation history':'')+'.',
+        'Your cwd '+cwd+' is a git worktree on branch '+branch+', branched from '+(pbranch||'HEAD')+' at the commit that session was on.',
+        'The primary checkout is '+mainRepo+' (branch '+(pbranch||'unknown')+'); it is the SAME repository \u2014 both worktrees share one object store and one set of refs.',
+        'So you can read and take its work directly, with no remote and no fetch: git log '+(pbranch||'HEAD')+', git diff '+(pbranch||'HEAD')+', git merge '+(pbranch||'HEAD')+', git rebase '+(pbranch||'HEAD')+'.',
+        dirty
+          ? 'Its UNCOMMITTED changes did not come with you. To pull them in: git -C '+mainRepo+' diff | git apply - (add --staged for staged work; untracked files are not included).'
+          : 'It had no uncommitted changes when you were branched.',
+        'Never check out '+(pbranch||'that branch')+' here \u2014 git forbids the same branch in two worktrees. Work on '+branch+' and merge back when done.'
+      ].join(' ');
+      const shq = v => "'"+String(v).replace(/'/g,"'\\''")+"'";
+      const cmd = (carried
         ? CLAUDE_BIN+" --resume '"+ps.sid+"' --fork-session --remote-control '"+name+"' --dangerously-skip-permissions"
-        : CLAUDE_BIN+" --remote-control '"+name+"' --dangerously-skip-permissions";
+        : CLAUDE_BIN+" --remote-control '"+name+"' --dangerously-skip-permissions")
+        + " --append-system-prompt "+shq(note);
       tmux(['new-session','-d','-s',name,'-c',cwd].concat(envArgs).concat([cmd]));
       autoAnswer(name,'claude');
     }
@@ -495,7 +509,7 @@ loadAccounts();
 async function pollBridge(name){for(var i=0;i<14;i++){try{var j=await(await fetch('/api/bridge?name='+encodeURIComponent(name))).json();if(j.bridge)return j.bridge;}catch(e){}await new Promise(function(r){setTimeout(r,1500);});}return null;}
 async function doSpawn(){var mode=document.getElementById('m_mode').value;var repo=document.getElementById('m_repo').value;if(mode!=='teleport'&&!repo){alert('No repo found under ~/Code');return;}var wt=(mode==='teleport')?0:(document.getElementById('m_wt').checked?1:0);var session='';if(mode==='teleport'){session=(document.getElementById('m_session').value||'').trim();if(!session){alert('Paste the cloud session id or claude.ai/code URL to teleport');return;}}var win=(mode==='claude'||mode==='teleport')?window.open('about:blank','_blank'):null;if(win){try{win.document.write('<title>Launching…</title><body style="font:16px system-ui;padding:2rem;color:#334155">Launching…</body>');}catch(e){}}var account=((document.getElementById('m_account')||{}).value)||'primary';var q='/api/spawn?repo='+encodeURIComponent(repo)+'&mode='+mode+'&worktree='+wt+'&account='+encodeURIComponent(account)+(session?('&session='+encodeURIComponent(session)):'');var r=await(await fetch(q,{method:'POST'})).json();if(!r.ok){if(win)win.close();alert('Could not start session'+(r.err?': '+r.err:''));return;}if(win){var nm=r.name||'';if(mode==='claude'&&account==='primary'){var b=await pollBridge(nm);win.location=b?('https://claude.ai/code/'+b):('${TERM}/?arg='+encodeURIComponent(nm));}else{win.location='${TERM}/?arg='+encodeURIComponent(nm);}}closeModal();setTimeout(function(){location.reload();},1200);}
 async function branchSession(n,e){if(e)e.stopPropagation();
- if(!confirm('Branch "'+n+'" into a new worktree?\n\nStarts a new session on a fresh branch off this one\u2019s current HEAD, carrying a fork of its conversation.\nUncommitted changes stay with the original.'))return;
+ if(!confirm('Branch "'+n+'" into a new worktree?\\n\\nStarts a new session on a fresh branch off this one\u2019s current HEAD, carrying a fork of its conversation.\\nUncommitted changes stay with the original.'))return;
  var win=window.open('about:blank','_blank');
  if(win){try{win.document.write('<title>Branching\u2026</title><body style="font:16px system-ui;padding:2rem;color:#334155">Branching\u2026</body>');}catch(err){}}
  var r=await(await fetch('/api/branch?name='+encodeURIComponent(n),{method:'POST'})).json();
