@@ -39,18 +39,50 @@ function accounts(){
   return out;
 }
 function accountDir(id){ const a=accounts().find(x=>x.id===id); return a?a.dir:HOME_DIR+'/.claude'; }
+// Which account owns a tmux session, and the conversation it is running: sessionId feeds
+// `--resume`, cwd locates the transcript. Prefer the live pid; stale json files linger.
+function claudeSession(tname){
+  let best=null;
+  for(const a of accounts()){
+    let files=[]; try{ files=fs.readdirSync(a.dir+'/sessions'); }catch{ continue; }
+    for(const f of files){
+      if(!f.endsWith('.json')) continue;
+      let d; try{ d=JSON.parse(fs.readFileSync(a.dir+'/sessions/'+f,'utf8')); }catch{ continue; }
+      if((d.tmux||'').split(':')[0]!==tname || !d.sessionId) continue;
+      const alive=!!(d.pid && fs.existsSync('/proc/'+d.pid));
+      const cand={account:a.id, dir:a.dir, sid:d.sessionId, cwd:d.cwd||'', alive, at:d.updatedAt||0};
+      if(!best || (cand.alive&&!best.alive) || (cand.alive===best.alive && cand.at>best.at)) best=cand;
+    }
+  }
+  return best;
+}
 // True "last used" = the conversation transcript's mtime; it updates on EVERY message
 // regardless of access path (terminal, remote-control, claude.ai, mobile) — unlike tmux
 // session_activity, which only sees local pane I/O.
+// Claude's per-project transcript dir mangles every '/', '.' and '_' in the cwd to '-',
+// so ~/Code/.worktrees/repo__wt lives in projects/-home-ubuntu-Code--worktrees-repo--wt.
+const projDir = cwd => cwd.replace(/[/._]/g,'-');
 function transcriptMtime(dir, sessionId, cwd){
   if(!sessionId || !cwd) return 0;
-  try{ return Math.floor(fs.statSync(dir+'/projects/'+cwd.replace(/\//g,'-')+'/'+sessionId+'.jsonl').mtimeMs/1000); }catch{ return 0; }
+  try{ return Math.floor(fs.statSync(dir+'/projects/'+projDir(cwd)+'/'+sessionId+'.jsonl').mtimeMs/1000); }catch{ return 0; }
 }
 const NCPU = os.cpus().length;
 
 const tmux = (a) => { try { return execFileSync('tmux', a, {encoding:'utf8'}); } catch { return ''; } };
 const hasSession = (n) => { try { execFileSync('tmux', ['has-session','-t','='+n], {stdio:'ignore'}); return true; } catch { return false; } };
 const git = (a) => { try { return {code:0, out: execFileSync('git', a, {encoding:'utf8'})}; } catch(e){ return {code: e.status||1, out: ((e.stdout||'')+(e.stderr||''))}; } };
+// A freshly spawned Claude stops on one-time prompts (trust folder, bypass-permissions,
+// teleport confirm). Poll the pane and answer them so the session comes up unattended.
+function autoAnswer(name, mode){
+  const rcState={sent:false};
+  const answer=()=>{ try{ const pane=tmux(['capture-pane','-p','-t',name]);
+    if(/trust this folder/.test(pane)) tmux(['send-keys','-t',name,'1','Enter']);
+    else if(/Bypass Permissions mode/.test(pane) && /Yes, I accept/.test(pane)) tmux(['send-keys','-t',name,'2','Enter']);   // one-time per new config dir
+    else if(/Teleport to Repo|Resume full session|Enter to confirm/.test(pane)) tmux(['send-keys','-t',name,'Enter']);
+    else if(mode==='teleport' && !rcState.sent && !/remote-control is active/.test(pane) && /(Session resumed|bypass permissions on)/i.test(pane)){ tmux(['send-keys','-t',name,'/remote-control','Enter']); rcState.sent=true; } }catch{} };
+  const sched = (mode==='teleport') ? [4000,7000,10000,13000,16000,19000,22000,25000,28000,32000,36000,40000,45000,50000,55000] : [4000,7000,10000];
+  sched.forEach(t=>setTimeout(answer,t));
+}
 function removeWorktree(w){
   if(!w || w.indexOf(CODE_ROOT+'/.worktrees/')!==0 || w.indexOf('..')>=0) return {ok:false,err:'not a managed worktree'};
   const g=git(['-C',w,'rev-parse','--git-common-dir']);
@@ -248,17 +280,64 @@ http.createServer((req,res)=>{
           ? CLAUDE_BIN+" --teleport '"+sid+"' --remote-control '"+name+"' --dangerously-skip-permissions"
           : CLAUDE_BIN+" --remote-control '"+name+"' --dangerously-skip-permissions";
         tmux(['new-session','-d','-s',name,'-c',cwd].concat(envArgs).concat([cmd]));
-        const rcState={sent:false};
-        const answer=()=>{ try{ const pane=tmux(['capture-pane','-p','-t',name]);
-          if(/trust this folder/.test(pane)) tmux(['send-keys','-t',name,'1','Enter']);
-          else if(/Bypass Permissions mode/.test(pane) && /Yes, I accept/.test(pane)) tmux(['send-keys','-t',name,'2','Enter']);   // one-time per new config dir
-          else if(/Teleport to Repo|Resume full session|Enter to confirm/.test(pane)) tmux(['send-keys','-t',name,'Enter']);
-          else if(mode==='teleport' && !rcState.sent && !/remote-control is active/.test(pane) && /(Session resumed|bypass permissions on)/i.test(pane)){ tmux(['send-keys','-t',name,'/remote-control','Enter']); rcState.sent=true; } }catch{} };
-        const sched = (mode==='teleport') ? [4000,7000,10000,13000,16000,19000,22000,25000,28000,32000,36000,40000,45000,50000,55000] : [4000,7000,10000];
-        sched.forEach(t=>setTimeout(answer,t));
+        autoAnswer(name,mode);
       }
     }
     res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({ok,name,mode,cwd,sid,branch,err}));
+  }
+  // Branch a running session: a new git worktree off its current HEAD, plus a forked copy
+  // of its conversation, so the spin-off starts knowing everything the parent knew.
+  if(req.method==='POST'&&u.pathname==='/api/branch'){
+    const parent=clean(u.searchParams.get('name'));
+    const carry=u.searchParams.get('carry')!=='0';   // fork the transcript too (default)
+    let ok=true, err=null, name=null, cwd=null, branch=null, carried=false, dirty=false;
+    const ps=parent?claudeSession(parent):null;
+    const pcwd=(ps&&ps.cwd)||(parent&&hasSession(parent)?tmux(['display-message','-p','-t',parent,'#{pane_current_path}']).trim():'');
+    if(!parent||!hasSession(parent)){ ok=false; err='no such session'; }
+    else if(!pcwd||!fs.existsSync(pcwd)){ ok=false; err='cannot resolve that session\u2019s directory'; }
+    else if(git(['-C',pcwd,'rev-parse','--git-dir']).code!==0){ ok=false; err='not a git repo \u2014 branching needs git'; }
+    if(ok){
+      const headr=git(['-C',pcwd,'rev-parse','HEAD']);
+      if(headr.code!==0){ ok=false; err='repo has no commits to branch from'; }
+      else{
+        const head=headr.out.trim();
+        dirty=git(['-C',pcwd,'status','--porcelain']).out.trim().length>0;   // uncommitted work stays with the parent
+        const g=git(['-C',pcwd,'rev-parse','--git-common-dir']);
+        let common=g.out.trim(); if(common && common[0]!=='/') common=path.resolve(pcwd,common);
+        const repoName=path.basename(path.dirname(common));
+        const wtBase=CODE_ROOT+'/.worktrees'; try{fs.mkdirSync(wtBase,{recursive:true});}catch{}
+        const b0=parent.replace(/-b\d*$/,'');   // branching a branch keeps one suffix, not a chain
+        let r=null;
+        for(let k=2;k<=20;k++){
+          const cand=b0+'-b'+k;
+          if(hasSession(cand)) continue;
+          const wtPath=wtBase+'/'+repoName+'__'+cand;
+          if(fs.existsSync(wtPath)) continue;
+          r=git(['-C',pcwd,'worktree','add','-b','wt/'+cand,wtPath,head]);
+          if(r.code===0){ name=cand; cwd=wtPath; branch='wt/'+cand; break; }
+        }
+        if(!name){ ok=false; err=('worktree add failed: '+((r&&r.out)||'no free name')).slice(0,300); }
+      }
+    }
+    if(ok){
+      const cfgDir=(ps&&ps.dir)||(HOME_DIR+'/.claude');
+      const account=(ps&&ps.account)||'primary';
+      // Transcripts are stored per project dir, so seed the parent's into the worktree's
+      // before --resume looks for it there.
+      if(carry && ps && ps.sid && ps.cwd){
+        const src=cfgDir+'/projects/'+projDir(ps.cwd)+'/'+ps.sid+'.jsonl';
+        const dstDir=cfgDir+'/projects/'+projDir(cwd);
+        try{ if(fs.existsSync(src)){ fs.mkdirSync(dstDir,{recursive:true}); fs.copyFileSync(src,dstDir+'/'+ps.sid+'.jsonl'); carried=true; } }catch{}
+      }
+      const envArgs=(account!=='primary')?['-e','CLAUDE_CONFIG_DIR='+cfgDir]:[];
+      const cmd = carried
+        ? CLAUDE_BIN+" --resume '"+ps.sid+"' --fork-session --remote-control '"+name+"' --dangerously-skip-permissions"
+        : CLAUDE_BIN+" --remote-control '"+name+"' --dangerously-skip-permissions";
+      tmux(['new-session','-d','-s',name,'-c',cwd].concat(envArgs).concat([cmd]));
+      autoAnswer(name,'claude');
+    }
+    res.writeHead(200,{'Content-Type':'application/json'});
+    return res.end(JSON.stringify({ok,name,parent,cwd,branch,carried,dirty,err}));
   }
   if(req.method==='POST'&&u.pathname==='/api/kill'){ const n=clean(u.searchParams.get('name')); const rmwt=u.searchParams.get('worktree')==='1'; const cwd=u.searchParams.get('cwd')||''; if(n) tmux(['kill-session','-t',n]); let wt=null; if(rmwt) wt=removeWorktree(cwd); res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({ok:true,wt})); }
   if(u.pathname==='/api/sessions'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(sessions())); }
@@ -316,7 +395,7 @@ render(INIT);tick();setInterval(tick,2000);
   const multiAcct = accounts().length>1;
   const acctBadge = x => (multiAcct && x.account) ? `<span class="pill acct">${esc(x.account)}</span>` : '';
   const rccard=x=>`<div class="card rc" data-name="${esc(x.name)}"><div class=body onclick="window.open('https://claude.ai/code/${esc(x.bridge)}','_blank')"><div class=row><span class=name>${esc(x.title||x.name)}</span>${acctBadge(x)}<span class="pill rc">RC</span></div><div class=cid>${esc(x.name)}</div><div class=cmd>▶ ${esc(x.cmd)}${x.status?' · '+esc(x.status):''}</div><pre class=preview><span class=e>rc-hosted · not in tmux · opens in claude.ai</span></pre><div class=meta>claude.ai ↗ <a class=vscode href="${CODE}/?folder=${encodeURIComponent(x.cwd||HOMEDIR)}" target=_blank rel=noopener onclick="event.stopPropagation()">‹/› VS Code</a></div></div></div>`;
-  const card=x=> x.rc ? rccard(x) : `<div class="card ${x.attached?'on':''}" data-name="${esc(x.name)}" data-cwd="${esc(x.cwd||'')}"><button class=kill title="kill session" onclick="killSession('${esc(x.name)}',event)">✕</button><div class=body onclick="open_('${encodeURIComponent(x.name)}')"><div class=row><span class=name>${esc(x.title||x.name)}</span>${acctBadge(x)}<span class="pill ${x.attached?'live':'idle'}">${x.attached?'LIVE':'idle'}</span></div><div class=cid>${esc(x.name)}</div><div class=cmd>${x.running?'▶':'○'} ${esc(x.cmd||'shell')}</div><pre class=preview>${esc(x.preview)||'<span class=e>— no output yet —</span>'}</pre><div class=meta>${x.wins} win · open ↗ <a class=vscode href="${CODE}/?folder=${encodeURIComponent(x.cwd||HOMEDIR)}" target=_blank rel=noopener onclick="event.stopPropagation()">‹/› VS Code</a>${x.bridge?` · <a class=vscode href="https://claude.ai/code/${esc(x.bridge)}" target=_blank rel=noopener onclick="event.stopPropagation()">claude.ai ↗</a>`:''}</div></div></div>`;
+  const card=x=> x.rc ? rccard(x) : `<div class="card ${x.attached?'on':''}" data-name="${esc(x.name)}" data-cwd="${esc(x.cwd||'')}"><button class=branch title="branch into a worktree" onclick="branchSession('${esc(x.name)}',event)">⑂</button><button class=kill title="kill session" onclick="killSession('${esc(x.name)}',event)">✕</button><div class=body onclick="open_('${encodeURIComponent(x.name)}')"><div class=row><span class=name>${esc(x.title||x.name)}</span>${acctBadge(x)}<span class="pill ${x.attached?'live':'idle'}">${x.attached?'LIVE':'idle'}</span></div><div class=cid>${esc(x.name)}</div><div class=cmd>${x.running?'▶':'○'} ${esc(x.cmd||'shell')}</div><pre class=preview>${esc(x.preview)||'<span class=e>— no output yet —</span>'}</pre><div class=meta>${x.wins} win · open ↗ <a class=vscode href="${CODE}/?folder=${encodeURIComponent(x.cwd||HOMEDIR)}" target=_blank rel=noopener onclick="event.stopPropagation()">‹/› VS Code</a>${x.bridge?` · <a class=vscode href="https://claude.ai/code/${esc(x.bridge)}" target=_blank rel=noopener onclick="event.stopPropagation()">claude.ai ↗</a>`:''}</div></div></div>`;
   res.writeHead(200,{'Content-Type':'text/html'});
   res.end(`<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Claude Sessions</title>
 <style>${CSS}
@@ -326,6 +405,8 @@ render(INIT);tick();setInterval(tick,2000);
 .card.on{border-color:rgba(34,197,94,.45)}.body{display:block;padding:15px 16px;cursor:pointer}
 .kill{position:absolute;top:8px;right:8px;z-index:2;width:24px;height:24px;border-radius:7px;border:1px solid rgba(248,113,113,.35);background:rgba(248,113,113,.12);color:#f87171;font-size:12px;cursor:pointer;line-height:1;padding:0}
 .kill:hover{background:#ef4444;color:#fff;border-color:#ef4444}
+.branch{position:absolute;top:8px;right:38px;z-index:2;width:24px;height:24px;border-radius:7px;border:1px solid rgba(129,140,248,.35);background:rgba(129,140,248,.12);color:#818cf8;font-size:13px;cursor:pointer;line-height:1;padding:0}
+.branch:hover{background:#6366f1;color:#fff;border-color:#6366f1}
 .row{display:flex;align-items:center;justify-content:space-between;padding-right:26px}
 .name{font-weight:650;font-size:15.5px;color:#e2e8f0;line-height:1.3;word-break:break-word}
 .cid{margin-top:4px;color:#64748b;font-size:11px;font-family:ui-monospace,Menlo,monospace;word-break:break-word}
@@ -368,6 +449,8 @@ render(INIT);tick();setInterval(tick,2000);
  .lact .vs{color:#38bdf8;text-decoration:none;font-weight:600;margin-right:10px}
  .lact .lkill{width:24px;height:24px;border-radius:7px;border:1px solid rgba(248,113,113,.35);background:rgba(248,113,113,.12);color:#f87171;font-size:12px;cursor:pointer;padding:0;line-height:1}
  .lact .lkill:hover{background:#ef4444;color:#fff;border-color:#ef4444}
+ .lact .lbranch{width:24px;height:24px;border-radius:7px;border:1px solid rgba(129,140,248,.35);background:rgba(129,140,248,.12);color:#818cf8;font-size:13px;cursor:pointer;padding:0;line-height:1}
+ .lact .lbranch:hover{background:#6366f1;color:#fff;border-color:#6366f1}
 </style></head><body><div class=wrap>
 <header><div><h1>🧠 Claude Sessions</h1><span class=sub>${s.length} sessions · refreshes every 4s</span></div>
 <div class=nav><a href="/" class=on>Sessions</a><a href="/monitor">📊 Monitor</a><span class=viewtoggle><button class=viewbtn data-v=grid onclick="setView('grid')">▦ Grid</button><button class=viewbtn data-v=list onclick="setView('list')">☰ List</button></span><button class=add onclick=openModal()>+ Session</button></div></header>
@@ -397,7 +480,7 @@ function fmtMem(mb){if(!mb)return '—';return mb>=1024?(mb/1024).toFixed(1)+' G
 function fmtCpu(x){if(x.rc)return '—';var p=x.cpu||0;var cls=p>=80?'hi':(p>=25?'mid':'');return '<span class="cpuval '+cls+'">'+p+'%</span>';}
 function esc2(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function sortData(a){var k=SORT,dir=DIR==='asc'?1:-1;return a.slice().sort(function(p,q){var x,y;if(k==='name'){x=(p.title||p.name||'').toLowerCase();y=(q.title||q.name||'').toLowerCase();}else if(k==='repo'){x=repoOf(p).toLowerCase();y=repoOf(q).toLowerCase();}else if(k==='launch'){x=p.created||0;y=q.created||0;}else if(k==='cpu'){x=p.cpu||0;y=q.cpu||0;}else if(k==='mem'){x=p.mem||0;y=q.mem||0;}else{x=p.activity||0;y=q.activity||0;}return x<y?-1*dir:(x>y?1*dir:0);});}
-function renderList(){var tb=document.getElementById('ltbody');if(!tb)return;var arr=sortData(DATA);tb.innerHTML=arr.map(function(x){var st=x.rc?'RC':(x.attached?'LIVE':'idle');var pc='pill '+(x.rc?'rc':(x.attached?'live':'idle'));return '<tr data-name="'+esc2(x.name)+'" data-cwd="'+esc2(x.cwd||'')+'" data-rc="'+(x.rc?'1':'')+'" data-bridge="'+esc2(x.bridge||'')+'"><td class=lname><span class=lopen>'+esc2(x.title||x.name)+'</span>'+((MULTIACCT&&x.account)?' <span class="pill acct">'+esc2(x.account)+'</span>':'')+'<span class=lsub>'+esc2(x.name)+'</span></td><td class=lrepo>'+esc2(repoOf(x)||'—')+'</td><td class=num title="'+esc2(fmtWhen(x.created))+'">'+fmtAgo(x.created)+'</td><td class=num title="'+esc2(fmtWhen(x.activity))+'">'+fmtAgo(x.activity)+'</td><td class="num cpu">'+fmtCpu(x)+'</td><td class=num>'+fmtMem(x.mem)+'</td><td><span class="'+pc+'">'+st+'</span></td><td class=lact>'+(x.bridge?'<a class=vs href="https://claude.ai/code/'+esc2(x.bridge)+'" target=_blank rel=noopener title="claude.ai">◎</a>':'')+'<a class=vs href="'+CODEBASE+'/?folder='+encodeURIComponent(x.cwd||HOMEBASE)+'" target=_blank rel=noopener title="VS Code">‹/›</a>'+(x.rc?'':'<button class=lkill title="kill">✕</button>')+'</td></tr>';}).join('');document.querySelectorAll('th.sortable').forEach(function(th){var k=th.dataset.k;th.classList.remove('asc','desc');if(SORT===k)th.classList.add(DIR);});}
+function renderList(){var tb=document.getElementById('ltbody');if(!tb)return;var arr=sortData(DATA);tb.innerHTML=arr.map(function(x){var st=x.rc?'RC':(x.attached?'LIVE':'idle');var pc='pill '+(x.rc?'rc':(x.attached?'live':'idle'));return '<tr data-name="'+esc2(x.name)+'" data-cwd="'+esc2(x.cwd||'')+'" data-rc="'+(x.rc?'1':'')+'" data-bridge="'+esc2(x.bridge||'')+'"><td class=lname><span class=lopen>'+esc2(x.title||x.name)+'</span>'+((MULTIACCT&&x.account)?' <span class="pill acct">'+esc2(x.account)+'</span>':'')+'<span class=lsub>'+esc2(x.name)+'</span></td><td class=lrepo>'+esc2(repoOf(x)||'—')+'</td><td class=num title="'+esc2(fmtWhen(x.created))+'">'+fmtAgo(x.created)+'</td><td class=num title="'+esc2(fmtWhen(x.activity))+'">'+fmtAgo(x.activity)+'</td><td class="num cpu">'+fmtCpu(x)+'</td><td class=num>'+fmtMem(x.mem)+'</td><td><span class="'+pc+'">'+st+'</span></td><td class=lact>'+(x.bridge?'<a class=vs href="https://claude.ai/code/'+esc2(x.bridge)+'" target=_blank rel=noopener title="claude.ai">◎</a>':'')+'<a class=vs href="'+CODEBASE+'/?folder='+encodeURIComponent(x.cwd||HOMEBASE)+'" target=_blank rel=noopener title="VS Code">‹/›</a>'+(x.rc?'':'<button class=lbranch title="branch into a worktree">⑂</button><button class=lkill title="kill">✕</button>')+'</td></tr>';}).join('');document.querySelectorAll('th.sortable').forEach(function(th){var k=th.dataset.k;th.classList.remove('asc','desc');if(SORT===k)th.classList.add(DIR);});}
 function setView(v){VIEW=v;localStorage.setItem('view',v);var g=document.getElementById('g'),l=document.getElementById('listwrap');if(g)g.style.display=(v==='grid')?'':'none';if(l)l.style.display=(v==='list')?'':'none';document.querySelectorAll('.viewbtn').forEach(function(b){b.classList.toggle('on',b.dataset.v===v);});if(v==='list')renderList();}
 function setSort(k){if(SORT===k){DIR=(DIR==='asc')?'desc':'asc';}else{SORT=k;DIR=(k==='name'||k==='repo')?'asc':'desc';}localStorage.setItem('sortk',SORT);localStorage.setItem('sortd',DIR);renderList();}
 function killByName(name,cwd,ev,disp){if(ev)ev.stopPropagation();var isWt=(cwd||'').indexOf('/.worktrees/')>=0;if(!confirm('Kill session "'+(disp||name)+'"?'))return;var wt=0;if(isWt){wt=confirm('This session runs in a git worktree:\\n'+cwd+'\\n\\nAlso remove the worktree and its branch?\\nUncommitted changes there will be lost.')?1:0;}var url='/api/kill?name='+encodeURIComponent(name);if(wt)url+='&worktree=1&cwd='+encodeURIComponent(cwd);fetch(url,{method:'POST'});DATA=DATA.filter(function(z){return z.name!==name;});var c=document.querySelector('.card[data-name="'+CSS.escape(name)+'"]');if(c)c.remove();renderList();}
@@ -411,6 +494,15 @@ async function loadAccounts(){try{const a=await(await fetch('/api/accounts')).js
 loadAccounts();
 async function pollBridge(name){for(var i=0;i<14;i++){try{var j=await(await fetch('/api/bridge?name='+encodeURIComponent(name))).json();if(j.bridge)return j.bridge;}catch(e){}await new Promise(function(r){setTimeout(r,1500);});}return null;}
 async function doSpawn(){var mode=document.getElementById('m_mode').value;var repo=document.getElementById('m_repo').value;if(mode!=='teleport'&&!repo){alert('No repo found under ~/Code');return;}var wt=(mode==='teleport')?0:(document.getElementById('m_wt').checked?1:0);var session='';if(mode==='teleport'){session=(document.getElementById('m_session').value||'').trim();if(!session){alert('Paste the cloud session id or claude.ai/code URL to teleport');return;}}var win=(mode==='claude'||mode==='teleport')?window.open('about:blank','_blank'):null;if(win){try{win.document.write('<title>Launching…</title><body style="font:16px system-ui;padding:2rem;color:#334155">Launching…</body>');}catch(e){}}var account=((document.getElementById('m_account')||{}).value)||'primary';var q='/api/spawn?repo='+encodeURIComponent(repo)+'&mode='+mode+'&worktree='+wt+'&account='+encodeURIComponent(account)+(session?('&session='+encodeURIComponent(session)):'');var r=await(await fetch(q,{method:'POST'})).json();if(!r.ok){if(win)win.close();alert('Could not start session'+(r.err?': '+r.err:''));return;}if(win){var nm=r.name||'';if(mode==='claude'&&account==='primary'){var b=await pollBridge(nm);win.location=b?('https://claude.ai/code/'+b):('${TERM}/?arg='+encodeURIComponent(nm));}else{win.location='${TERM}/?arg='+encodeURIComponent(nm);}}closeModal();setTimeout(function(){location.reload();},1200);}
+async function branchSession(n,e){if(e)e.stopPropagation();
+ if(!confirm('Branch "'+n+'" into a new worktree?\n\nStarts a new session on a fresh branch off this one\u2019s current HEAD, carrying a fork of its conversation.\nUncommitted changes stay with the original.'))return;
+ var win=window.open('about:blank','_blank');
+ if(win){try{win.document.write('<title>Branching\u2026</title><body style="font:16px system-ui;padding:2rem;color:#334155">Branching\u2026</body>');}catch(err){}}
+ var r=await(await fetch('/api/branch?name='+encodeURIComponent(n),{method:'POST'})).json();
+ if(!r.ok){if(win)win.close();alert('Could not branch'+(r.err?': '+r.err:''));return;}
+ if(r.dirty&&!r.carried)alert('Branched to '+r.branch+', but the parent has uncommitted changes that did not come along.');
+ if(win){var b=await pollBridge(r.name);win.location=b?('https://claude.ai/code/'+b):('${TERM}/?arg='+encodeURIComponent(r.name));}
+ setTimeout(function(){location.reload();},1200);}
 async function killSession(n,e){e.stopPropagation();const c=document.querySelector('.card[data-name="'+CSS.escape(n)+'"]');const cwd=c?(c.dataset.cwd||''):'';const disp=(c&&c.querySelector('.name'))?c.querySelector('.name').textContent.trim():n;const isWt=cwd.indexOf('/.worktrees/')>=0;if(!confirm('Kill session "'+disp+'"?'))return;let wt=0;if(isWt){wt=confirm('This session runs in a git worktree:\\n'+cwd+'\\n\\nAlso remove the worktree and its branch?\\nUncommitted changes there will be lost.')?1:0;}let url='/api/kill?name='+encodeURIComponent(n);if(wt)url+='&worktree=1&cwd='+encodeURIComponent(cwd);await fetch(url,{method:'POST'});if(c)c.remove();}
 async function tick(){try{const d=await(await fetch('/api/sessions')).json();DATA=d;
  if(VIEW==='list'){renderList();return;}
@@ -418,6 +510,6 @@ async function tick(){try{const d=await(await fetch('/api/sessions')).json();DAT
  d.forEach(x=>{const c=document.querySelector('.card[data-name="'+CSS.escape(x.name)+'"]');if(!c||x.rc)return;const p=c.querySelector('.pill');p.className='pill '+(x.attached?'live':'idle');p.textContent=x.attached?'LIVE':'idle';c.classList.toggle('on',x.attached);c.querySelector('.name').textContent=x.title||x.name;c.querySelector('.cmd').textContent=(x.running?'▶ ':'○ ')+(x.cmd||'shell');c.querySelector('.preview').textContent=x.preview||'— no output yet —';});
 }catch(e){}}
 setInterval(tick,4000);
-(function(){var tb=document.getElementById('ltbody');if(tb){tb.addEventListener('click',function(e){var tr=e.target.closest('tr');if(!tr)return;var name=tr.dataset.name;if(e.target.closest('.lkill')){killByName(name,tr.dataset.cwd,e,((tr.querySelector('.lopen')||{}).textContent||name).trim());return;}if(e.target.closest('.vs'))return;if(tr.dataset.rc){window.open('https://claude.ai/code/'+tr.dataset.bridge,'_blank');}else{open_(encodeURIComponent(name));}});}setView(VIEW);})();
+(function(){var tb=document.getElementById('ltbody');if(tb){tb.addEventListener('click',function(e){var tr=e.target.closest('tr');if(!tr)return;var name=tr.dataset.name;if(e.target.closest('.lkill')){killByName(name,tr.dataset.cwd,e,((tr.querySelector('.lopen')||{}).textContent||name).trim());return;}if(e.target.closest('.lbranch')){branchSession(name,e);return;}if(e.target.closest('.vs'))return;if(tr.dataset.rc){window.open('https://claude.ai/code/'+tr.dataset.bridge,'_blank');}else{open_(encodeURIComponent(name));}});}setView(VIEW);})();
 </script></body></html>`);
 }).listen(PORT,'127.0.0.1',()=>console.log('dashboard on '+PORT));
