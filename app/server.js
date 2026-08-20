@@ -50,7 +50,7 @@ function claudeSession(tname){
       let d; try{ d=JSON.parse(fs.readFileSync(a.dir+'/sessions/'+f,'utf8')); }catch{ continue; }
       if((d.tmux||'').split(':')[0]!==tname || !d.sessionId) continue;
       const alive=!!(d.pid && fs.existsSync('/proc/'+d.pid));
-      const cand={account:a.id, dir:a.dir, sid:d.sessionId, cwd:d.cwd||'', alive, at:d.updatedAt||0};
+      const cand={account:a.id, dir:a.dir, sid:d.sessionId, cwd:d.cwd||'', status:d.status||'', alive, at:d.updatedAt||0};
       if(!best || (cand.alive&&!best.alive) || (cand.alive===best.alive && cand.at>best.at)) best=cand;
     }
   }
@@ -73,6 +73,22 @@ const hasSession = (n) => { try { execFileSync('tmux', ['has-session','-t','='+n
 const git = (a) => { try { return {code:0, out: execFileSync('git', a, {encoding:'utf8'})}; } catch(e){ return {code: e.status||1, out: ((e.stdout||'')+(e.stderr||''))}; } };
 // A freshly spawned Claude stops on one-time prompts (trust folder, bypass-permissions,
 // teleport confirm). Poll the pane and answer them so the session comes up unattended.
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+// Type a first message into a freshly launched session, but only once it is past the
+// trust/bypass prompts and showing its input line — otherwise the keys answer a dialog.
+function sendWhenReady(name, text, tries){
+  let n=0; const max=tries||24;
+  const tick=()=>{ n++;
+    let pane=''; try{ pane=tmux(['capture-pane','-p','-t',name]); }catch{}
+    if(/bypass permissions on/.test(pane) && !/trust this folder|Yes, I accept/.test(pane)){
+      tmux(['send-keys','-t',name,'-l',text]);
+      setTimeout(()=>tmux(['send-keys','-t',name,'Enter']),600);
+      return;
+    }
+    if(n<max) setTimeout(tick,2500);
+  };
+  setTimeout(tick,6000);
+}
 function autoAnswer(name, mode){
   const rcState={sent:false};
   const answer=()=>{ try{ const pane=tmux(['capture-pane','-p','-t',name]);
@@ -285,73 +301,96 @@ http.createServer((req,res)=>{
     }
     res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({ok,name,mode,cwd,sid,branch,err}));
   }
-  // Branch a running session: a new git worktree off its current HEAD, plus a forked copy
-  // of its conversation, so the spin-off starts knowing everything the parent knew.
+  // Everything the branch dialog needs to prefill: deliberate names derived from the REPO
+  // (parent session names are often inherited and say nothing about the code), plus whether
+  // the parent is mid-turn.
+  function branchDefaults(parent){
+    if(!parent||!hasSession(parent)) return {ok:false,err:'no such session'};
+    const ps=claudeSession(parent);
+    const pcwd=(ps&&ps.cwd)||tmux(['display-message','-p','-t',parent,'#{pane_current_path}']).trim();
+    if(!pcwd||!fs.existsSync(pcwd)) return {ok:false,err:'cannot resolve that session’s directory'};
+    if(git(['-C',pcwd,'rev-parse','--git-dir']).code!==0) return {ok:false,err:'not a git repo — branching needs git'};
+    const g=git(['-C',pcwd,'rev-parse','--git-common-dir']);
+    let common=g.out.trim(); if(common && common[0]!=='/') common=path.resolve(pcwd,common);
+    const mainRepo=path.dirname(common), repoName=path.basename(mainRepo);
+    const pbranch=git(['-C',pcwd,'rev-parse','--abbrev-ref','HEAD']).out.trim();
+    const mainBranch=git(['-C',mainRepo,'rev-parse','--abbrev-ref','HEAD']).out.trim();
+    let name='', n=2;
+    while(n<60){ const c=repoName+'-b'+n; if(!hasSession(c) && !fs.existsSync(CODE_ROOT+'/.worktrees/'+repoName+'__b'+n)){ name=c; break; } n++; }
+    return {ok:true, parent, pcwd, mainRepo, repoName, pbranch, mainBranch,
+      dirty: git(['-C',pcwd,'status','--porcelain']).out.trim().length>0,
+      status:(ps&&ps.status)||'', hasConvo:!!(ps&&ps.sid),
+      name, wt: repoName+'__b'+n, branch:'wt/'+name};
+  }
+  if(u.pathname==='/api/branchinfo'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(branchDefaults(clean(u.searchParams.get('name'))))); }
+
+  // Branch a running session into its own worktree: a new branch off its current HEAD plus
+  // a fork of its conversation, so the spin-off starts knowing what the parent knew.
   if(req.method==='POST'&&u.pathname==='/api/branch'){
     const parent=clean(u.searchParams.get('name'));
-    const carry=u.searchParams.get('carry')!=='0';   // fork the transcript too (default)
-    let ok=true, err=null, name=null, cwd=null, branch=null, carried=false, dirty=false, mainRepo=null, pbranch='';
-    const ps=parent?claudeSession(parent):null;
-    const pcwd=(ps&&ps.cwd)||(parent&&hasSession(parent)?tmux(['display-message','-p','-t',parent,'#{pane_current_path}']).trim():'');
-    if(!parent||!hasSession(parent)){ ok=false; err='no such session'; }
-    else if(!pcwd||!fs.existsSync(pcwd)){ ok=false; err='cannot resolve that session\u2019s directory'; }
-    else if(git(['-C',pcwd,'rev-parse','--git-dir']).code!==0){ ok=false; err='not a git repo \u2014 branching needs git'; }
-    if(ok){
-      const headr=git(['-C',pcwd,'rev-parse','HEAD']);
-      if(headr.code!==0){ ok=false; err='repo has no commits to branch from'; }
-      else{
-        const head=headr.out.trim();
-        pbranch=git(['-C',pcwd,'rev-parse','--abbrev-ref','HEAD']).out.trim();
-        dirty=git(['-C',pcwd,'status','--porcelain']).out.trim().length>0;   // uncommitted work stays with the parent
-        const g=git(['-C',pcwd,'rev-parse','--git-common-dir']);
-        let common=g.out.trim(); if(common && common[0]!=='/') common=path.resolve(pcwd,common);
-        mainRepo=path.dirname(common);
-        const repoName=path.basename(mainRepo);
-        const wtBase=CODE_ROOT+'/.worktrees'; try{fs.mkdirSync(wtBase,{recursive:true});}catch{}
-        const b0=parent.replace(/-b\d*$/,'');   // branching a branch keeps one suffix, not a chain
-        let r=null;
-        for(let k=2;k<=20;k++){
-          const cand=b0+'-b'+k;
-          if(hasSession(cand)) continue;
-          const wtPath=wtBase+'/'+repoName+'__'+cand;
-          if(fs.existsSync(wtPath)) continue;
-          r=git(['-C',pcwd,'worktree','add','-b','wt/'+cand,wtPath,head]);
-          if(r.code===0){ name=cand; cwd=wtPath; branch='wt/'+cand; break; }
-        }
-        if(!name){ ok=false; err=('worktree add failed: '+((r&&r.out)||'no free name')).slice(0,300); }
-      }
-    }
-    if(ok){
+    const carry=u.searchParams.get('carry')!=='0';           // fork the transcript too
+    const wait=u.searchParams.get('wait')!=='0';             // let the parent land its turn first
+    const wantName=clean(u.searchParams.get('as')||'');
+    const wantWt=(u.searchParams.get('wt')||'').replace(/[^A-Za-z0-9_.-]/g,'').slice(0,80);
+    const done=o=>{ res.writeHead(200,{'Content-Type':'application/json'}); res.end(JSON.stringify(o)); };
+    (async()=>{
+      const d=branchDefaults(parent);
+      if(!d.ok) return done(d);
+      const name=wantName||d.name;
+      const wtName=wantWt||d.wt;
+      const cwd=CODE_ROOT+'/.worktrees/'+wtName;
+      const branch='wt/'+name;
+      if(!name) return done({ok:false,err:'a session name is required'});
+      if(hasSession(name)) return done({ok:false,err:'session “'+name+'” already exists'});
+      if(fs.existsSync(cwd)) return done({ok:false,err:'worktree “'+wtName+'” already exists'});
+      if(git(['-C',d.pcwd,'rev-parse','--verify','--quiet','refs/heads/'+branch]).code===0)
+        return done({ok:false,err:'branch “'+branch+'” already exists'});
+      // Forking mid-turn copies a half-written transcript, so hold until the parent is idle.
+      let waited=0;
+      if(wait){ const t0=Date.now();
+        while(Date.now()-t0 < 900000){ const cs=claudeSession(parent); if(!cs || cs.status!=='busy') break; await sleep(2000); }
+        waited=Math.round((Date.now()-t0)/1000); }
+      const ps=claudeSession(parent);
+      const busy=!!(ps && ps.status==='busy');
+      const headr=git(['-C',d.pcwd,'rev-parse','HEAD']);
+      if(headr.code!==0) return done({ok:false,err:'repo has no commits to branch from'});
+      const dirty=git(['-C',d.pcwd,'status','--porcelain']).out.trim().length>0;
+      try{fs.mkdirSync(CODE_ROOT+'/.worktrees',{recursive:true});}catch{}
+      const r=git(['-C',d.pcwd,'worktree','add','-b',branch,cwd,headr.out.trim()]);
+      if(r.code!==0) return done({ok:false,err:('worktree add failed: '+r.out).slice(0,300)});
       const cfgDir=(ps&&ps.dir)||(HOME_DIR+'/.claude');
       const account=(ps&&ps.account)||'primary';
       // Transcripts are stored per project dir, so seed the parent's into the worktree's
-      // before --resume looks for it there.
+      // before --resume goes looking for it there.
+      let carried=false;
       if(carry && ps && ps.sid && ps.cwd){
         const src=cfgDir+'/projects/'+projDir(ps.cwd)+'/'+ps.sid+'.jsonl';
         const dstDir=cfgDir+'/projects/'+projDir(cwd);
         try{ if(fs.existsSync(src)){ fs.mkdirSync(dstDir,{recursive:true}); fs.copyFileSync(src,dstDir+'/'+ps.sid+'.jsonl'); carried=true; } }catch{}
       }
-      const envArgs=(account!=='primary')?['-e','CLAUDE_CONFIG_DIR='+cfgDir]:[];
       const note=[
-        'You are a FORK of the session "'+parent+'"'+(carried?' and carry its conversation history':'')+'.',
-        'Your cwd '+cwd+' is a git worktree on branch '+branch+', branched from '+(pbranch||'HEAD')+' at the commit that session was on.',
-        'The primary checkout is '+mainRepo+' (branch '+(pbranch||'unknown')+'); it is the SAME repository \u2014 both worktrees share one object store and one set of refs.',
-        'So you can read and take its work directly, with no remote and no fetch: git log '+(pbranch||'HEAD')+', git diff '+(pbranch||'HEAD')+', git merge '+(pbranch||'HEAD')+', git rebase '+(pbranch||'HEAD')+'.',
+        'You are a FORK of the session “'+parent+'”'+(carried?', carrying its conversation history':'')+'.',
+        'STOP before acting: do NOT continue whatever that session was in the middle of. It was working somewhere else, on a different branch. Re-orient first — check where you are and what this branch is for, and say so — before you touch a file.',
+        'Your cwd '+cwd+' is a git worktree on branch '+branch+', cut from '+(d.pbranch||'HEAD')+' — the branch the parent is on, checked out at '+d.pcwd+'.',
+        'The primary checkout is '+d.mainRepo+' on '+(d.mainBranch||'unknown')+'. Every one of these is the SAME repository: all worktrees share one object store and one set of refs.',
+        'So you can take their work directly, with no remote and no fetch: git merge '+(d.pbranch||'HEAD')+', git diff '+(d.mainBranch||'HEAD')+', git log '+(d.mainBranch||'HEAD')+', git rebase '+(d.mainBranch||'HEAD')+'.',
         dirty
-          ? 'Its UNCOMMITTED changes did not come with you. To pull them in: git -C '+mainRepo+' diff | git apply - (add --staged for staged work; untracked files are not included).'
-          : 'It had no uncommitted changes when you were branched.',
-        'Never check out '+(pbranch||'that branch')+' here \u2014 git forbids the same branch in two worktrees. Work on '+branch+' and merge back when done.'
+          ? 'The parent working tree '+d.pcwd+' has UNCOMMITTED changes that did not come with you. To pull them in: git -C '+d.pcwd+' diff | git apply - (add --staged for staged work; untracked files are not included).'
+          : 'The parent working tree had no uncommitted changes when you were branched.',
+        'Never check out '+[d.pbranch,d.mainBranch].filter((v,i,a)=>v&&a.indexOf(v)===i).join(' or ')+' here — git forbids the same branch in two worktrees. Work on '+branch+' and merge back when done.'
       ].join(' ');
       const shq = v => "'"+String(v).replace(/'/g,"'\\''")+"'";
+      const envArgs=(account!=='primary')?['-e','CLAUDE_CONFIG_DIR='+cfgDir]:[];
       const cmd = (carried
-        ? CLAUDE_BIN+" --resume '"+ps.sid+"' --fork-session --remote-control '"+name+"' --dangerously-skip-permissions"
-        : CLAUDE_BIN+" --remote-control '"+name+"' --dangerously-skip-permissions")
-        + " --append-system-prompt "+shq(note);
+        ? CLAUDE_BIN+' --resume '+shq(ps.sid)+' --fork-session --remote-control '+shq(name)+' --dangerously-skip-permissions'
+        : CLAUDE_BIN+' --remote-control '+shq(name)+' --dangerously-skip-permissions')
+        + ' --append-system-prompt '+shq(note);
       tmux(['new-session','-d','-s',name,'-c',cwd].concat(envArgs).concat([cmd]));
       autoAnswer(name,'claude');
-    }
-    res.writeHead(200,{'Content-Type':'application/json'});
-    return res.end(JSON.stringify({ok,name,parent,cwd,branch,carried,dirty,err}));
+      if(carried) sendWhenReady(name,'You have just been forked into a new git worktree. Stop the task you were mid-way through — it belongs to the session you were forked from, not here. Run pwd, git branch --show-current and git status, then tell me in a couple of lines where you are, what this branch is for as far as you can tell, and what you would do first. Do not change any files until I answer.');
+      done({ok:true,name,parent,cwd,branch,carried,dirty,waited,busy,err:null});
+    })().catch(e=>{ try{ done({ok:false,err:String((e&&e.message)||e)}); }catch{} });
+    return;
   }
   if(req.method==='POST'&&u.pathname==='/api/kill'){ const n=clean(u.searchParams.get('name')); const rmwt=u.searchParams.get('worktree')==='1'; const cwd=u.searchParams.get('cwd')||''; if(n) tmux(['kill-session','-t',n]); let wt=null; if(rmwt) wt=removeWorktree(cwd); res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({ok:true,wt})); }
   if(u.pathname==='/api/sessions'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(sessions())); }
@@ -478,6 +517,14 @@ render(INIT);tick();setInterval(tick,2000);
 <label class=fld id=m_reporow>Repo<span class=repowrap><select id=m_repo onchange="syncName()"></select><label class=wtlbl title="isolated git worktree + branch"><input type=checkbox id=m_wt> worktree</label></span></label>
 <div class=sheetbtns><button class=ghost onclick="closeModal()">Cancel</button><button class=add onclick="doSpawn()">Launch</button></div>
 </div></div>
+<div id=bmodal class=modal hidden onclick="if(event.target===this)closeBModal()"><div class=sheet>
+<div class=sheettitle>Branch session</div>
+<div class=fldhint id=b_ctx style="text-transform:none;letter-spacing:0"></div>
+<label class=fld>Session name<input id=b_name type=text oninput="bSync()" spellcheck=false><span class=fldhint>new tmux session · its branch will be <span id=b_br>wt/…</span></span></label>
+<label class=fld>Worktree folder<input id=b_wt type=text spellcheck=false oninput="B_WT_TOUCHED=true"><span class=fldhint>created under ~/Code/.worktrees/</span></label>
+<label class=fld style="text-transform:none;letter-spacing:0;font-weight:400"><label class=wtlbl><input type=checkbox id=b_wait checked> wait for the parent to finish its current turn</label><span class=fldhint>forking mid-turn copies a half-written transcript</span></label>
+<div class=sheetbtns><button class=ghost onclick="closeBModal()">Cancel</button><button class=add id=b_go onclick="doBranch()">Branch</button></div>
+</div></div>
 <script>
 function open_(n){window.open('${TERM}/?arg='+n,'_blank');}
 var CODEBASE='${CODE}';
@@ -508,14 +555,39 @@ async function loadAccounts(){try{const a=await(await fetch('/api/accounts')).js
 loadAccounts();
 async function pollBridge(name){for(var i=0;i<14;i++){try{var j=await(await fetch('/api/bridge?name='+encodeURIComponent(name))).json();if(j.bridge)return j.bridge;}catch(e){}await new Promise(function(r){setTimeout(r,1500);});}return null;}
 async function doSpawn(){var mode=document.getElementById('m_mode').value;var repo=document.getElementById('m_repo').value;if(mode!=='teleport'&&!repo){alert('No repo found under ~/Code');return;}var wt=(mode==='teleport')?0:(document.getElementById('m_wt').checked?1:0);var session='';if(mode==='teleport'){session=(document.getElementById('m_session').value||'').trim();if(!session){alert('Paste the cloud session id or claude.ai/code URL to teleport');return;}}var win=(mode==='claude'||mode==='teleport')?window.open('about:blank','_blank'):null;if(win){try{win.document.write('<title>Launching…</title><body style="font:16px system-ui;padding:2rem;color:#334155">Launching…</body>');}catch(e){}}var account=((document.getElementById('m_account')||{}).value)||'primary';var q='/api/spawn?repo='+encodeURIComponent(repo)+'&mode='+mode+'&worktree='+wt+'&account='+encodeURIComponent(account)+(session?('&session='+encodeURIComponent(session)):'');var r=await(await fetch(q,{method:'POST'})).json();if(!r.ok){if(win)win.close();alert('Could not start session'+(r.err?': '+r.err:''));return;}if(win){var nm=r.name||'';if(mode==='claude'&&account==='primary'){var b=await pollBridge(nm);win.location=b?('https://claude.ai/code/'+b):('${TERM}/?arg='+encodeURIComponent(nm));}else{win.location='${TERM}/?arg='+encodeURIComponent(nm);}}closeModal();setTimeout(function(){location.reload();},1200);}
+var B_PARENT='', B_WT_TOUCHED=false;
+function closeBModal(){document.getElementById('bmodal').hidden=true;}
+function bSync(){var n=(document.getElementById('b_name').value||'').trim();
+ document.getElementById('b_br').textContent='wt/'+(n||'…');
+ if(!B_WT_TOUCHED){var repo=(document.getElementById('bmodal').dataset.repo||'');
+  var suffix=n.indexOf(repo+'-')===0?n.slice(repo.length+1):n;
+  document.getElementById('b_wt').value=repo+'__'+(suffix||'b');}}
 async function branchSession(n,e){if(e)e.stopPropagation();
- if(!confirm('Branch "'+n+'" into a new worktree?\\n\\nStarts a new session on a fresh branch off this one\u2019s current HEAD, carrying a fork of its conversation.\\nUncommitted changes stay with the original.'))return;
+ var d=await(await fetch('/api/branchinfo?name='+encodeURIComponent(n))).json();
+ if(!d.ok){alert('Cannot branch '+n+(d.err?': '+d.err:''));return;}
+ B_PARENT=n;B_WT_TOUCHED=false;
+ var m=document.getElementById('bmodal');m.dataset.repo=d.repoName;
+ document.getElementById('b_ctx').innerHTML='from <b>'+esc2(n)+'</b> \u00b7 repo <b>'+esc2(d.repoName)+'</b> on <b>'+esc2(d.pbranch||'?')+'</b>'
+  +(d.dirty?' \u00b7 <span style="color:#fbbf24">uncommitted changes stay with the parent</span>':'')
+  +(d.status==='busy'?' \u00b7 <span style="color:#fbbf24">busy right now</span>':'')
+  +(d.hasConvo?'':' \u00b7 <span style="color:#fbbf24">no conversation to fork</span>');
+ document.getElementById('b_name').value=d.name;document.getElementById('b_wt').value=d.wt;
+ document.getElementById('b_br').textContent=d.branch;
+ document.getElementById('b_go').textContent='Branch';document.getElementById('b_go').disabled=false;
+ m.hidden=false;document.getElementById('b_name').focus();}
+async function doBranch(){var as=(document.getElementById('b_name').value||'').trim();
+ var wt=(document.getElementById('b_wt').value||'').trim();
+ var wait=document.getElementById('b_wait').checked?1:0;
+ if(!as){alert('Give the new session a name');return;}
+ var go=document.getElementById('b_go');go.disabled=true;
+ go.textContent=wait?'Waiting for parent\u2026':'Branching\u2026';
+ var q='/api/branch?name='+encodeURIComponent(B_PARENT)+'&as='+encodeURIComponent(as)+'&wt='+encodeURIComponent(wt)+'&wait='+wait;
+ var r=await(await fetch(q,{method:'POST'})).json();
+ if(!r.ok){go.disabled=false;go.textContent='Branch';alert('Could not branch'+(r.err?': '+r.err:''));return;}
+ closeBModal();
  var win=window.open('about:blank','_blank');
- if(win){try{win.document.write('<title>Branching\u2026</title><body style="font:16px system-ui;padding:2rem;color:#334155">Branching\u2026</body>');}catch(err){}}
- var r=await(await fetch('/api/branch?name='+encodeURIComponent(n),{method:'POST'})).json();
- if(!r.ok){if(win)win.close();alert('Could not branch'+(r.err?': '+r.err:''));return;}
- if(r.dirty&&!r.carried)alert('Branched to '+r.branch+', but the parent has uncommitted changes that did not come along.');
- if(win){var b=await pollBridge(r.name);win.location=b?('https://claude.ai/code/'+b):('${TERM}/?arg='+encodeURIComponent(r.name));}
+ if(win){try{win.document.write('<title>Branching\u2026</title><body style="font:16px system-ui;padding:2rem;color:#334155">Branching\u2026</body>');}catch(err){}
+  var b=await pollBridge(r.name);win.location=b?('https://claude.ai/code/'+b):('${TERM}/?arg='+encodeURIComponent(r.name));}
  setTimeout(function(){location.reload();},1200);}
 async function killSession(n,e){e.stopPropagation();const c=document.querySelector('.card[data-name="'+CSS.escape(n)+'"]');const cwd=c?(c.dataset.cwd||''):'';const disp=(c&&c.querySelector('.name'))?c.querySelector('.name').textContent.trim():n;const isWt=cwd.indexOf('/.worktrees/')>=0;if(!confirm('Kill session "'+disp+'"?'))return;let wt=0;if(isWt){wt=confirm('This session runs in a git worktree:\\n'+cwd+'\\n\\nAlso remove the worktree and its branch?\\nUncommitted changes there will be lost.')?1:0;}let url='/api/kill?name='+encodeURIComponent(n);if(wt)url+='&worktree=1&cwd='+encodeURIComponent(cwd);await fetch(url,{method:'POST'});if(c)c.remove();}
 async function tick(){try{const d=await(await fetch('/api/sessions')).json();DATA=d;
