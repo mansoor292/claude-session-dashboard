@@ -44,7 +44,7 @@ Encrypt **wildcard** cert (DNS-01), behind HTTP basic auth.
  sessions.*            term.*                code.*                 pNNNN.*
  :5000 dashboard       :7681 ttyd            :8080 code-server      :NNNN your app
    │                     │
-   │                     └── tmux-web → `tmux new-session -A -s <arg>`  (attach by name)
+   │                     └── tmux-web → `tmux attach -t <arg>`  (attach by name, never creates)
    │
    └── reads: tmux + ~/.claude*/sessions/*.json (all accounts) + transcript mtimes + /proc
        writes: spawn/kill tmux sessions, create/remove git worktrees

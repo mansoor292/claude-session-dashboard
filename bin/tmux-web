@@ -5,4 +5,15 @@ S="${1:-claude-01}"
 # sanitize: only allow safe session-name chars
 S="$(echo "$S" | tr -cd 'A-Za-z0-9_-' | cut -c1-40)"
 [ -z "$S" ] && S="claude-01"
-exec tmux new-session -A -s "$S" -c "${CODE_ROOT:-$HOME/Code}"
+# ATTACH ONLY. Never create: ttyd auto-reconnects a dropped tab, so a `new-session -A`
+# here resurrects any session you kill while its terminal is still open (as a bare shell
+# in the wrong directory). Sessions are created by the dashboard, or by claude-sessions-init.
+if tmux has-session -t "=$S" 2>/dev/null; then
+  exec tmux attach -t "=$S"
+fi
+printf '\n  Session "%s" is not running.\n\n' "$S"
+printf '  Live sessions:\n'
+tmux list-sessions -F '    #{session_name}  (#{?session_attached,attached,idle})' 2>/dev/null || printf '    none\n'
+printf '\n  This terminal only attaches to existing sessions — start one from the dashboard.\n'
+# Hold the pty open: exiting immediately makes ttyd reconnect in a loop.
+read -r -p '  Press Enter to close. ' _
