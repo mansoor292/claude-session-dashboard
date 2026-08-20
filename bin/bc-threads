@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Route Basecamp replies back into the Claude session that owns the thread.
+
+A session posts to Basecamp and registers the thread here; the watcher polls each
+registered thread for new comments and types them into that session's tmux pane.
+
+  bc-threads post <project> <subject> [body]   post a message + register it
+  bc-threads reply <recording> <text>          comment on a thread we own
+  bc-threads register <recording|url> [-s S]   attach an existing thread to a session
+  bc-threads list                              show the registry
+  bc-threads unregister <recording>            stop watching a thread
+  bc-threads watch [--once] [--dry-run]        poll and deliver (see bc-watch.timer)
+
+Loop guard: comments we posted ourselves are skipped two ways — by id (recorded at
+post time) and by the FOOTER marker — because the CLI usually authenticates as the
+same human whose replies we *do* want to act on, so filtering by author would drop
+the wrong half.
+"""
+import json, os, re, subprocess, sys, time, html, argparse, glob
+
+BASECAMP = os.environ.get("BASECAMP_BIN", os.path.expanduser("~/.local/bin/basecamp"))
+TMUX     = os.environ.get("TMUX_BIN", "/usr/bin/tmux")
+SOCKET   = os.environ.get("TMUX_SOCKET", "default")     # sessions live on the default socket
+STORE    = os.path.expanduser(os.environ.get("BC_THREADS_FILE", "~/.claude/bc-threads.json"))
+FOOTER   = "— via Claude session"                       # marks our own comments, for humans and for us
+MAXLEN   = 1200                                         # per-comment body cut, keeps the pane sane
+
+
+# ---- registry -------------------------------------------------------------
+def load():
+    try:
+        with open(STORE) as f: return json.load(f)
+    except Exception: return {"threads": {}}
+
+def save(reg):
+    os.makedirs(os.path.dirname(STORE), exist_ok=True)
+    tmp = STORE + ".tmp"
+    with open(tmp, "w") as f: json.dump(reg, f, indent=1, sort_keys=True)
+    os.replace(tmp, STORE)                              # atomic: a crashed write never truncates
+
+
+# ---- basecamp cli ---------------------------------------------------------
+def bc(*args, check=True):
+    """Run the CLI and return the envelope's .data (absolute path: hooks/systemd lack ~/.local/bin)."""
+    p = subprocess.run([BASECAMP, *args, "--json"], capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        if not check: return None
+        sys.exit("basecamp %s failed: %s" % (" ".join(args), (p.stderr or p.stdout)[:400]))
+    try: env = json.loads(p.stdout)
+    except Exception:
+        if not check: return None
+        sys.exit("basecamp %s: unparseable output" % " ".join(args))
+    if not env.get("ok") and check:
+        sys.exit("basecamp %s: %s" % (" ".join(args), str(env)[:400]))
+    return env.get("data")
+
+
+# ---- sessions -------------------------------------------------------------
+def sessions():
+    """tmux session name -> {alive, status} from every account's Claude session registry."""
+    out = {}
+    for f in glob.glob(os.path.expanduser("~/.claude*/sessions/*.json")):
+        try: d = json.load(open(f))
+        except Exception: continue
+        name = (d.get("tmux", "") or "").split(":")[0]
+        if not name or not d.get("sessionId"): continue
+        pid = d.get("pid")
+        alive = bool(pid and os.path.exists("/proc/%d" % pid))
+        cur = out.get(name)
+        if cur is None or (alive and not cur["alive"]):
+            out[name] = {"alive": alive, "status": d.get("status") or ""}
+    return out
+
+def tmux_has(name):
+    return subprocess.run([TMUX, "-L", SOCKET, "has-session", "-t", "=" + name],
+                          capture_output=True).returncode == 0
+
+def deliver(name, text):
+    """Type one line into the session, then Enter. Newlines would submit early, so flatten."""
+    line = " ".join(text.split())
+    subprocess.run([TMUX, "-L", SOCKET, "send-keys", "-t", name, "-l", line], check=True)
+    time.sleep(0.4)
+    subprocess.run([TMUX, "-L", SOCKET, "send-keys", "-t", name, "Enter"], check=True)
+
+
+# ---- helpers --------------------------------------------------------------
+def detag(s):
+    s = re.sub(r"<bc-attachment[^>]*>.*?</bc-attachment>", " [attachment] ", s or "", flags=re.S)
+    s = re.sub(r"<br\s*/?>|</p>", " ", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    return re.sub(r"\s+", " ", html.unescape(s)).strip()
+
+def recording_id(ref):
+    if str(ref).isdigit(): return str(ref)
+    d = bc("url", "parse", str(ref))
+    return str((d or {}).get("recording_id") or "")
+
+def cur_session():
+    """The tmux session we are running inside, if any."""
+    p = subprocess.run([TMUX, "display-message", "-p", "#{session_name}"], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+# ---- commands -------------------------------------------------------------
+def cmd_register(a):
+    rid = recording_id(a.recording)
+    if not rid: sys.exit("could not resolve a recording id from %r" % a.recording)
+    sess = a.session or cur_session()
+    if not sess: sys.exit("no --session given and not running inside tmux")
+    comments = bc("comments", "list", rid) or []
+    ids = sorted(int(c["id"]) for c in comments)
+    reg = load()
+    reg["threads"][rid] = {
+        "session": sess,
+        "project": a.project or (comments[0].get("bucket", {}).get("id") if comments else None),
+        "title": (comments[0].get("parent", {}) or {}).get("title", "") if comments else "",
+        "url": (comments[0].get("parent", {}) or {}).get("app_url", "") if comments else "",
+        # --from-start replays existing comments; default is "only what arrives from now on"
+        "last_comment_id": 0 if a.from_start else (ids[-1] if ids else 0),
+        "ours": [],
+        "registered": int(time.time()),
+    }
+    save(reg)
+    print("watching %s -> session %s (from comment %s)" % (rid, sess, reg["threads"][rid]["last_comment_id"]))
+
+def cmd_post(a):
+    body = a.body or ""
+    sess = a.session or cur_session()
+    if sess: body = (body + "\n\n" + FOOTER + " " + sess).strip()
+    d = bc("messages", "create", a.subject, body or "-", "--in", a.project) or {}
+    rid = str(d.get("id") or "")
+    if not rid: sys.exit("posted but no recording id came back: %s" % str(d)[:300])
+    print("posted %s %s" % (rid, d.get("app_url", "")))
+    cmd_register(argparse.Namespace(recording=rid, session=sess, project=a.project, from_start=False))
+
+def cmd_reply(a):
+    rid = recording_id(a.recording)
+    sess = a.session or cur_session()
+    text = a.text + ("\n\n" + FOOTER + " " + sess if sess else "")
+    d = bc("comments", "create", rid, text, *(["--in", a.project] if a.project else [])) or {}
+    reg = load()
+    t = reg["threads"].get(rid)
+    if t and d.get("id"):
+        t.setdefault("ours", []).append(int(d["id"]))       # never feed our own reply back in
+        save(reg)
+    print("replied %s" % d.get("id", "?"))
+
+def cmd_list(a):
+    reg, live = load(), sessions()
+    if not reg["threads"]: print("no threads registered"); return
+    for rid, t in sorted(reg["threads"].items()):
+        s = live.get(t["session"], {})
+        state = "alive/" + (s.get("status") or "?") if s.get("alive") else ("shell" if tmux_has(t["session"]) else "GONE")
+        print("%-14s -> %-28s [%s]  last=%s  %s" % (rid, t["session"], state, t.get("last_comment_id"), (t.get("title") or "")[:40]))
+
+def cmd_unregister(a):
+    reg = load(); rid = recording_id(a.recording)
+    if reg["threads"].pop(rid, None): save(reg); print("stopped watching", rid)
+    else: print("not registered:", rid)
+
+def cmd_watch(a):
+    reg, live = load(), sessions()
+    if not reg["threads"]:
+        if a.verbose: print("no threads registered")
+        return
+    dirty = False
+    for rid, t in sorted(reg["threads"].items()):
+        comments = bc("comments", "list", rid, check=False)
+        if comments is None:
+            print("!! %s: could not fetch comments" % rid); continue
+        seen, ours = int(t.get("last_comment_id") or 0), set(t.get("ours") or [])
+        fresh = [c for c in sorted(comments, key=lambda c: int(c["id"]))
+                 if int(c["id"]) > seen and int(c["id"]) not in ours and FOOTER not in (c.get("content") or "")]
+        newest = max([int(c["id"]) for c in comments] or [seen])
+        if not fresh:
+            if newest > seen: t["last_comment_id"] = newest; dirty = True   # skip past our own chatter
+            if a.verbose: print("   %s: nothing new" % rid)
+            continue
+        sess = t["session"]
+        info = live.get(sess, {})
+        if not info.get("alive"):
+            print("-- %s: %d new, but session %s is not running — holding" % (rid, len(fresh), sess)); continue
+        if info.get("status") == "busy":
+            print("-- %s: %d new, but %s is busy — holding" % (rid, len(fresh), sess)); continue
+        # One delivery for the whole batch: separate submissions just queue behind each other.
+        parts = []
+        for c in fresh:
+            who = (c.get("creator") or {}).get("name") or "someone"
+            parts.append('%s: "%s"' % (who, detag(c.get("content"))[:MAXLEN]))
+        msg = ('Basecamp — %d new %s on "%s". %s Thread: %s . To answer on the thread run: '
+               'bc-threads reply %s "your reply"'
+               % (len(fresh), "reply" if len(fresh) == 1 else "replies",
+                  (t.get("title") or rid)[:60], "  ".join(parts),
+                  fresh[-1].get("app_url") or t.get("url") or "", rid))
+        if a.dry_run:
+            print("   would deliver to %s: %s" % (sess, msg[:200]))
+        else:
+            deliver(sess, msg)
+            print("-> %s: delivered %d comment(s), through %s" % (sess, len(fresh), fresh[-1]["id"]))
+            t["last_comment_id"] = max(int(c["id"]) for c in fresh); dirty = True
+    if dirty and not a.dry_run: save(reg)
+
+
+p = argparse.ArgumentParser(prog="bc-threads", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+sub = p.add_subparsers(dest="cmd", required=True)
+
+sp = sub.add_parser("register"); sp.add_argument("recording"); sp.add_argument("-s", "--session"); sp.add_argument("-p", "--project")
+sp.add_argument("--from-start", action="store_true", help="replay existing comments instead of only new ones"); sp.set_defaults(fn=cmd_register)
+sp = sub.add_parser("post"); sp.add_argument("project"); sp.add_argument("subject"); sp.add_argument("body", nargs="?")
+sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_post)
+sp = sub.add_parser("reply"); sp.add_argument("recording"); sp.add_argument("text"); sp.add_argument("-p", "--project")
+sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_reply)
+sp = sub.add_parser("list"); sp.set_defaults(fn=cmd_list)
+sp = sub.add_parser("unregister"); sp.add_argument("recording"); sp.set_defaults(fn=cmd_unregister)
+sp = sub.add_parser("watch"); sp.add_argument("--once", action="store_true"); sp.add_argument("--dry-run", action="store_true")
+sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_watch)
+
+a = p.parse_args()
+a.fn(a)

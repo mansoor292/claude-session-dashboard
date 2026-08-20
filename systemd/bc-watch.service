@@ -1,0 +1,9 @@
+[Unit]
+Description=Deliver Basecamp replies into the Claude session that owns the thread
+
+[Service]
+Type=oneshot
+User=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/bc-threads watch

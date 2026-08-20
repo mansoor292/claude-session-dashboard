@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll registered Basecamp threads for human replies
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=90s
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
