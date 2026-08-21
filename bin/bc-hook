@@ -33,24 +33,34 @@ def load_secret():
 
 
 class Poller:
-    """Collapses a burst of events into a single `bc-threads watch`."""
-    def __init__(self):
-        self.lock, self.pending, self.last = threading.Lock(), False, 0.0
+    """Collapses a burst of events into one `bc-threads watch`.
 
-    def trigger(self):
+    Routing lives in the registry, not in the payload — the recording id is used only to
+    narrow which thread gets re-fetched, so a forged id can at most cause a re-poll of a
+    thread we already watch. Pings are skipped: they have their own timer sweep and a
+    comment event says nothing about them.
+    """
+    def __init__(self):
+        self.lock, self.pending, self.ids, self.last = threading.Lock(), False, set(), 0.0
+
+    def trigger(self, rid=None):
         with self.lock:
+            if rid: self.ids.add(str(rid))
             if self.pending: return
             self.pending = True
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
         time.sleep(DEBOUNCE)
-        with self.lock: self.pending = False
+        with self.lock:
+            self.pending, ids = False, set(self.ids); self.ids.clear()
+        cmd = [BC_THREADS, "watch", "--no-adopt", "--no-pings"]
+        if len(ids) == 1:                       # one thread touched: re-fetch just that one
+            cmd += ["--only", ids.pop()]
         try:
-            p = subprocess.run([BC_THREADS, "watch", "--no-adopt"], capture_output=True,
-                               text=True, timeout=300)
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             out = (p.stdout or "").strip()
-            if out: print(out, flush=True)
+            print(out if out else "polled (%s), nothing new" % (" ".join(cmd[2:]) or "all"), flush=True)
         except Exception as e:
             print("!! poll failed: %s" % e, flush=True)
         self.last = time.time()
@@ -72,13 +82,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._reply(404, b"not found"); return
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(min(n, 65536)) if n else b""
-        kind = ""
-        try:                                     # logged only — never delivered
-            kind = (json.loads(raw or b"{}").get("kind") or "")[:60]
+        kind, rid = "", None
+        try:                                     # id narrows the poll; content is never used
+            d = json.loads(raw or b"{}")
+            kind = (d.get("kind") or "")[:60]
+            rec = d.get("recording") or {}
+            rid = (rec.get("parent") or {}).get("id") or rec.get("id")
         except Exception:
             pass
-        print("event %s from %s — polling" % (kind or "?", self.client_address[0]), flush=True)
-        self.poller.trigger()
+        print("event %s (recording %s) from %s — polling" % (kind or "?", rid or "?", self.client_address[0]), flush=True)
+        self.poller.trigger(rid)
         self._reply(200)
 
     def do_GET(self):

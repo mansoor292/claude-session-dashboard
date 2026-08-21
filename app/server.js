@@ -242,6 +242,32 @@ function inGitRepo(cwd){
   }
   return false;
 }
+// ---- Basecamp bridge state (written by bin/bc-threads) ----
+const BC_STORE   = HOMEDIR+'/.claude/bc-threads.json';
+const BC_HISTORY = HOMEDIR+'/.claude/bc-history.jsonl';
+const BC_HOOKS   = HOMEDIR+'/.claude/bc-hooks.json';
+function bcState(){
+  let reg={threads:{},pings:{}}, hooks={projects:{}}, hist=[];
+  try{ reg=JSON.parse(fs.readFileSync(BC_STORE,'utf8')); }catch{}
+  try{ hooks=JSON.parse(fs.readFileSync(BC_HOOKS,'utf8')); }catch{}
+  try{
+    const lines=fs.readFileSync(BC_HISTORY,'utf8').trim().split('\n').slice(-400);
+    for(const l of lines){ try{ hist.push(JSON.parse(l)); }catch{} }
+  }catch{}
+  hist.reverse();                                   // newest first
+  const live={}; for(const x of sessions()) live[x.name]={bridge:x.bridge,rc:!!x.rc,cwd:x.cwd,attached:x.attached};
+  const threads=Object.entries(reg.threads||{}).map(([id,t])=>({
+    id, kind:'thread', title:t.title||'', session:t.session||'', project:String(t.project||''),
+    url:t.url||'', last:t.last_comment_id||0, ours:(t.ours||[]).length,
+    bridge:(live[t.session]||{}).bridge||null, alive:!!live[t.session]
+  }));
+  const pings=Object.entries(reg.pings||{}).map(([id,t])=>({
+    id, kind:'ping', title:t.who||'', session:t.session||'_dashboard', project:'',
+    url:'https://app.basecamp.com/4156959/circles/'+id, last:t.last_line_id||0, ours:0,
+    bridge:(live[t.session||'_dashboard']||{}).bridge||null, alive:!!live[t.session||'_dashboard']
+  }));
+  return {threads:threads.concat(pings), hooks, hist, self:reg.self||null};
+}
 const gb = b => (b/1073741824);
 const fmtGB = b => gb(b).toFixed(1)+'G';
 const fmtUp = s => { const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60); return (d?d+'d ':'')+(h?h+'h ':'')+m+'m'; };
@@ -417,6 +443,61 @@ http.createServer((req,res)=>{
   if(u.pathname==='/api/stats'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(stats())); }
 
   // ---- Monitor page ----
+  if(u.pathname==='/api/basecamp'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(bcState())); }
+  if(u.pathname==='/basecamp'){
+    const d=bcState();
+    const ago=t=>{ if(!t) return '—'; const s=Math.floor(Date.now()/1000)-t; if(s<60) return s+'s'; if(s<3600) return Math.floor(s/60)+'m'; if(s<86400) return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d'; };
+    const hookRows=Object.entries(d.hooks.projects||{}).map(([proj,hs])=>{
+      const mine=hs.filter(h=>h.mine);
+      const th=d.threads.filter(t=>t.project===proj);
+      return `<tr><td class=cmd>${esc(proj)}</td>
+        <td>${mine.length?`<span class="pill live">${esc(String(mine[0].id))} ${mine[0].active?'active':'inactive'}</span> <span class=dim>${esc((mine[0].types||[]).join(','))}</span>`:'<span class="pill idle">none</span>'}</td>
+        <td>${th.map(t=>`<span class=chip>${esc(t.title||t.id)}</span>`).join(' ')||'<span class=dim>—</span>'}</td>
+        <td>${[...new Set(th.map(t=>t.session))].map(x=>esc(x)).join(', ')||'<span class=dim>—</span>'}</td></tr>`;
+    }).join('');
+    const linkRows=d.threads.map(t=>`<tr>
+      <td><span class="pill ${t.kind==='ping'?'rc':'live'}">${t.kind}</span></td>
+      <td>${t.url?`<a href="${esc(t.url)}" target=_blank rel=noopener>${esc(t.title||t.id)}</a>`:esc(t.title||t.id)}<div class=dim>${esc(t.id)}</div></td>
+      <td class=cmd>${esc(t.project||'—')}</td>
+      <td>${esc(t.session||'—')} ${t.alive?'<span class="pill live">live</span>':'<span class="pill idle">gone</span>'}</td>
+      <td>${t.bridge?`<a href="https://claude.ai/code/${esc(t.bridge)}" target=_blank rel=noopener>claude.ai ↗</a>`:'<span class=dim>not bridged</span>'}</td>
+      <td class=num>${t.ours||0}</td></tr>`).join('');
+    const histRows=d.hist.map(h=>{
+      const k=h.kind==='sent'?'sent':(h.kind==='hold'?'held':'in');
+      const cls=h.kind==='sent'?'acct':(h.kind==='hold'?'idle':'live');
+      return `<tr><td class=num title="${esc(new Date((h.ts||0)*1000).toISOString())}">${ago(h.ts)}</td>
+        <td><span class="pill ${cls}">${k}</span></td>
+        <td>${esc(h.title||h.thread||h.circle||'')}</td>
+        <td>${esc(h.frm||(h.kind==='sent'?'CatalogsAI':''))}</td>
+        <td>${esc(h.session||'')}</td>
+        <td class=msg>${esc(h.text||(h.why?('('+h.why+', '+(h.count||0)+' waiting)'):''))}</td></tr>`;
+    }).join('');
+    res.writeHead(200,{'Content-Type':'text/html'});
+    return res.end(`<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Basecamp · Claude box</title>
+<style>${CSS}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#94a3b8;margin:26px 0 6px}
+table{width:100%;border-collapse:collapse;font-size:13px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:12px;overflow:hidden}
+th{text-align:left;color:#94a3b8;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.06em;padding:9px 11px;border-bottom:1px solid rgba(148,163,184,.2)}
+td{padding:8px 11px;border-bottom:1px solid rgba(148,163,184,.07);vertical-align:top}
+td.num{font-variant-numeric:tabular-nums;color:#94a3b8;white-space:nowrap}
+td.cmd{font-family:ui-monospace,Menlo,monospace;color:#7dd3fc}
+td.msg{color:#cbd5e1;max-width:640px}
+.dim{color:#64748b;font-size:11.5px}
+.chip{display:inline-block;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.3);color:#7dd3fc;border-radius:7px;padding:1px 7px;font-size:11.5px;margin:1px 0}
+a{color:#7dd3fc;text-decoration:none} a:hover{text-decoration:underline}
+.hookurl{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:#64748b;word-break:break-all}
+</style></head><body><div class=wrap>
+<header><div><h1>Basecamp bridge</h1><span class=sub>${d.threads.length} watched · ${d.hist.length} events · posting as ${esc((d.self||{}).name||'?')}</span></div>
+<div class=nav><a href="/">Sessions</a><a href="/monitor">📊 Monitor</a><a href="/basecamp" class=on>Basecamp</a></div></header>
+<h2>Webhooks → projects → sessions</h2>
+<table><thead><tr><th>Project</th><th>Webhook</th><th>Watched threads</th><th>Sessions</th></tr></thead><tbody>${hookRows||'<tr><td colspan=4 class=dim>no webhook snapshot yet — run bc-threads hooks</td></tr>'}</tbody></table>
+<div class=hookurl>receiver: ${esc((d.hooks.url||'').replace(/\/[^/]+$/,'/••••••'))} · snapshot ${ago(d.hooks.checked)} ago</div>
+<h2>Thread ↔ session links</h2>
+<table><thead><tr><th>Kind</th><th>Thread</th><th>Project</th><th>Session</th><th>Web</th><th>Sent</th></tr></thead><tbody>${linkRows||'<tr><td colspan=6 class=dim>nothing registered</td></tr>'}</tbody></table>
+<h2>Message history</h2>
+<table><thead><tr><th>When</th><th></th><th>Thread</th><th>From</th><th>Session</th><th>Message</th></tr></thead><tbody>${histRows||'<tr><td colspan=6 class=dim>no messages yet</td></tr>'}</tbody></table>
+</div><script>setTimeout(function(){location.reload();},20000);</script></body></html>`);
+  }
   if(u.pathname==='/monitor'){
     const s=stats();
     res.writeHead(200,{'Content-Type':'text/html'});
@@ -437,7 +518,7 @@ td.cmd{font-family:ui-monospace,Menlo,monospace;color:#7dd3fc}
 .mini i{display:block;height:100%;background:#38bdf8}
 </style></head><body><div class=wrap>
 <header><div><h1>📊 System Monitor</h1><span class=sub id=meta></span></div>
-<div class=nav><a href="/">Sessions</a><a href="/monitor" class=on>Monitor</a></div></header>
+<div class=nav><a href="/">Sessions</a><a href="/monitor" class=on>Monitor</a><a href="/basecamp">Basecamp</a></div></header>
 <div class=gauges id=gauges></div>
 <table><thead><tr><th>PID</th><th>Process</th><th>CPU %</th><th>MEM %</th><th>RSS</th></tr></thead><tbody id=procs></tbody></table>
 </div>
@@ -528,7 +609,7 @@ render(INIT);tick();setInterval(tick,2000);
  .lact .lbranch:hover{background:#6366f1;color:#fff;border-color:#6366f1}
 </style></head><body><div class=wrap>
 <header><div><h1>🧠 Claude Sessions</h1><span class=sub>${s.length} sessions · refreshes every 4s</span></div>
-<div class=nav><a href="/" class=on>Sessions</a><a href="/monitor">📊 Monitor</a><span class=viewtoggle><button class=viewbtn data-v=grid onclick="setView('grid')">▦ Grid</button><button class=viewbtn data-v=list onclick="setView('list')">☰ List</button></span><button class=add onclick=openModal()>+ Session</button></div></header>
+<div class=nav><a href="/" class=on>Sessions</a><a href="/monitor">📊 Monitor</a><a href="/basecamp">✉️ Basecamp</a><span class=viewtoggle><button class=viewbtn data-v=grid onclick="setView('grid')">▦ Grid</button><button class=viewbtn data-v=list onclick="setView('list')">☰ List</button></span><button class=add onclick=openModal()>+ Session</button></div></header>
 <div class=grid id=g>${s.map(card).join('')}</div>
 <div id=listwrap style="display:none"><table class=ltbl><thead><tr><th class=sortable data-k=name onclick="setSort('name')">Name</th><th class=sortable data-k=repo onclick="setSort('repo')">Repo</th><th class=sortable data-k=launch onclick="setSort('launch')">Launched</th><th class=sortable data-k=used onclick="setSort('used')">Last used</th><th class=sortable data-k=cpu onclick="setSort('cpu')">CPU</th><th class=sortable data-k=mem onclick="setSort('mem')">Mem</th><th>Status</th><th></th></tr></thead><tbody id=ltbody></tbody></table></div></div>
 <div id=modal class=modal hidden onclick="if(event.target===this)closeModal()"><div class=sheet>
