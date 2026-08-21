@@ -46,7 +46,7 @@ Encrypt **wildcard** cert (DNS-01), behind HTTP basic auth.
    │                     │
    │                     └── tmux-web → `tmux attach -t <arg>`  (attach by name, never creates)
    │
-   ├── bc-hook.service → webhook receiver, p8977 (Basecamp comment → immediate poll)
+   ├── bc-hook.service → webhook receiver, p8977 (one webhook per connected project)
    ├── bc-watch.timer  → `bc-threads watch`  (safety net + pings, every 2m)
    └── bc-authcheck.timer → warns before the Basecamp token expires
    │

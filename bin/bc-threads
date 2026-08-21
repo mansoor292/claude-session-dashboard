@@ -414,26 +414,66 @@ def cmd_ping_link(a):
     print("ping circle %s now routes to %s" % (a.circle, a.session))
 
 
-def ensure_hook(project, quiet=True):
-    """Make sure this project has our Comment webhook, so a new thread is instant.
+def hook_url():
+    try:
+        return subprocess.run([os.environ.get("BC_HOOK_BIN", "/usr/local/bin/bc-hook"), "--print-url"],
+                              capture_output=True, text=True, timeout=30).stdout.strip()
+    except Exception:
+        return ""
 
-    Without one the thread is still watched, just by the 2-minute timer — working but
-    silently slower, which is the kind of gap nobody notices until it matters.
+
+def connect_project(project, reg=None, quiet=True):
+    """Connect THIS BOX to a project: one Comment webhook, recorded in the registry.
+
+    The webhook belongs to the box↔project pair, not to any thread or session. Threads
+    come and go and sessions get unlinked; the connection outlives all of that, so it is
+    stored explicitly rather than inferred from whatever happens to be registered.
     """
     if not project: return False
-    try:
-        url = subprocess.run([os.environ.get("BC_HOOK_BIN", "/usr/local/bin/bc-hook"), "--print-url"],
-                             capture_output=True, text=True, timeout=30).stdout.strip()
-        if not url: return False
-        hooks = bc("webhooks", "list", "--in", str(project), check=False) or []
-        if any((h.get("payload_url") or "").rstrip("/") == url.rstrip("/") for h in hooks):
-            return True
-        d = bc("webhooks", "create", url, "--in", str(project), "--types", "Comment", check=False)
-        if d and not quiet: print("hooked project %s (webhook %s)" % (project, d.get("id")))
-        elif d: print("   webhook created for project %s" % project)
-        return bool(d)
-    except Exception as e:
-        print("!! could not set up webhook for %s: %s" % (project, e)); return False
+    project = str(project)
+    own = reg is None
+    if own: reg = load()
+    projects = reg.setdefault("projects", {})
+    url = hook_url()
+    if not url:
+        print("!! no webhook url (is bc-hook installed?)"); return False
+    hooks = bc("webhooks", "list", "--in", project, check=False) or []
+    mine = [h for h in hooks if (h.get("payload_url") or "").rstrip("/") == url.rstrip("/")]
+    if mine:
+        rec = projects.setdefault(project, {"connected": int(time.time())})
+        rec["hook_id"] = mine[0].get("id"); rec["active"] = mine[0].get("active")
+        if own: save(reg)
+        return True
+    d = bc("webhooks", "create", url, "--in", project, "--types", "Comment", check=False)
+    if not d:
+        print("!! could not create webhook for project %s" % project); return False
+    projects[project] = {"hook_id": d.get("id"), "active": True, "connected": int(time.time())}
+    if own: save(reg)
+    print("   connected project %s (webhook %s)" % (project, d.get("id")))
+    return True
+
+
+def disconnect_project(project, reg=None):
+    """Drop this box's webhook for a project. Threads stay registered — they just fall
+    back to timer polling, which is what the connection was accelerating."""
+    project = str(project)
+    own = reg is None
+    if own: reg = load()
+    url = hook_url()
+    removed = []
+    for h in bc("webhooks", "list", "--in", project, check=False) or []:
+        if (h.get("payload_url") or "").rstrip("/") == url.rstrip("/"):
+            if bc("webhooks", "delete", str(h["id"]), "--in", project, check=False) is not None:
+                removed.append(h["id"])
+    (reg.setdefault("projects", {})).pop(project, None)
+    if own: save(reg)
+    print("   disconnected project %s%s" % (project, (" (removed webhook %s)" % ", ".join(map(str, removed))) if removed else ""))
+    return True
+
+
+def ensure_hook(project, quiet=True):
+    """Registering a thread implies the box wants this project connected."""
+    return connect_project(project, quiet=quiet)
 
 
 def cmd_hooks(a):
@@ -447,17 +487,25 @@ def cmd_hooks(a):
                          capture_output=True, text=True).stdout.strip()
     if not url: sys.exit("could not work out the webhook url (is bc-hook installed?)")
     reg = load()
-    want = {str(t.get("project")) for t in reg["threads"].values() if t.get("project")}
-    print("watching %d project(s): %s" % (len(want), ", ".join(sorted(want)) or "-"))
+    # The connection list is the authority. Projects seen on threads are folded in once,
+    # so an older registry migrates without losing anything.
+    want = set((reg.get("projects") or {}).keys())
+    inferred = {str(t.get("project")) for t in reg["threads"].values() if t.get("project")}
+    if inferred - want:
+        print("adopting %d project(s) from existing threads" % len(inferred - want))
+        want |= inferred
+    print("box connected to %d project(s): %s" % (len(want), ", ".join(sorted(want)) or "-"))
     for proj in sorted(want):
         hooks = bc("webhooks", "list", "--in", proj, check=False) or []
         mine = [h for h in hooks if (h.get("payload_url") or "").rstrip("/") == url.rstrip("/")]
         if mine:
-            print("  %s: already hooked (%s)" % (proj, mine[0].get("id"))); continue
+            rec = (reg.setdefault("projects", {})).setdefault(proj, {"connected": int(time.time())})
+            rec["hook_id"] = mine[0].get("id"); rec["active"] = mine[0].get("active")
+            print("  %s: connected (%s)" % (proj, mine[0].get("id"))); continue
         if a.dry_run:
-            print("  %s: would create webhook" % proj); continue
-        d = bc("webhooks", "create", url, "--in", proj, "--types", a.types, check=False)
-        print("  %s: %s" % (proj, ("created " + str((d or {}).get("id"))) if d else "FAILED"))
+            print("  %s: would connect" % proj); continue
+        connect_project(proj, reg)
+    save(reg)
     snap = {"url": url, "checked": int(time.time()), "projects": {}}
     for proj in sorted(want):
         snap["projects"][proj] = [
@@ -473,6 +521,23 @@ def cmd_hooks(a):
                 if (h.get("payload_url") or "").rstrip("/") == url.rstrip("/"):
                     bc("webhooks", "delete", str(h["id"]), "--in", proj, check=False)
                     print("  %s: removed webhook %s" % (proj, h["id"]))
+
+
+def cmd_projects(a):
+    reg = load()
+    projects = reg.get("projects") or {}
+    if a.connect:
+        for p_ in a.connect: connect_project(p_, reg)
+        save(reg); return
+    if a.disconnect:
+        for p_ in a.disconnect: disconnect_project(p_, reg)
+        save(reg); return
+    if not projects: print("this box is not connected to any project"); return
+    threads = reg.get("threads") or {}
+    for proj, rec in sorted(projects.items()):
+        n = sum(1 for t in threads.values() if str(t.get("project")) == proj)
+        print("%-12s webhook %-9s %s  %d watched thread(s)"
+              % (proj, rec.get("hook_id") or "-", "active" if rec.get("active") else "?", n))
 
 
 def cmd_authcheck(a):
@@ -586,6 +651,8 @@ sp = sub.add_parser("ping-reply"); sp.add_argument("circle"); sp.add_argument("t
 sp.add_argument("--chat"); sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_ping_reply)
 sp = sub.add_parser("ping-link"); sp.add_argument("circle"); sp.add_argument("session")
 sp.set_defaults(fn=cmd_ping_link)
+sp = sub.add_parser("projects"); sp.add_argument("--connect", nargs="*"); sp.add_argument("--disconnect", nargs="*")
+sp.set_defaults(fn=cmd_projects)
 sp = sub.add_parser("hooks"); sp.add_argument("--types", default="Comment")
 sp.add_argument("--dry-run", action="store_true"); sp.add_argument("--prune", action="store_true")
 sp.add_argument("--prune-projects", nargs="*"); sp.set_defaults(fn=cmd_hooks)

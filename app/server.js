@@ -292,7 +292,12 @@ function bcState(){
     url:'https://app.basecamp.com/4156959/circles/'+id, last:t.last_line_id||0, ours:0,
     bridge:(live[t.session||'_dashboard']||{}).bridge||null, alive:!!live[t.session||'_dashboard']
   }));
-  return {threads:threads.concat(pings), hooks, hist, self:reg.self||null};
+  const projects=Object.entries(reg.projects||{}).map(([id,r])=>({
+    id, hook:r.hook_id||null, active:!!r.active, connected:r.connected||0,
+    threads:threads.filter(t=>t.project===id),
+    sessions:[...new Set(threads.filter(t=>t.project===id).map(t=>t.session))]
+  })).sort((a,b)=>a.id.localeCompare(b.id));
+  return {projects, threads:threads.concat(pings), hooks, hist, self:reg.self||null};
 }
 const gb = b => (b/1073741824);
 const fmtGB = b => gb(b).toFixed(1)+'G';
@@ -469,6 +474,16 @@ http.createServer((req,res)=>{
   if(u.pathname==='/api/stats'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(stats())); }
 
   // ---- Monitor page ----
+  if(req.method==='POST'&&(u.pathname==='/api/basecamp/connect'||u.pathname==='/api/basecamp/disconnect')){
+    const proj=(u.searchParams.get('project')||'').replace(/[^0-9]/g,'');
+    const flag=(u.pathname.endsWith('/connect'))?'--connect':'--disconnect';
+    if(!proj){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({ok:false,err:'missing project'})); }
+    let out='',ok=true;
+    try{ out=execFileSync('/usr/local/bin/bc-threads',['projects',flag,proj],{encoding:'utf8',timeout:120000}); }
+    catch(e){ ok=false; out=String((e&&(e.stdout||e.message))||e); }
+    bcNote({kind:flag==='--connect'?'connect':'disconnect',title:'project '+proj,text:out.trim().slice(0,300)});
+    res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({ok,out:out.trim()}));
+  }
   if(req.method==='POST'&&u.pathname==='/api/basecamp/unlink'){
     const kind=(u.searchParams.get('kind')==='ping')?'ping':'thread';
     const id=(u.searchParams.get('id')||'').replace(/[^0-9]/g,'');
@@ -479,14 +494,11 @@ http.createServer((req,res)=>{
   if(u.pathname==='/basecamp'){
     const d=bcState();
     const ago=t=>{ if(!t) return '—'; const s=Math.floor(Date.now()/1000)-t; if(s<60) return s+'s'; if(s<3600) return Math.floor(s/60)+'m'; if(s<86400) return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d'; };
-    const hookRows=Object.entries(d.hooks.projects||{}).map(([proj,hs])=>{
-      const mine=hs.filter(h=>h.mine);
-      const th=d.threads.filter(t=>t.project===proj);
-      return `<tr><td class=cmd>${esc(proj)}</td>
-        <td>${mine.length?`<span class="pill live">${esc(String(mine[0].id))} ${mine[0].active?'active':'inactive'}</span> <span class=dim>${esc((mine[0].types||[]).join(','))}</span>`:'<span class="pill idle">none</span>'}</td>
-        <td>${th.map(t=>`<span class=chip>${esc(t.title||t.id)}</span>`).join(' ')||'<span class=dim>—</span>'}</td>
-        <td>${[...new Set(th.map(t=>t.session))].map(x=>esc(x)).join(', ')||'<span class=dim>—</span>'}</td></tr>`;
-    }).join('');
+    const hookRows=d.projects.map(p=>`<tr><td class=cmd>${esc(p.id)}</td>
+        <td>${p.hook?`<span class="pill live">webhook ${esc(String(p.hook))}${p.active?'':' (inactive)'}</span>`:'<span class="pill idle">no webhook — polling only</span>'}</td>
+        <td>${p.threads.map(t=>`<span class=chip>${esc(t.title||t.id)}</span>`).join(' ')||'<span class=dim>no threads watched</span>'}</td>
+        <td>${p.sessions.map(x=>esc(x)).join(', ')||'<span class=dim>—</span>'}</td>
+        <td><button class=unlink data-act=disconnect data-id="${esc(p.id)}" data-n="${p.threads.length}" title="remove this box's webhook for the project">disconnect</button></td></tr>`).join('');
     const linkRows=d.threads.map(t=>`<tr>
       <td><span class="pill ${t.kind==='ping'?'rc':'live'}">${t.kind}</span></td>
       <td>${t.url?`<a href="${esc(t.url)}" target=_blank rel=noopener>${esc(t.title||t.id)}</a>`:esc(t.title||t.id)}<div class=dim>${esc(t.id)}</div></td>
@@ -522,10 +534,11 @@ a{color:#7dd3fc;text-decoration:none} a:hover{text-decoration:underline}
 .unlink{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.32);color:#f87171;border-radius:8px;padding:3px 10px;font-size:11.5px;cursor:pointer}
 .unlink:hover{background:#ef4444;color:#fff;border-color:#ef4444}
 </style></head><body><div class=wrap>
-<header><div><h1>Basecamp bridge</h1><span class=sub>${d.threads.length} watched · ${d.hist.length} events · posting as ${esc((d.self||{}).name||'?')}</span></div>
+<header><div><h1>Basecamp bridge</h1><span class=sub>${d.projects.length} project(s) · ${d.threads.length} watched · ${d.hist.length} events · posting as ${esc((d.self||{}).name||'?')}</span></div>
 <div class=nav><a href="/">Sessions</a><a href="/monitor">📊 Monitor</a><a href="/basecamp" class=on>Basecamp</a></div></header>
-<h2>Webhooks → projects → sessions</h2>
-<table><thead><tr><th>Project</th><th>Webhook</th><th>Watched threads</th><th>Sessions</th></tr></thead><tbody>${hookRows||'<tr><td colspan=4 class=dim>no webhook snapshot yet — run bc-threads hooks</td></tr>'}</tbody></table>
+<h2>This box ↔ projects</h2>
+<div class=dim style="margin-bottom:6px">One webhook per project, owned by the box. Independent of threads and sessions — unlinking a thread leaves the connection alone.</div>
+<table><thead><tr><th>Project</th><th>Connection</th><th>Watched threads</th><th>Sessions</th><th></th></tr></thead><tbody>${hookRows||'<tr><td colspan=5 class=dim>not connected to any project</td></tr>'}</tbody></table>
 <div class=hookurl>receiver: ${esc((d.hooks.url||'').replace(/\/[^/]+$/,'/••••••'))} · snapshot ${ago(d.hooks.checked)} ago</div>
 <h2>Thread ↔ session links</h2>
 <table><thead><tr><th>Kind</th><th>Thread</th><th>Project</th><th>Session</th><th>Web</th><th>Sent</th><th></th></tr></thead><tbody>${linkRows||'<tr><td colspan=7 class=dim>nothing registered</td></tr>'}</tbody></table>
@@ -536,6 +549,14 @@ var RELOAD=setTimeout(function(){location.reload();},20000);
 document.addEventListener('click',async function(e){
   var b=e.target.closest('.unlink'); if(!b) return;
   clearTimeout(RELOAD);
+  if(b.dataset.act==='disconnect'){
+    var n=+b.dataset.n||0;
+    if(!confirm('Disconnect this box from project '+b.dataset.id+'?\\n\\nIts webhook is deleted. '+(n?(n+' watched thread(s) stay registered and fall back to 2-minute polling.'):'No threads are watched there.')+'\\n\\nReconnect with: bc-threads projects --connect '+b.dataset.id)){ RELOAD=setTimeout(function(){location.reload();},20000); return; }
+    b.disabled=true; b.textContent='\u2026';
+    var rr=await(await fetch('/api/basecamp/disconnect?project='+encodeURIComponent(b.dataset.id),{method:'POST'})).json();
+    if(!rr.ok){ alert('Could not disconnect: '+(rr.out||'')); b.disabled=false; b.textContent='disconnect'; return; }
+    location.reload(); return;
+  }
   var kind=b.dataset.kind, sess=b.dataset.sess;
   var what=(kind==='ping')
     ? 'Unlink this ping from '+(sess||'its session')+'?\\n\\nIt will route to _dashboard again.'
