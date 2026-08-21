@@ -246,6 +246,32 @@ function inGitRepo(cwd){
 const BC_STORE   = HOMEDIR+'/.claude/bc-threads.json';
 const BC_HISTORY = HOMEDIR+'/.claude/bc-history.jsonl';
 const BC_HOOKS   = HOMEDIR+'/.claude/bc-hooks.json';
+function bcSave(reg){
+  const tmp=BC_STORE+'.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(reg,null,1));
+  fs.renameSync(tmp, BC_STORE);                    // atomic: bc-threads may be mid-cycle
+}
+function bcNote(rec){
+  try{ fs.appendFileSync(BC_HISTORY, JSON.stringify(Object.assign({ts:Math.floor(Date.now()/1000)},rec))+'\n'); }catch{}
+}
+// Drop the routing between a thread (or ping) and its session. A thread with no session
+// has nothing to deliver to, so unlinking stops watching it; a ping falls back to the
+// dashboard, which is where unrouted pings go anyway.
+function bcUnlink(kind, id){
+  let reg; try{ reg=JSON.parse(fs.readFileSync(BC_STORE,'utf8')); }catch{ return {ok:false,err:'no registry'}; }
+  if(kind==='ping'){
+    const t=(reg.pings||{})[id]; if(!t) return {ok:false,err:'unknown ping'};
+    const was=t.session||'';
+    if(was){ delete t.session; bcSave(reg); bcNote({kind:'unlink',circle:id,title:t.who||'',session:was,text:'ping unlinked \u2014 routes to _dashboard again'}); return {ok:true,was,mode:'ping-detached'}; }
+    delete reg.pings[id]; bcSave(reg); bcNote({kind:'unlink',circle:id,title:t.who||'',session:'',text:'ping thread removed'});
+    return {ok:true,was:'',mode:'ping-removed'};
+  }
+  const t=(reg.threads||{})[id]; if(!t) return {ok:false,err:'unknown thread'};
+  const was=t.session||''; const title=t.title||'';
+  delete reg.threads[id]; bcSave(reg);
+  bcNote({kind:'unlink',thread:id,title,session:was,text:'thread unlinked \u2014 no longer watched'});
+  return {ok:true,was,title,mode:'thread-removed'};
+}
 function bcState(){
   let reg={threads:{},pings:{}}, hooks={projects:{}}, hist=[];
   try{ reg=JSON.parse(fs.readFileSync(BC_STORE,'utf8')); }catch{}
@@ -443,6 +469,12 @@ http.createServer((req,res)=>{
   if(u.pathname==='/api/stats'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(stats())); }
 
   // ---- Monitor page ----
+  if(req.method==='POST'&&u.pathname==='/api/basecamp/unlink'){
+    const kind=(u.searchParams.get('kind')==='ping')?'ping':'thread';
+    const id=(u.searchParams.get('id')||'').replace(/[^0-9]/g,'');
+    const r=id?bcUnlink(kind,id):{ok:false,err:'missing id'};
+    res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(r));
+  }
   if(u.pathname==='/api/basecamp'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(bcState())); }
   if(u.pathname==='/basecamp'){
     const d=bcState();
@@ -461,7 +493,8 @@ http.createServer((req,res)=>{
       <td class=cmd>${esc(t.project||'—')}</td>
       <td>${esc(t.session||'—')} ${t.alive?'<span class="pill live">live</span>':'<span class="pill idle">gone</span>'}</td>
       <td>${t.bridge?`<a href="https://claude.ai/code/${esc(t.bridge)}" target=_blank rel=noopener>claude.ai ↗</a>`:'<span class=dim>not bridged</span>'}</td>
-      <td class=num>${t.ours||0}</td></tr>`).join('');
+      <td class=num>${t.ours||0}</td>
+      <td><button class=unlink data-kind="${t.kind}" data-id="${esc(t.id)}" data-label="${esc(t.title||t.id)}" data-sess="${esc(t.session||'')}" title="remove this link">unlink</button></td></tr>`).join('');
     const histRows=d.hist.map(h=>{
       const k=h.kind==='sent'?'sent':(h.kind==='hold'?'held':'in');
       const cls=h.kind==='sent'?'acct':(h.kind==='hold'?'idle':'live');
@@ -486,6 +519,8 @@ td.msg{color:#cbd5e1;max-width:640px}
 .chip{display:inline-block;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.3);color:#7dd3fc;border-radius:7px;padding:1px 7px;font-size:11.5px;margin:1px 0}
 a{color:#7dd3fc;text-decoration:none} a:hover{text-decoration:underline}
 .hookurl{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:#64748b;word-break:break-all}
+.unlink{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.32);color:#f87171;border-radius:8px;padding:3px 10px;font-size:11.5px;cursor:pointer}
+.unlink:hover{background:#ef4444;color:#fff;border-color:#ef4444}
 </style></head><body><div class=wrap>
 <header><div><h1>Basecamp bridge</h1><span class=sub>${d.threads.length} watched · ${d.hist.length} events · posting as ${esc((d.self||{}).name||'?')}</span></div>
 <div class=nav><a href="/">Sessions</a><a href="/monitor">📊 Monitor</a><a href="/basecamp" class=on>Basecamp</a></div></header>
@@ -493,10 +528,25 @@ a{color:#7dd3fc;text-decoration:none} a:hover{text-decoration:underline}
 <table><thead><tr><th>Project</th><th>Webhook</th><th>Watched threads</th><th>Sessions</th></tr></thead><tbody>${hookRows||'<tr><td colspan=4 class=dim>no webhook snapshot yet — run bc-threads hooks</td></tr>'}</tbody></table>
 <div class=hookurl>receiver: ${esc((d.hooks.url||'').replace(/\/[^/]+$/,'/••••••'))} · snapshot ${ago(d.hooks.checked)} ago</div>
 <h2>Thread ↔ session links</h2>
-<table><thead><tr><th>Kind</th><th>Thread</th><th>Project</th><th>Session</th><th>Web</th><th>Sent</th></tr></thead><tbody>${linkRows||'<tr><td colspan=6 class=dim>nothing registered</td></tr>'}</tbody></table>
+<table><thead><tr><th>Kind</th><th>Thread</th><th>Project</th><th>Session</th><th>Web</th><th>Sent</th><th></th></tr></thead><tbody>${linkRows||'<tr><td colspan=7 class=dim>nothing registered</td></tr>'}</tbody></table>
 <h2>Message history</h2>
 <table><thead><tr><th>When</th><th></th><th>Thread</th><th>From</th><th>Session</th><th>Message</th></tr></thead><tbody>${histRows||'<tr><td colspan=6 class=dim>no messages yet</td></tr>'}</tbody></table>
-</div><script>setTimeout(function(){location.reload();},20000);</script></body></html>`);
+</div><script>
+var RELOAD=setTimeout(function(){location.reload();},20000);
+document.addEventListener('click',async function(e){
+  var b=e.target.closest('.unlink'); if(!b) return;
+  clearTimeout(RELOAD);
+  var kind=b.dataset.kind, sess=b.dataset.sess;
+  var what=(kind==='ping')
+    ? 'Unlink this ping from '+(sess||'its session')+'?\\n\\nIt will route to _dashboard again.'
+    : 'Unlink "'+b.dataset.label+'" from '+(sess||'its session')+'?\\n\\nThe thread stops being watched \u2014 new comments will not reach any session. Re-add it later with: bc-threads register '+b.dataset.id+' -s <session>';
+  if(!confirm(what)){ RELOAD=setTimeout(function(){location.reload();},20000); return; }
+  b.disabled=true; b.textContent='\u2026';
+  var r=await(await fetch('/api/basecamp/unlink?kind='+kind+'&id='+encodeURIComponent(b.dataset.id),{method:'POST'})).json();
+  if(!r.ok){ alert('Could not unlink'+(r.err?': '+r.err:'')); b.disabled=false; b.textContent='unlink'; return; }
+  location.reload();
+});
+</script></body></html>`);
   }
   if(u.pathname==='/monitor'){
     const s=stats();
