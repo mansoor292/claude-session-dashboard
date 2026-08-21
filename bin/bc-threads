@@ -187,13 +187,14 @@ def sessions_in(paths):
 # What a session must do with a delivered message. Kept here so the wording is identical
 # for comments and pings, and changes in one place.
 _RULE = (
-    "DO NOT start work and DO NOT reply on the thread yet. "
-    "Read whatever you need read-only to understand the ask, then answer HERE with: "
-    "(1) a short plan — what you would change, in what order, and what could break; "
-    "(2) every clarifying question or ambiguity you would otherwise have to guess at; "
-    "(3) anything you need from me first (access, a decision, a file). "
-    "Then stop and wait. Begin only when I say go, and send a thread reply only with "
-    "wording I approved, using: bc-threads %s %s \"the approved text\""
+    "HANDLE IT: first decide whether the ask is fully specified. Anything you would have to "
+    "guess at — scope, which repo or file, what done looks like, an unstated assumption — "
+    "means it is not. Do NOT start work on an ill-formed ask. "
+    "Instead ask the person back on the thread: numbered, specific questions, everything you "
+    "need in ONE reply, via bc-threads %s %s \"your questions\". Do not ask what you could "
+    "answer yourself by reading the code or the thread. Their answers come back to you here. "
+    "Once the ask is fully clear — straight away if it already was — do the work, then report "
+    "back on the thread the same way."
 )
 HANDLE_RULE = _RULE.replace("%s %s", "reply %s", 1) % "%s"
 PING_HANDLE_RULE = _RULE.replace("%s %s", "ping-reply %s", 1) % "%s"

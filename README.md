@@ -264,9 +264,10 @@ Config lives in `~/.claude/bc-threads.json`, never in this repo:
 | `account` | Basecamp account id, discovered on first use |
 | `self` | the person id the CLI posts as, so our own comments never loop back |
 
-**Sessions do not post on their own.** Append `docs/CLAUDE.md.basecamp.md` to
-`~/.claude/CLAUDE.md` and every session treats a delivered message as context: write the
-plan, wait for the human in the session to confirm, then send what was approved.
+**Sessions clarify before they build.** Append `docs/CLAUDE.md.basecamp.md` to
+`~/.claude/CLAUDE.md` and a session receiving an underspecified request asks the person
+back on the thread — numbered questions, all in one reply — rather than guessing, and does
+the work once the answers land.
 
 ## Multiple Claude accounts (spillover to a second plan)
 
