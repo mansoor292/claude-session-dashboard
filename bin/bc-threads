@@ -357,7 +357,9 @@ def cmd_ping_reply(a):
     if not chat: sys.exit("unknown chat id for circle %s — run `bc-threads pings` first" % a.circle)
     sess = a.session or cur_session()
     text = a.text + (("\n\n" + FOOTER + " " + sess) if sess else "")
-    body = json.dumps({"content": "<p>%s</p>" % html.escape(text).replace("\n", "<br>")})
+    # Chat lines are PLAIN TEXT by default: an HTML wrapper comes back escaped and the
+    # reader sees literal <p> and <br> tags. Send the text as-is, newlines included.
+    body = json.dumps({"content": text})
     bc("api", "post", "/buckets/%s/chats/%s/lines.json" % (a.circle, chat), "--data", body)
     print("ping sent to circle %s" % a.circle)
 
