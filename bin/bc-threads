@@ -1,69 +1,96 @@
 #!/usr/bin/env python3
-"""Route Basecamp replies back into the Claude session that owns the thread.
+"""Bridge a Basecamp project to the Claude session that works on it.
 
-A session posts to Basecamp and registers the thread here; the watcher polls each
-registered thread for new comments and types them into that session's tmux pane.
+One project, one session. Every comment in a linked project goes to that session —
+no per-thread bookkeeping, nothing to register when a new thread starts.
 
-  bc-threads post <project> <subject> [body]   post a message + register it
-  bc-threads reply <recording> <text>          comment on a thread we own
-  bc-threads register <recording|url> [-s S]   attach an existing thread to a session
-  bc-threads list                              show the registry
-  bc-threads unregister <recording>            stop watching a thread
-  bc-threads watch [--once] [--dry-run]        poll and deliver (see bc-watch.timer)
+  bc-threads link <project> [session]    bind a project to a session (+ its webhook)
+  bc-threads unlink <project>            unbind and remove the webhook
+  bc-threads projects                    what this box is bridging
+  bc-threads reply <recording> "text"    answer on a thread
+  bc-threads watch [--dry-run] [-v]      one sweep (what bc-watch.timer runs)
+  bc-threads pings / ping-reply / ping-link
+  bc-threads authcheck                   warn before the OAuth token expires
 
-Loop guard: comments we posted ourselves are skipped two ways — by id (recorded at
-post time) and by the FOOTER marker — because the CLI usually authenticates as the
-same human whose replies we *do* want to act on, so filtering by author would drop
-the wrong half.
+Delivery is gated on the session being idle: messages are typed into its pane, so
+arriving mid-turn would drop keystrokes into a running tool call. A busy session
+keeps its watermark and takes the batch on the next sweep.
+
+Site config lives in the registry (~/.claude/bc-threads.json), never in this file:
+  ping_from / ping_repo_filter / ping_session / account / self
 """
 import json, os, re, subprocess, sys, time, html, argparse, glob
 
 BASECAMP = os.environ.get("BASECAMP_BIN", os.path.expanduser("~/.local/bin/basecamp"))
 TMUX     = os.environ.get("TMUX_BIN", "/usr/bin/tmux")
-SOCKET   = os.environ.get("TMUX_SOCKET", "default")     # sessions live on the default socket
+SOCKET   = os.environ.get("TMUX_SOCKET", "default")
 STORE    = os.path.expanduser(os.environ.get("BC_THREADS_FILE", "~/.claude/bc-threads.json"))
 HISTORY  = os.path.expanduser(os.environ.get("BC_HISTORY_FILE", "~/.claude/bc-history.jsonl"))
 HOOKSNAP = os.path.expanduser(os.environ.get("BC_HOOKS_FILE", "~/.claude/bc-hooks.json"))
-FOOTER   = "— via Claude session"                       # marks our own comments, for humans and for us
-# tmux send-keys carries 16k+ intact, so these are generous. Anything actually cut says
-# so and links the original — a silently shortened comment makes a session act on half a
-# request without knowing it.
-MAXLEN   = int(os.environ.get("BC_MAXLEN", "6000"))     # per comment/line
-BATCHMAX = int(os.environ.get("BC_BATCHMAX", "24000"))  # whole delivery
-HISTLEN  = int(os.environ.get("BC_HISTLEN", "4000"))    # what the dashboard stores
 CODE_ROOT = os.path.expanduser(os.environ.get("CODE_ROOT", "~/Code"))
-# Site config lives in the registry (~/.claude/bc-threads.json), not here:
-#   ping_from         list of sender names to act on; empty/absent = everyone
-#   ping_repo_filter  substring picking which checkouts to offer for an unlinked ping
-#   account           Basecamp account id, discovered on first use
+FOOTER   = "\u2014 via Claude session"                  # marks our own pre-agent-account posts
+MAXLEN   = int(os.environ.get("BC_MAXLEN", "6000"))     # per comment/ping line
+BATCHMAX = int(os.environ.get("BC_BATCHMAX", "24000"))  # whole delivery
+HISTLEN  = int(os.environ.get("BC_HISTLEN", "4000"))    # what /basecamp stores
+SWEEP    = int(os.environ.get("BC_SWEEP", "100"))       # comments pulled per sweep
 PING_FROM = []                                          # no sender allowlist by default
+
+# What a session does with a delivered message — one wording for comments and pings.
+_RULE = (
+    "HANDLE IT: first decide whether the ask is fully specified. Anything you would have to "
+    "guess at \u2014 scope, which repo or file, what done looks like, an unstated assumption "
+    "\u2014 means it is not. Do NOT start work on an ill-formed ask. "
+    "Instead ask the person back on the thread: numbered, specific questions, everything you "
+    "need in ONE reply, via bc-threads %s. Do not ask what you could answer yourself by "
+    "reading the code or the thread. Their answers come back to you here. Once the ask is "
+    "fully clear \u2014 straight away if it already was \u2014 do the work, then report back "
+    "the same way."
+)
+HANDLE_RULE = _RULE % 'reply <the recording id shown above> "your questions"'
+PING_HANDLE_RULE = _RULE % 'ping-reply %s "your questions"'
 
 
 # ---- registry -------------------------------------------------------------
 def load():
     try:
-        with open(STORE) as f: return json.load(f)
-    except Exception: return {"threads": {}}
+        with open(STORE) as f: reg = json.load(f)
+    except Exception:
+        reg = {}
+    reg.setdefault("projects", {})
+    reg.setdefault("pings", {})
+    old = reg.pop("threads", None)
+    if old:                       # migrate: a project's session is whoever owned its threads
+        for t in old.values():
+            proj = str(t.get("project") or "")
+            if not proj or not t.get("session"): continue
+            rec = reg["projects"].setdefault(proj, {"connected": int(time.time())})
+            rec.setdefault("session", t["session"])
+            rec["last_comment_id"] = max(int(rec.get("last_comment_id") or 0),
+                                         int(t.get("last_comment_id") or 0))
+        save(reg)
+        print("migrated %d thread link(s) into %d project link(s)" % (len(old), len(reg["projects"])),
+              file=sys.stderr)
+    return reg
+
 
 def save(reg):
     os.makedirs(os.path.dirname(STORE), exist_ok=True)
     tmp = STORE + ".tmp"
     with open(tmp, "w") as f: json.dump(reg, f, indent=1, sort_keys=True)
-    os.replace(tmp, STORE)                              # atomic: a crashed write never truncates
+    os.replace(tmp, STORE)                        # atomic: a crashed write never truncates
 
 
 def note(kind, **kw):
-    """Append one line to the event log the dashboard reads. Never fatal."""
     try:
-        rec = dict(ts=int(time.time()), kind=kind, **kw)
-        with open(HISTORY, "a") as f: f.write(json.dumps(rec) + "\n")
+        with open(HISTORY, "a") as f:
+            f.write(json.dumps(dict(ts=int(time.time()), kind=kind, **kw)) + "\n")
     except Exception: pass
 
 
 # ---- basecamp cli ---------------------------------------------------------
 def bc(*args, check=True):
-    """Run the CLI and return the envelope's .data (absolute path: hooks/systemd lack ~/.local/bin)."""
-    p = subprocess.run([BASECAMP, *args, "--json"], capture_output=True, text=True, timeout=120)
+    """Run the CLI, return the envelope's .data. Absolute path: systemd lacks ~/.local/bin."""
+    p = subprocess.run([BASECAMP, *args, "--json"], capture_output=True, text=True, timeout=180)
     if p.returncode != 0:
         if not check: return None
         sys.exit("basecamp %s failed: %s" % (" ".join(args), (p.stderr or p.stdout)[:400]))
@@ -77,12 +104,7 @@ def bc(*args, check=True):
 
 
 def whoami(reg):
-    """The person id the CLI posts as, cached in the registry.
-
-    When the CLI authenticates as a dedicated agent user rather than as one of the humans
-    on the thread, 'skip our own comments' is a clean author test rather than a footer
-    sniff — and the footer still covers anything posted before such a switch.
-    """
+    """The person id we post as, so our own comments never come back at us."""
     me = reg.get("self") or {}
     if me.get("id"): return me
     d = bc("people", "show", "me", check=False) or {}
@@ -93,8 +115,17 @@ def whoami(reg):
     return {}
 
 
+def account_id(reg):
+    if os.environ.get("BC_ACCOUNT"): return os.environ["BC_ACCOUNT"]
+    if reg.get("account"): return reg["account"]
+    d = bc("accounts", "list", check=False) or []
+    if d:
+        reg["account"] = str(d[0].get("id") or ""); save(reg)
+        return reg["account"]
+    return ""
+
+
 def parse_duration(txt):
-    """'335h58m27s' -> hours (float). Returns None if it cannot be read."""
     m = re.findall(r"(\d+(?:\.\d+)?)\s*([dhms])", str(txt or ""))
     if not m: return None
     mult = {"d": 24.0, "h": 1.0, "m": 1 / 60.0, "s": 1 / 3600.0}
@@ -103,7 +134,7 @@ def parse_duration(txt):
 
 # ---- sessions -------------------------------------------------------------
 def sessions():
-    """tmux session name -> {alive, status} from every account's Claude session registry."""
+    """tmux session name -> {alive, status, bridge} from every account's registry."""
     out = {}
     for f in glob.glob(os.path.expanduser("~/.claude*/sessions/*.json")):
         try: d = json.load(open(f))
@@ -118,16 +149,15 @@ def sessions():
                          "bridge": d.get("bridgeSessionId") or ""}
     return out
 
+
 def tmux_has(name):
     return subprocess.run([TMUX, "-L", SOCKET, "has-session", "-t", "=" + name],
                           capture_output=True).returncode == 0
 
-def ensure_bridge(name, wait=30):
-    """A delivered reply only shows up in claude.ai if the session is bridged.
 
-    Without Remote Control the message still lands in the pane and the transcript, but it
-    is invisible from the web/phone — so turn RC on before delivering rather than after.
-    """
+def ensure_bridge(name, wait=30):
+    """Without Remote Control the message lands in the pane but is invisible from
+    claude.ai or a phone, so turn it on before delivering rather than after."""
     if sessions().get(name, {}).get("bridge"): return True
     subprocess.run([TMUX, "-L", SOCKET, "send-keys", "-t", name, "-l", "/remote-control"], check=False)
     time.sleep(0.4)
@@ -139,27 +169,212 @@ def ensure_bridge(name, wait=30):
 
 
 def deliver(name, text):
-    """Type one line into the session, then Enter. Newlines would submit early, so flatten."""
+    """Type one line, then Enter. A newline would submit early, so flatten."""
     line = " ".join(text.split())
     subprocess.run([TMUX, "-L", SOCKET, "send-keys", "-t", name, "-l", line], check=True)
     time.sleep(0.4)
     subprocess.run([TMUX, "-L", SOCKET, "send-keys", "-t", name, "Enter"], check=True)
 
 
-# ---- helpers --------------------------------------------------------------
-def account_id(reg):
-    """Basecamp account id, discovered once and cached — used to rebuild circle URLs."""
-    if os.environ.get("BC_ACCOUNT"): return os.environ["BC_ACCOUNT"]
-    if reg.get("account"): return reg["account"]
-    d = bc("accounts", "list", check=False) or []
-    if d:
-        reg["account"] = str(d[0].get("id") or ""); save(reg)
-        return reg["account"]
-    return ""
+def ready(sess, live, label):
+    """Deliverable now? Holding beats dropping keystrokes into a running tool call."""
+    info = live.get(sess, {})
+    if not sess:
+        print("-- %s: no session linked \u2014 holding" % label); return False
+    if not info.get("alive"):
+        print("-- %s: session %s is not running \u2014 holding" % (label, sess))
+        note("hold", title=label, session=sess, why="session not running"); return False
+    if info.get("status") == "busy":
+        print("-- %s: %s is busy \u2014 holding" % (label, sess))
+        note("hold", title=label, session=sess, why="session busy"); return False
+    return True
 
 
+# ---- text -----------------------------------------------------------------
+def detag(s):
+    s = re.sub(r"<bc-attachment[^>]*>.*?</bc-attachment>", " [attachment] ", s or "", flags=re.S)
+    s = re.sub(r"<br\s*/?>|</p>", " ", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    return re.sub(r"\s+", " ", html.unescape(s)).strip()
+
+
+def clip(text, n, url=""):
+    """Shorten only when we must, and never quietly."""
+    text = text or ""
+    if len(text) <= n: return text
+    return text[:n] + " \u2026[CUT after %d of %d chars%s]" % (
+        n, len(text), (" \u2014 full text: " + url) if url else "")
+
+
+def recording_id(ref):
+    if str(ref).isdigit(): return str(ref)
+    d = bc("url", "parse", str(ref))
+    return str((d or {}).get("recording_id") or "")
+
+
+def cur_session():
+    p = subprocess.run([TMUX, "display-message", "-p", "#{session_name}"], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+# ---- the project webhook --------------------------------------------------
+def hook_url():
+    try:
+        return subprocess.run([os.environ.get("BC_HOOK_BIN", "/usr/local/bin/bc-hook"), "--print-url"],
+                              capture_output=True, text=True, timeout=30).stdout.strip()
+    except Exception:
+        return ""
+
+
+def connect_hook(project, rec):
+    url = hook_url()
+    if not url:
+        print("!! no webhook url (is bc-hook installed?)"); return False
+    for h in bc("webhooks", "list", "--in", project, check=False) or []:
+        if (h.get("payload_url") or "").rstrip("/") == url.rstrip("/"):
+            rec["hook_id"] = h.get("id"); rec["active"] = h.get("active"); return True
+    d = bc("webhooks", "create", url, "--in", project, "--types", "Comment", check=False)
+    if not d:
+        print("!! could not create webhook for project %s" % project); return False
+    rec["hook_id"] = d.get("id"); rec["active"] = True
+    print("   webhook %s created for project %s" % (d.get("id"), project))
+    return True
+
+
+def remove_hook(project):
+    url, gone = hook_url(), []
+    for h in bc("webhooks", "list", "--in", project, check=False) or []:
+        if (h.get("payload_url") or "").rstrip("/") == url.rstrip("/"):
+            if bc("webhooks", "delete", str(h["id"]), "--in", project, check=False) is not None:
+                gone.append(str(h["id"]))
+    return gone
+
+
+def sweep_comments(limit):
+    """Every recent comment across the account, newest first \u2014 one call covers all projects."""
+    return bc("comments", "list", "--all-projects", "--limit", str(limit), check=False) or []
+
+
+# ---- commands -------------------------------------------------------------
+def cmd_link(a):
+    reg = load()
+    project = str(a.project)
+    sess = a.session or cur_session()
+    if not sess: sys.exit("no session given and not running inside tmux")
+    if not tmux_has(sess): sys.exit("no such session: %s" % sess)
+    rec = reg["projects"].get(project) or {"connected": int(time.time())}
+    rec["session"] = sess
+    connect_hook(project, rec)
+    if not rec.get("last_comment_id"):
+        # Start from now: linking a project should not replay its whole history.
+        ids = [int(c["id"]) for c in sweep_comments(SWEEP)
+               if str((c.get("bucket") or {}).get("id")) == project]
+        rec["last_comment_id"] = max(ids) if ids else 0
+    reg["projects"][project] = rec
+    save(reg)
+    note("link", project=project, session=sess, text="project linked to session")
+    print("project %s -> %s (from comment %s)" % (project, sess, rec["last_comment_id"]))
+
+
+def cmd_unlink(a):
+    reg = load()
+    project = str(a.project)
+    rec = reg["projects"].pop(project, None)
+    if rec is None: sys.exit("project %s is not linked" % project)
+    gone = [] if a.keep_hook else remove_hook(project)
+    save(reg)
+    note("unlink", project=project, session=rec.get("session") or "",
+         text="unlinked" + ((", removed webhook " + ", ".join(gone)) if gone else ""))
+    print("project %s unlinked%s" % (project, (" (webhook %s removed)" % ", ".join(gone)) if gone else ""))
+
+
+def cmd_projects(a):
+    reg = load(); live = sessions()
+    if not reg["projects"]: print("no projects linked"); return
+    for proj, rec in sorted(reg["projects"].items()):
+        s = live.get(rec.get("session") or "", {})
+        state = ("alive/" + (s.get("status") or "?")) if s.get("alive") else "GONE"
+        print("%-12s -> %-28s [%s]  webhook %-9s  last=%s"
+              % (proj, rec.get("session") or "-", state, rec.get("hook_id") or "none",
+                 rec.get("last_comment_id") or 0))
+
+
+def cmd_watch(a):
+    reg = load(); me = whoami(reg); live = sessions()
+    if not a.no_pings:
+        try: cmd_pings(argparse.Namespace(to=None, dry_run=a.dry_run, verbose=a.verbose))
+        except Exception as e: print("!! ping sweep failed: %s" % e)
+    if not reg["projects"]:
+        if a.verbose: print("no projects linked")
+        return
+    comments = sweep_comments(a.limit)
+    per = {}
+    for c in comments:
+        proj = str((c.get("bucket") or {}).get("id") or "")
+        if proj in reg["projects"]: per.setdefault(proj, []).append(c)
+    dirty = False
+    for proj, rec in sorted(reg["projects"].items()):
+        cs = sorted(per.get(proj, []), key=lambda c: int(c["id"]))
+        if not cs:
+            if a.verbose: print("   %s: nothing in this sweep" % proj)
+            continue
+        seen = int(rec.get("last_comment_id") or 0)
+        ours, mine = set(rec.get("ours") or []), me.get("id")
+        fresh = [c for c in cs if int(c["id"]) > seen and int(c["id"]) not in ours
+                 and FOOTER not in (c.get("content") or "")
+                 and not (mine and (c.get("creator") or {}).get("id") == mine)]
+        newest = max(int(c["id"]) for c in cs)
+        if not fresh:
+            if newest > seen: rec["last_comment_id"] = newest; dirty = True
+            if a.verbose: print("   %s: nothing new" % proj)
+            continue
+        sess = rec.get("session") or ""
+        if not ready(sess, live, "project " + proj): continue
+        parts = []
+        for c in fresh:
+            par = c.get("parent") or {}
+            who = (c.get("creator") or {}).get("name") or "someone"
+            parts.append('[thread %s "%s"] %s: "%s" %s'
+                         % (par.get("id") or "?", (par.get("title") or "")[:60], who,
+                            clip(detag(c.get("content")), MAXLEN, c.get("app_url") or ""),
+                            c.get("app_url") or ""))
+        msg = clip("Basecamp \u2014 %d new comment(s) in project %s. %s %s"
+                   % (len(fresh), proj, "  ".join(parts), HANDLE_RULE), BATCHMAX)
+        if a.dry_run:
+            print("   would deliver to %s (%d chars):\n%s" % (sess, len(msg), msg)); continue
+        if not ensure_bridge(sess):
+            print("!! %s: no Remote Control bridge \u2014 delivering, but it will not show in claude.ai" % sess)
+        deliver(sess, msg)
+        bridge = sessions().get(sess, {}).get("bridge") or ""
+        print("-> %s: delivered %d comment(s) from project %s%s"
+              % (sess, len(fresh), proj, ("  https://claude.ai/code/" + bridge) if bridge else ""))
+        for c in fresh:
+            par = c.get("parent") or {}
+            note("comment", project=proj, thread=str(par.get("id") or ""),
+                 title=par.get("title") or "", session=sess,
+                 frm=(c.get("creator") or {}).get("name") or "", cid=str(c["id"]),
+                 url=c.get("app_url") or "", bridge=bridge,
+                 text=clip(detag(c.get("content")), HISTLEN))
+        rec["last_comment_id"] = max(int(c["id"]) for c in fresh); dirty = True
+    if dirty: save(reg)
+
+
+def cmd_reply(a):
+    reg = load()
+    rid = recording_id(a.recording)
+    sess = a.session or cur_session()
+    d = bc("comments", "create", rid, a.text, *(["--in", a.project] if a.project else [])) or {}
+    if d.get("id"):
+        # Belt and braces: the author filter already covers our own comments.
+        for rec in reg["projects"].values():
+            rec.setdefault("ours", []).append(int(d["id"]))
+        save(reg)
+    note("sent", thread=rid, session=sess or "", cid=str(d.get("id") or ""), text=clip(a.text, HISTLEN))
+    print("replied %s" % d.get("id", "?"))
+
+
+# ---- pings (Basecamp has no webhook event type for them) ------------------
 def repo_choices(pattern=""):
-    """Candidate checkouts a ping could be linked to: matching repos plus their worktrees."""
     out = []
     for base in (CODE_ROOT, CODE_ROOT + "/catalogs", CODE_ROOT + "/.worktrees"):
         try: entries = sorted(os.listdir(base))
@@ -172,201 +387,20 @@ def repo_choices(pattern=""):
     return out
 
 
-def sessions_in(paths):
-    """Live sessions already working in one of those checkouts, name -> path."""
-    out = {}
-    res = subprocess.run([TMUX, "-L", SOCKET, "list-sessions", "-F", "#{session_name}"],
-                         capture_output=True, text=True)
-    for name in (res.stdout or "").split():
-        p = subprocess.run([TMUX, "-L", SOCKET, "display-message", "-p", "-t", name, "#{pane_current_path}"],
-                           capture_output=True, text=True).stdout.strip()
-        if p in paths: out[name] = p
-    return out
-
-
-# What a session must do with a delivered message. Kept here so the wording is identical
-# for comments and pings, and changes in one place.
-_RULE = (
-    "HANDLE IT: first decide whether the ask is fully specified. Anything you would have to "
-    "guess at — scope, which repo or file, what done looks like, an unstated assumption — "
-    "means it is not. Do NOT start work on an ill-formed ask. "
-    "Instead ask the person back on the thread: numbered, specific questions, everything you "
-    "need in ONE reply, via bc-threads %s %s \"your questions\". Do not ask what you could "
-    "answer yourself by reading the code or the thread. Their answers come back to you here. "
-    "Once the ask is fully clear — straight away if it already was — do the work, then report "
-    "back on the thread the same way."
-)
-HANDLE_RULE = _RULE.replace("%s %s", "reply %s", 1) % "%s"
-PING_HANDLE_RULE = _RULE.replace("%s %s", "ping-reply %s", 1) % "%s"
-
-
-def clip(text, n, url=""):
-    """Shorten only when we must, and never quietly."""
-    text = text or ""
-    if len(text) <= n: return text
-    return text[:n] + " …[CUT after %d of %d chars%s]" % (n, len(text), (" — full text: " + url) if url else "")
-
-
-def detag(s):
-    s = re.sub(r"<bc-attachment[^>]*>.*?</bc-attachment>", " [attachment] ", s or "", flags=re.S)
-    s = re.sub(r"<br\s*/?>|</p>", " ", s)
-    s = re.sub(r"<[^>]+>", "", s)
-    return re.sub(r"\s+", " ", html.unescape(s)).strip()
-
-def recording_id(ref):
-    if str(ref).isdigit(): return str(ref)
-    d = bc("url", "parse", str(ref))
-    return str((d or {}).get("recording_id") or "")
-
-def cur_session():
-    """The tmux session we are running inside, if any."""
-    p = subprocess.run([TMUX, "display-message", "-p", "#{session_name}"], capture_output=True, text=True)
-    return p.stdout.strip() if p.returncode == 0 else ""
-
-
-# ---- commands -------------------------------------------------------------
-def cmd_register(a):
-    rid = recording_id(a.recording)
-    if not rid: sys.exit("could not resolve a recording id from %r" % a.recording)
-    sess = a.session or cur_session()
-    if not sess: sys.exit("no --session given and not running inside tmux")
-    comments = bc("comments", "list", rid) or []
-    ids = sorted(int(c["id"]) for c in comments)
-    reg = load()
-    reg["threads"][rid] = {
-        "session": sess,
-        "project": a.project or (comments[0].get("bucket", {}).get("id") if comments else None),
-        "title": (comments[0].get("parent", {}) or {}).get("title", "") if comments else "",
-        "url": (comments[0].get("parent", {}) or {}).get("app_url", "") if comments else "",
-        # --from-start replays existing comments; default is "only what arrives from now on"
-        "last_comment_id": 0 if a.from_start else (ids[-1] if ids else 0),
-        "ours": [],
-        "registered": int(time.time()),
-    }
-    save(reg)
-    print("watching %s -> session %s (from comment %s)" % (rid, sess, reg["threads"][rid]["last_comment_id"]))
-    proj = reg["threads"][rid].get("project")
-    if not proj:
-        # Project comes from a comment's bucket, so a thread with none leaves it unknown —
-        # and an unknown project cannot be hooked. Say so instead of quietly polling.
-        print("   ! no project resolved for %s — falling back to 2-minute polling. "
-              "Re-run with -p <project> to hook it for instant delivery." % rid)
-    elif not getattr(a, "no_hook", False):
-        ensure_hook(proj)
-
-def cmd_post(a):
-    body = a.body or ""
-    sess = a.session or cur_session()
-    if sess: body = (body + "\n\n" + FOOTER + " " + sess).strip()
-    d = bc("messages", "create", a.subject, body or "-", "--in", a.project) or {}
-    rid = str(d.get("id") or "")
-    if not rid: sys.exit("posted but no recording id came back: %s" % str(d)[:300])
-    print("posted %s %s" % (rid, d.get("app_url", "")))
-    cmd_register(argparse.Namespace(recording=rid, session=sess, project=a.project,
-                                    from_start=False, no_hook=False))
-
-def cmd_reply(a):
-    rid = recording_id(a.recording)
-    sess = a.session or cur_session()
-    text = a.text + ("\n\n" + FOOTER + " " + sess if sess else "")
-    d = bc("comments", "create", rid, text, *(["--in", a.project] if a.project else [])) or {}
-    reg = load()
-    t = reg["threads"].get(rid)
-    if t and d.get("id"):
-        t.setdefault("ours", []).append(int(d["id"]))       # never feed our own reply back in
-        save(reg)
-    note("sent", thread=rid, title=(t or {}).get("title") or "", session=sess or "",
-         cid=str(d.get("id") or ""), text=clip(a.text, HISTLEN))
-    print("replied %s" % d.get("id", "?"))
-
-def cmd_list(a):
-    reg, live = load(), sessions()
-    if not reg["threads"]: print("no threads registered"); return
-    for rid, t in sorted(reg["threads"].items()):
-        s = live.get(t["session"], {})
-        state = "alive/" + (s.get("status") or "?") if s.get("alive") else ("shell" if tmux_has(t["session"]) else "GONE")
-        web = ("https://claude.ai/code/" + s["bridge"]) if s.get("bridge") else "not in claude.ai"
-        print("%-14s -> %-24s [%s]  last=%s  %s\n%s%s" % (rid, t["session"], state, t.get("last_comment_id"),
-              (t.get("title") or "")[:40], " " * 20, web))
-
-def cmd_unregister(a):
-    reg = load(); rid = recording_id(a.recording)
-    if reg["threads"].pop(rid, None): save(reg); print("stopped watching", rid)
-    else: print("not registered:", rid)
-
-def cmd_adopt(a):
-    """Pick up threads a session posted without registering.
-
-    Sessions reach for `basecamp messages create` directly, so registration cannot rely
-    on them remembering. Every post made through bc-threads carries the footer naming
-    its session, which is enough to reconstruct the mapping after the fact.
-    """
-    reg, live, found = load(), sessions(), 0
-    # A session touches Basecamp two ways: it starts a thread (message), or it answers on
-    # someone else's (comment). Both carry the footer, so both are adoptable.
-    cand = []
-    for m in bc("messages", "list", "--all-projects", "--limit", str(a.limit), check=False) or []:
-        cand.append((str(m.get("id") or ""), m.get("content") or "", m.get("title") or "",
-                     m.get("app_url") or "", (m.get("bucket") or {}).get("id")))
-    for c in bc("comments", "list", "--all-projects", "--limit", str(a.limit), check=False) or []:
-        par = c.get("parent") or {}
-        cand.append((str(par.get("id") or ""), c.get("content") or "", par.get("title") or "",
-                     par.get("app_url") or "", (c.get("bucket") or {}).get("id")))
-    for rid, body, title, url, bucket in cand:
-        if not rid or rid in reg["threads"] or FOOTER not in body: continue
-        tail = detag(body).split(FOOTER)[-1].strip().split()
-        if not tail: continue
-        sess = tail[0]
-        # Do not accumulate mappings to sessions that no longer exist.
-        if sess not in live and not tmux_has(sess):
-            if a.verbose: print("skip %s: session %s is gone" % (rid, sess))
-            continue
-        comments = bc("comments", "list", rid, check=False) or []
-        reg["threads"][rid] = {
-            "session": sess, "project": bucket, "title": title, "url": url,
-            "last_comment_id": max([int(x["id"]) for x in comments] or [0]),
-            "ours": [], "registered": int(time.time()), "adopted": True,
-        }
-        found += 1
-        print("adopted %s -> %s  %s" % (rid, sess, title[:50]))
-        ensure_hook(bucket)
-    # Threads adopted from a comment can land without bucket/title (the payload carries
-    # neither); fill them in so `list` and webhook registration have something to work with.
-    for rid, t in reg["threads"].items():
-        if t.get("project") and t.get("title"): continue
-        cs = bc("comments", "list", rid, check=False) or []
-        if not cs: continue
-        par = cs[0].get("parent") or {}
-        t["project"] = t.get("project") or (cs[0].get("bucket") or {}).get("id")
-        t["title"] = t.get("title") or par.get("title") or ""
-        t["url"] = t.get("url") or par.get("app_url") or ""
-        found += 1
-        print("filled in %s: project=%s %s" % (rid, t.get("project"), (t.get("title") or "")[:40]))
-        ensure_hook(t.get("project"))
-    if found: save(reg)
-    elif a.verbose: print("nothing new to adopt")
-
-
 def cmd_pings(a):
-    """Deliver Basecamp pings (direct messages) into a session.
-
-    Pings have no webhook event type and are not in `recordings`, so notifications are the
-    only way to find them. They live as chat transcripts in Circle buckets and are read
-    through the raw lines API.
-    """
     reg = load(); me = whoami(reg); live = sessions()
     seen = reg.setdefault("pings", {})
     d = bc("notifications", "list", check=False) or {}
-    items = (d.get("unreads") or []) + (d.get("reads") or []) if isinstance(d, dict) else []
+    items = ((d.get("unreads") or []) + (d.get("reads") or [])) if isinstance(d, dict) else []
     circles = {}
     for r in items:
         if r.get("section") != "pings": continue
         m = re.search(r"/buckets/(\d+)/recordings/(\d+)/", r.get("subscription_url") or "")
         if m: circles[m.group(1)] = {"chat": m.group(2), "who": r.get("bucket_name") or "",
                                      "url": r.get("app_url") or ""}
-    # Notifications only carry UNREAD items, so a thread we have already seen drops out of
-    # discovery the moment it is read. Keep polling every circle we know about.
-    for circle, st in (seen or {}).items():
+    # Notifications carry only UNREAD items, so a thread drops out of discovery once read.
+    # Keep polling every circle already known.
+    for circle, st in list(seen.items()):
         if circle in circles or not st.get("chat"): continue
         circles[circle] = {"chat": st["chat"], "who": st.get("who") or "",
                            "url": st.get("url") or ("https://app.basecamp.com/%s/circles/%s"
@@ -376,54 +410,44 @@ def cmd_pings(a):
         return
     target = a.to or reg.get("ping_session") or "_dashboard"
     for circle, info in sorted(circles.items()):
-        lines = bc("api", "get", "/buckets/%s/chats/%s/lines.json" % (circle, info["chat"]), check=False) or []
+        lines = bc("api", "get", "/buckets/%s/chats/%s/lines.json" % (circle, info["chat"]), check=False)
         if not isinstance(lines, list) or not lines: continue
-        if circle not in seen:      # persist on discovery so `ping-link` can target it at once
+        if circle not in seen:
             seen[circle] = {"last_line_id": 0, "who": info["who"], "chat": info["chat"],
-                            "url": info.get("url") or ""}   # keep it, so no id juggling later
+                            "url": info.get("url") or ""}
             save(reg)
-        st = seen[circle]
-        st["chat"] = info["chat"]
-        last = int(st.get("last_line_id") or 0)
+        st = seen[circle]; st["chat"] = info["chat"]
         allow = [x.lower() for x in (reg.get("ping_from") or PING_FROM)]
-        fresh, ignored = [], []
+        last = int(st.get("last_line_id") or 0)
+        fresh = []
         for l in sorted(lines, key=lambda l: int(l["id"])):
             if int(l["id"]) <= last: continue
-            who = (l.get("creator") or {}).get("name") or ""
             if me.get("id") and (l.get("creator") or {}).get("id") == me["id"]: continue
-            (fresh if (not allow or who.lower() in allow) else ignored).append(l)
-        for l in ignored:
-            print("   ignoring ping line from %s (not in ping_from)" % ((l.get("creator") or {}).get("name") or "?"))
+            who = (l.get("creator") or {}).get("name") or ""
+            if allow and who.lower() not in allow:
+                print("   ignoring ping line from %s (not in ping_from)" % (who or "?")); continue
+            fresh.append(l)
         newest = max(int(l["id"]) for l in lines)
         if not fresh:
             if newest > last: st["last_line_id"] = newest; save(reg)
             if a.verbose: print("   ping %s: nothing new" % info["who"])
             continue
         sess = st.get("session") or target
-        if not live.get(sess, {}).get("alive"):
-            print("-- ping %s: %d new, but %s is not running — holding" % (info["who"], len(fresh), sess))
-            note("hold", circle=circle, title=info["who"], session=sess, count=len(fresh), why="session not running"); continue
-        if live[sess].get("status") == "busy":
-            print("-- ping %s: %d new, but %s is busy — holding" % (info["who"], len(fresh), sess))
-            note("hold", circle=circle, title=info["who"], session=sess, count=len(fresh), why="session busy"); continue
-        body = "  ".join('%s: "%s"' % ((l.get("creator") or {}).get("name") or "?",
-                                       clip(detag(l.get("content")), MAXLEN, info["url"])) for l in fresh)
-        # Only pitch checkouts while the thread has no home; once linked it just routes.
+        if not ready(sess, live, "ping " + info["who"]): continue
         repos = [] if st.get("session") else repo_choices(reg.get("ping_repo_filter") or "")
-        busy = sessions_in(set(repos)) if repos else {}
-        offer = ""
-        if repos:
-            listed = ", ".join("%s%s" % (os.path.basename(r), (" [session %s]" % n) if (n := next((k for k, v in busy.items() if v == r), None)) else "")
-                               for r in repos)
-            offer = (" This ping is not linked to a repo yet. Offer these checkouts and ask which one it belongs to: "
-                     + listed + ". Once they pick, run: bc-threads ping-link " + circle + " <session-name> "
-                     "(or start a session in that checkout first, then link it).")
-        msg = ('Basecamp ping — %d new message(s) from %s. %s Thread: %s .%s '
-               + PING_HANDLE_RULE % circle) % (len(fresh), info["who"], body, info["url"], offer)
+        offer = ((" This ping is not linked to a checkout yet. Offer these and ask which it belongs to: "
+                  + ", ".join(os.path.basename(r) for r in repos)
+                  + ". Then: bc-threads ping-link " + circle + " <session>.") if repos else "")
+        body = "  ".join('%s: "%s"' % ((l.get("creator") or {}).get("name") or "?",
+                                       clip(detag(l.get("content")), MAXLEN, info["url"]))
+                         for l in fresh)
+        msg = clip("Basecamp ping \u2014 %d new message(s) from %s. %s Thread: %s .%s %s"
+                   % (len(fresh), info["who"], body, info["url"], offer,
+                      PING_HANDLE_RULE % circle), BATCHMAX)
         if a.dry_run:
             print("   would deliver to %s:\n%s" % (sess, msg)); continue
         ensure_bridge(sess); deliver(sess, msg)
-        st["last_line_id"] = max(int(l["id"]) for l in fresh); st["chat"] = info["chat"]; save(reg)
+        st["last_line_id"] = max(int(l["id"]) for l in fresh); save(reg)
         print("-> %s: delivered %d ping line(s) from %s" % (sess, len(fresh), info["who"]))
         for l in fresh:
             note("ping", circle=circle, title=info["who"], session=sess,
@@ -435,281 +459,89 @@ def cmd_ping_reply(a):
     reg = load()
     st = (reg.get("pings") or {}).get(str(a.circle))
     chat = a.chat or (st or {}).get("chat")
-    if not chat: sys.exit("unknown chat id for circle %s — run `bc-threads pings` first" % a.circle)
+    if not chat: sys.exit("unknown chat for circle %s \u2014 run `bc-threads pings` first" % a.circle)
     sess = a.session or cur_session()
-    text = a.text + (("\n\n" + FOOTER + " " + sess) if sess else "")
-    # Chat lines are PLAIN TEXT by default: an HTML wrapper comes back escaped and the
-    # reader sees literal <p> and <br> tags. Send the text as-is, newlines included.
-    body = json.dumps({"content": text})
-    bc("api", "post", "/buckets/%s/chats/%s/lines.json" % (a.circle, chat), "--data", body)
-    note("sent", circle=str(a.circle), title=(st or {}).get("who") or "", session=sess or "", text=clip(a.text, HISTLEN))
+    # Chat lines are PLAIN TEXT: an HTML wrapper comes back escaped and the reader sees tags.
+    bc("api", "post", "/buckets/%s/chats/%s/lines.json" % (a.circle, chat),
+       "--data", json.dumps({"content": a.text}))
+    note("sent", circle=str(a.circle), title=(st or {}).get("who") or "", session=sess or "",
+         text=clip(a.text, HISTLEN))
     print("ping sent to circle %s" % a.circle)
 
 
 def cmd_ping_link(a):
-    """Hand a ping thread to the session that owns the work, so later lines route there."""
     reg = load()
     st = (reg.setdefault("pings", {})).get(str(a.circle))
-    if st is None: sys.exit("circle %s is not known — run `bc-threads pings` first" % a.circle)
+    if st is None: sys.exit("circle %s is not known \u2014 run `bc-threads pings` first" % a.circle)
     if not tmux_has(a.session): sys.exit("no such session: %s" % a.session)
-    st["session"] = a.session
-    save(reg)
+    st["session"] = a.session; save(reg)
     print("ping circle %s now routes to %s" % (a.circle, a.session))
 
 
-def hook_url():
-    try:
-        return subprocess.run([os.environ.get("BC_HOOK_BIN", "/usr/local/bin/bc-hook"), "--print-url"],
-                              capture_output=True, text=True, timeout=30).stdout.strip()
-    except Exception:
-        return ""
-
-
-def connect_project(project, reg=None, quiet=True):
-    """Connect THIS BOX to a project: one Comment webhook, recorded in the registry.
-
-    The webhook belongs to the box↔project pair, not to any thread or session. Threads
-    come and go and sessions get unlinked; the connection outlives all of that, so it is
-    stored explicitly rather than inferred from whatever happens to be registered.
-    """
-    if not project: return False
-    project = str(project)
-    own = reg is None
-    if own: reg = load()
-    projects = reg.setdefault("projects", {})
-    url = hook_url()
-    if not url:
-        print("!! no webhook url (is bc-hook installed?)"); return False
-    hooks = bc("webhooks", "list", "--in", project, check=False) or []
-    mine = [h for h in hooks if (h.get("payload_url") or "").rstrip("/") == url.rstrip("/")]
-    if mine:
-        rec = projects.setdefault(project, {"connected": int(time.time())})
-        rec["hook_id"] = mine[0].get("id"); rec["active"] = mine[0].get("active")
-        if own: save(reg)
-        return True
-    d = bc("webhooks", "create", url, "--in", project, "--types", "Comment", check=False)
-    if not d:
-        print("!! could not create webhook for project %s" % project); return False
-    projects[project] = {"hook_id": d.get("id"), "active": True, "connected": int(time.time())}
-    if own: save(reg)
-    print("   connected project %s (webhook %s)" % (project, d.get("id")))
-    return True
-
-
-def disconnect_project(project, reg=None):
-    """Drop this box's webhook for a project. Threads stay registered — they just fall
-    back to timer polling, which is what the connection was accelerating."""
-    project = str(project)
-    own = reg is None
-    if own: reg = load()
-    url = hook_url()
-    removed = []
-    for h in bc("webhooks", "list", "--in", project, check=False) or []:
-        if (h.get("payload_url") or "").rstrip("/") == url.rstrip("/"):
-            if bc("webhooks", "delete", str(h["id"]), "--in", project, check=False) is not None:
-                removed.append(h["id"])
-    (reg.setdefault("projects", {})).pop(project, None)
-    if own: save(reg)
-    print("   disconnected project %s%s" % (project, (" (removed webhook %s)" % ", ".join(map(str, removed))) if removed else ""))
-    return True
-
-
-def ensure_hook(project, quiet=True):
-    """Registering a thread implies the box wants this project connected."""
-    return connect_project(project, quiet=quiet)
-
-
+# ---- housekeeping ---------------------------------------------------------
 def cmd_hooks(a):
-    """Keep one Comment webhook per project we actually watch.
-
-    Webhooks are per-project, threads are per-recording, so the set of projects is derived
-    from the registry and reconciled on every run: create what is missing, delete ours
-    where nothing is watched any more.
-    """
-    url = subprocess.run([os.environ.get("BC_HOOK_BIN", "/usr/local/bin/bc-hook"), "--print-url"],
-                         capture_output=True, text=True).stdout.strip()
+    """Reconcile every linked project's webhook, and snapshot it for the dashboard."""
+    reg = load(); url = hook_url()
     if not url: sys.exit("could not work out the webhook url (is bc-hook installed?)")
-    reg = load()
-    # The connection list is the authority. Projects seen on threads are folded in once,
-    # so an older registry migrates without losing anything.
-    want = set((reg.get("projects") or {}).keys())
-    inferred = {str(t.get("project")) for t in reg["threads"].values() if t.get("project")}
-    if inferred - want:
-        print("adopting %d project(s) from existing threads" % len(inferred - want))
-        want |= inferred
-    print("box connected to %d project(s): %s" % (len(want), ", ".join(sorted(want)) or "-"))
-    for proj in sorted(want):
-        hooks = bc("webhooks", "list", "--in", proj, check=False) or []
-        mine = [h for h in hooks if (h.get("payload_url") or "").rstrip("/") == url.rstrip("/")]
-        if mine:
-            rec = (reg.setdefault("projects", {})).setdefault(proj, {"connected": int(time.time())})
-            rec["hook_id"] = mine[0].get("id"); rec["active"] = mine[0].get("active")
-            print("  %s: connected (%s)" % (proj, mine[0].get("id"))); continue
-        if a.dry_run:
-            print("  %s: would connect" % proj); continue
-        connect_project(proj, reg)
-    save(reg)
     snap = {"url": url, "checked": int(time.time()), "projects": {}}
-    for proj in sorted(want):
+    for proj, rec in sorted(reg["projects"].items()):
+        if a.dry_run:
+            print("  %s: would reconcile" % proj)
+        else:
+            connect_hook(proj, rec)
+            print("  %s: webhook %s" % (proj, rec.get("hook_id") or "FAILED"))
         snap["projects"][proj] = [
             {"id": h.get("id"), "active": h.get("active"), "types": h.get("types") or [],
-             "url": h.get("payload_url") or "", "mine": (h.get("payload_url") or "").rstrip("/") == url.rstrip("/")}
+             "url": h.get("payload_url") or "",
+             "mine": (h.get("payload_url") or "").rstrip("/") == url.rstrip("/")}
             for h in (bc("webhooks", "list", "--in", proj, check=False) or [])]
+    if not a.dry_run: save(reg)
     try:
         with open(HOOKSNAP, "w") as f: json.dump(snap, f, indent=1)
     except Exception as e: print("!! could not write hook snapshot: %s" % e)
-    if a.prune:
-        for proj in sorted({str(p) for p in (a.prune_projects or [])} - want):
-            for h in bc("webhooks", "list", "--in", proj, check=False) or []:
-                if (h.get("payload_url") or "").rstrip("/") == url.rstrip("/"):
-                    bc("webhooks", "delete", str(h["id"]), "--in", proj, check=False)
-                    print("  %s: removed webhook %s" % (proj, h["id"]))
-
-
-def cmd_projects(a):
-    reg = load()
-    projects = reg.get("projects") or {}
-    if a.connect:
-        for p_ in a.connect: connect_project(p_, reg)
-        save(reg); return
-    if a.disconnect:
-        for p_ in a.disconnect: disconnect_project(p_, reg)
-        save(reg); return
-    if not projects: print("this box is not connected to any project"); return
-    threads = reg.get("threads") or {}
-    for proj, rec in sorted(projects.items()):
-        n = sum(1 for t in threads.values() if str(t.get("project")) == proj)
-        print("%-12s webhook %-9s %s  %d watched thread(s)"
-              % (proj, rec.get("hook_id") or "-", "active" if rec.get("active") else "?", n))
 
 
 def cmd_authcheck(a):
-    """Warn before the OAuth token lapses.
-
-    The watcher runs unattended: an expired token just makes every poll fail, so replies
-    stop routing quietly. Shout while there is still time to run `basecamp auth login`.
-    """
     d = bc("auth", "status", check=False) or {}
     hours = parse_duration(d.get("expires_in"))
     ok = d.get("authenticated") and not d.get("expired")
     if ok and hours is not None and hours > a.warn_hours:
-        if a.verbose: print("basecamp auth ok — %.0fh left" % hours)
+        if a.verbose: print("basecamp auth ok \u2014 %.0fh left" % hours)
         return
-    if not ok:
-        msg = ("Basecamp auth has EXPIRED — bc-watch cannot poll threads and replies are not "
-               "reaching sessions. Run: basecamp auth login (then paste the callback URL here).")
-    else:
-        msg = ("Basecamp auth expires in about %.0f hours. Re-auth before it lapses or thread "
-               "replies stop routing: basecamp auth login (then paste the callback URL here)." % (hours or 0))
+    msg = ("Basecamp auth has EXPIRED \u2014 bc-watch cannot poll and replies are not reaching "
+           "sessions. Run: basecamp auth login (then paste the callback URL here).") if not ok else (
+          "Basecamp auth expires in about %.0f hours. Re-auth before it lapses or thread replies "
+          "stop routing: basecamp auth login (then paste the callback URL here)." % (hours or 0))
     print("!!", msg)
-    target = a.notify
-    if target and sessions().get(target, {}).get("alive") and sessions()[target].get("status") != "busy":
-        try:
-            deliver(target, msg); print("-> notified %s" % target)
-        except Exception as e:
-            print("!! could not notify %s: %s" % (target, e))
+    live = sessions()
+    if a.notify and live.get(a.notify, {}).get("alive") and live[a.notify].get("status") != "busy":
+        try: deliver(a.notify, msg); print("-> notified %s" % a.notify)
+        except Exception as e: print("!! could not notify %s: %s" % (a.notify, e))
 
 
-def cmd_watch(a):
-    if not a.no_pings:
-        try: cmd_pings(argparse.Namespace(to=None, dry_run=False, verbose=a.verbose))
-        except Exception as e: print("!! ping sweep failed: %s" % e)
-    if not a.no_adopt:
-        try: cmd_adopt(argparse.Namespace(limit=a.adopt_limit, verbose=False))
-        except Exception as e: print("!! adopt failed: %s" % e)
-    reg, live = load(), sessions()
-    me = whoami(reg)
-    if not reg["threads"]:
-        if a.verbose: print("no threads registered")
-        return
-    dirty = False
-    for rid, t in sorted(reg["threads"].items()):
-        if a.only and rid != str(a.only): continue
-        comments = bc("comments", "list", rid, check=False)
-        if comments is None:
-            print("!! %s: could not fetch comments" % rid); continue
-        seen, ours, mine = int(t.get("last_comment_id") or 0), set(t.get("ours") or []), me.get("id")
-        fresh = [c for c in sorted(comments, key=lambda c: int(c["id"]))
-                 if int(c["id"]) > seen and int(c["id"]) not in ours
-                 and FOOTER not in (c.get("content") or "")
-                 and not (mine and (c.get("creator") or {}).get("id") == mine)]
-        newest = max([int(c["id"]) for c in comments] or [seen])
-        if not fresh:
-            if newest > seen: t["last_comment_id"] = newest; dirty = True   # skip past our own chatter
-            if a.verbose: print("   %s: nothing new" % rid)
-            continue
-        sess = t["session"]
-        info = live.get(sess, {})
-        if not info.get("alive"):
-            print("-- %s: %d new, but session %s is not running — holding" % (rid, len(fresh), sess))
-            note("hold", thread=rid, title=t.get("title") or "", session=sess, count=len(fresh), why="session not running"); continue
-        if info.get("status") == "busy":
-            print("-- %s: %d new, but %s is busy — holding" % (rid, len(fresh), sess))
-            note("hold", thread=rid, title=t.get("title") or "", session=sess, count=len(fresh), why="session busy"); continue
-        # One delivery for the whole batch: separate submissions just queue behind each other.
-        parts = []
-        for c in fresh:
-            who = (c.get("creator") or {}).get("name") or "someone"
-            parts.append('%s: "%s"' % (who, clip(detag(c.get("content")), MAXLEN,
-                                                 c.get("app_url") or t.get("url") or "")))
-        msg = ('Basecamp — %d new %s on "%s". %s Thread: %s . '
-               + HANDLE_RULE % rid) % (len(fresh), "reply" if len(fresh) == 1 else "replies",
-                                       (t.get("title") or rid)[:60], "  ".join(parts),
-                                       fresh[-1].get("app_url") or t.get("url") or "")
-        msg = clip(msg, BATCHMAX, fresh[-1].get("app_url") or t.get("url") or "")
-        if a.dry_run:
-            print("   would deliver to %s (%d chars):\n%s" % (sess, len(msg), msg))
-        else:
-            if not ensure_bridge(sess):
-                print("!! %s: no Remote Control bridge — delivering, but it will not show in claude.ai" % sess)
-            deliver(sess, msg)
-            bridge = sessions().get(sess, {}).get("bridge") or ""
-            where = "  https://claude.ai/code/" + bridge if bridge else ""
-            print("-> %s: delivered %d comment(s), through %s%s" % (sess, len(fresh), fresh[-1]["id"], where))
-            for c in fresh:
-                note("comment", thread=rid, title=t.get("title") or "", session=sess,
-                     frm=(c.get("creator") or {}).get("name") or "", cid=str(c["id"]),
-                     url=c.get("app_url") or t.get("url") or "", bridge=bridge,
-                     text=clip(detag(c.get("content")), HISTLEN))
-            t["last_comment_id"] = max(int(c["id"]) for c in fresh); dirty = True
-    if dirty and not a.dry_run: save(reg)
-
-
-p = argparse.ArgumentParser(prog="bc-threads", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+p = argparse.ArgumentParser(prog="bc-threads", description=__doc__,
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
 sub = p.add_subparsers(dest="cmd", required=True)
-
-sp = sub.add_parser("register"); sp.add_argument("recording"); sp.add_argument("-s", "--session"); sp.add_argument("-p", "--project")
-sp.add_argument("--no-hook", action="store_true", help="skip creating the project's webhook")
-sp.add_argument("--from-start", action="store_true", help="replay existing comments instead of only new ones"); sp.set_defaults(fn=cmd_register)
-sp = sub.add_parser("post"); sp.add_argument("project"); sp.add_argument("subject"); sp.add_argument("body", nargs="?")
-sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_post)
-sp = sub.add_parser("reply"); sp.add_argument("recording"); sp.add_argument("text"); sp.add_argument("-p", "--project")
-sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_reply)
-sp = sub.add_parser("list"); sp.set_defaults(fn=cmd_list)
-sp = sub.add_parser("unregister"); sp.add_argument("recording"); sp.set_defaults(fn=cmd_unregister)
-sp = sub.add_parser("pings"); sp.add_argument("--to", help="session to deliver into (default _dashboard)")
-sp.add_argument("--dry-run", action="store_true"); sp.add_argument("-v", "--verbose", action="store_true")
-sp.set_defaults(fn=cmd_pings)
+sp = sub.add_parser("link"); sp.add_argument("project"); sp.add_argument("session", nargs="?")
+sp.set_defaults(fn=cmd_link)
+sp = sub.add_parser("unlink"); sp.add_argument("project")
+sp.add_argument("--keep-hook", action="store_true"); sp.set_defaults(fn=cmd_unlink)
+sp = sub.add_parser("projects"); sp.set_defaults(fn=cmd_projects)
+sp = sub.add_parser("watch"); sp.add_argument("--dry-run", action="store_true")
+sp.add_argument("--no-pings", action="store_true"); sp.add_argument("--limit", type=int, default=SWEEP)
+sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_watch)
+sp = sub.add_parser("reply"); sp.add_argument("recording"); sp.add_argument("text")
+sp.add_argument("-p", "--project"); sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_reply)
+sp = sub.add_parser("pings"); sp.add_argument("--to"); sp.add_argument("--dry-run", action="store_true")
+sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_pings)
 sp = sub.add_parser("ping-reply"); sp.add_argument("circle"); sp.add_argument("text")
 sp.add_argument("--chat"); sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_ping_reply)
 sp = sub.add_parser("ping-link"); sp.add_argument("circle"); sp.add_argument("session")
 sp.set_defaults(fn=cmd_ping_link)
-sp = sub.add_parser("projects"); sp.add_argument("--connect", nargs="*"); sp.add_argument("--disconnect", nargs="*")
-sp.set_defaults(fn=cmd_projects)
-sp = sub.add_parser("hooks"); sp.add_argument("--types", default="Comment")
-sp.add_argument("--dry-run", action="store_true"); sp.add_argument("--prune", action="store_true")
-sp.add_argument("--prune-projects", nargs="*"); sp.set_defaults(fn=cmd_hooks)
+sp = sub.add_parser("hooks"); sp.add_argument("--dry-run", action="store_true"); sp.set_defaults(fn=cmd_hooks)
 sp = sub.add_parser("authcheck"); sp.add_argument("--warn-hours", type=float, default=48.0)
-sp.add_argument("--notify", default="_dashboard", help="session to tell (empty to only log)")
-sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_authcheck)
-sp = sub.add_parser("adopt"); sp.add_argument("-n", "--limit", type=int, default=50)
-sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_adopt)
-sp = sub.add_parser("watch"); sp.add_argument("--once", action="store_true"); sp.add_argument("--dry-run", action="store_true")
-sp.add_argument("--no-adopt", action="store_true", help="skip the auto-registration sweep")
-sp.add_argument("--adopt-limit", type=int, default=50)
-sp.add_argument("--only", help="poll just this recording id (used by the webhook receiver)")
-sp.add_argument("--no-pings", action="store_true", help="skip the ping sweep")
-sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_watch)
+sp.add_argument("--notify", default="_dashboard"); sp.add_argument("-v", "--verbose", action="store_true")
+sp.set_defaults(fn=cmd_authcheck)
 
 a = p.parse_args()
 a.fn(a)

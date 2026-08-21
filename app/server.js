@@ -258,22 +258,22 @@ function bcNote(rec){
 // has nothing to deliver to, so unlinking stops watching it; a ping falls back to the
 // dashboard, which is where unrouted pings go anyway.
 function bcUnlink(kind, id){
-  let reg; try{ reg=JSON.parse(fs.readFileSync(BC_STORE,'utf8')); }catch{ return {ok:false,err:'no registry'}; }
+  // Delegate to bc-threads: it owns the Basecamp side (removing the project's webhook).
   if(kind==='ping'){
+    let reg; try{ reg=JSON.parse(fs.readFileSync(BC_STORE,'utf8')); }catch{ return {ok:false,err:'no registry'}; }
     const t=(reg.pings||{})[id]; if(!t) return {ok:false,err:'unknown ping'};
     const was=t.session||'';
-    if(was){ delete t.session; bcSave(reg); bcNote({kind:'unlink',circle:id,title:t.who||'',session:was,text:'ping unlinked \u2014 routes to _dashboard again'}); return {ok:true,was,mode:'ping-detached'}; }
-    delete reg.pings[id]; bcSave(reg); bcNote({kind:'unlink',circle:id,title:t.who||'',session:'',text:'ping thread removed'});
-    return {ok:true,was:'',mode:'ping-removed'};
+    if(was){ delete t.session; bcSave(reg); bcNote({kind:'unlink',circle:id,title:t.who||'',session:was,text:'ping unlinked'}); return {ok:true,was}; }
+    delete reg.pings[id]; bcSave(reg); bcNote({kind:'unlink',circle:id,title:t.who||'',text:'ping removed'});
+    return {ok:true,was:''};
   }
-  const t=(reg.threads||{})[id]; if(!t) return {ok:false,err:'unknown thread'};
-  const was=t.session||''; const title=t.title||'';
-  delete reg.threads[id]; bcSave(reg);
-  bcNote({kind:'unlink',thread:id,title,session:was,text:'thread unlinked \u2014 no longer watched'});
-  return {ok:true,was,title,mode:'thread-removed'};
+  try{
+    const out=execFileSync('/usr/local/bin/bc-threads',['unlink',id],{encoding:'utf8',timeout:120000});
+    return {ok:true,out:out.trim()};
+  }catch(e){ return {ok:false,err:String((e&&(e.stdout||e.message))||e).slice(0,300)}; }
 }
 function bcState(){
-  let reg={threads:{},pings:{}}, hooks={projects:{}}, hist=[];
+  let reg={projects:{},pings:{}}, hooks={projects:{}}, hist=[];
   try{ reg=JSON.parse(fs.readFileSync(BC_STORE,'utf8')); }catch{}
   try{ hooks=JSON.parse(fs.readFileSync(BC_HOOKS,'utf8')); }catch{}
   try{
@@ -281,23 +281,18 @@ function bcState(){
     for(const l of lines){ try{ hist.push(JSON.parse(l)); }catch{} }
   }catch{}
   hist.reverse();                                   // newest first
-  const live={}; for(const x of sessions()) live[x.name]={bridge:x.bridge,rc:!!x.rc,cwd:x.cwd,attached:x.attached};
-  const threads=Object.entries(reg.threads||{}).map(([id,t])=>({
-    id, kind:'thread', title:t.title||'', session:t.session||'', project:String(t.project||''),
-    url:t.url||'', last:t.last_comment_id||0, ours:(t.ours||[]).length,
-    bridge:(live[t.session]||{}).bridge||null, alive:!!live[t.session]
-  }));
+  const live={}; for(const x of sessions()) live[x.name]={bridge:x.bridge,rc:!!x.rc,cwd:x.cwd};
+  const projects=Object.entries(reg.projects||{}).map(([id,r])=>({
+    id, session:r.session||'', hook:r.hook_id||null, active:!!r.active,
+    last:r.last_comment_id||0, connected:r.connected||0,
+    bridge:(live[r.session]||{}).bridge||null, alive:!!live[r.session],
+    seen:hist.filter(h=>h.project===id&&h.kind==='comment').length
+  })).sort((a,b)=>a.id.localeCompare(b.id));
   const pings=Object.entries(reg.pings||{}).map(([id,t])=>({
-    id, kind:'ping', title:t.who||'', session:t.session||'_dashboard', project:'',
-    url:t.url||'', last:t.last_line_id||0, ours:0,
+    id, who:t.who||'', session:t.session||'', url:t.url||'', last:t.last_line_id||0,
     bridge:(live[t.session||'_dashboard']||{}).bridge||null, alive:!!live[t.session||'_dashboard']
   }));
-  const projects=Object.entries(reg.projects||{}).map(([id,r])=>({
-    id, hook:r.hook_id||null, active:!!r.active, connected:r.connected||0,
-    threads:threads.filter(t=>t.project===id),
-    sessions:[...new Set(threads.filter(t=>t.project===id).map(t=>t.session))]
-  })).sort((a,b)=>a.id.localeCompare(b.id));
-  return {projects, threads:threads.concat(pings), hooks, hist, self:reg.self||null};
+  return {projects, pings, hooks, hist, self:reg.self||null};
 }
 const gb = b => (b/1073741824);
 const fmtGB = b => gb(b).toFixed(1)+'G';
@@ -494,28 +489,28 @@ http.createServer((req,res)=>{
   if(u.pathname==='/basecamp'){
     const d=bcState();
     const ago=t=>{ if(!t) return '—'; const s=Math.floor(Date.now()/1000)-t; if(s<60) return s+'s'; if(s<3600) return Math.floor(s/60)+'m'; if(s<86400) return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d'; };
-    const hookRows=d.projects.map(p=>`<tr><td class=cmd>${esc(p.id)}</td>
-        <td>${p.hook?`<span class="pill live">webhook ${esc(String(p.hook))}${p.active?'':' (inactive)'}</span>`:'<span class="pill idle">no webhook — polling only</span>'}</td>
-        <td>${p.threads.map(t=>`<span class=chip>${esc(t.title||t.id)}</span>`).join(' ')||'<span class=dim>no threads watched</span>'}</td>
-        <td>${p.sessions.map(x=>esc(x)).join(', ')||'<span class=dim>—</span>'}</td>
-        <td><button class=unlink data-act=disconnect data-id="${esc(p.id)}" data-n="${p.threads.length}" title="remove this box's webhook for the project">disconnect</button></td></tr>`).join('');
-    const linkRows=d.threads.map(t=>`<tr>
-      <td><span class="pill ${t.kind==='ping'?'rc':'live'}">${t.kind}</span></td>
-      <td>${t.url?`<a href="${esc(t.url)}" target=_blank rel=noopener>${esc(t.title||t.id)}</a>`:esc(t.title||t.id)}<div class=dim>${esc(t.id)}</div></td>
-      <td class=cmd>${esc(t.project||'—')}</td>
-      <td>${esc(t.session||'—')} ${t.alive?'<span class="pill live">live</span>':'<span class="pill idle">gone</span>'}</td>
-      <td>${t.bridge?`<a href="https://claude.ai/code/${esc(t.bridge)}" target=_blank rel=noopener>claude.ai ↗</a>`:'<span class=dim>not bridged</span>'}</td>
-      <td class=num>${t.ours||0}</td>
-      <td><button class=unlink data-kind="${t.kind}" data-id="${esc(t.id)}" data-label="${esc(t.title||t.id)}" data-sess="${esc(t.session||'')}" title="remove this link">unlink</button></td></tr>`).join('');
+    const projRows=d.projects.map(p=>`<tr>
+      <td class=cmd><a href="https://basecamp.com" onclick="return false" title="project id">${esc(p.id)}</a></td>
+      <td>${esc(p.session||'—')} ${p.alive?'<span class="pill live">live</span>':'<span class="pill idle">gone</span>'}</td>
+      <td>${p.hook?`<span class="pill live">webhook ${esc(String(p.hook))}${p.active?'':' (inactive)'}</span>`:'<span class="pill idle">polling only</span>'}</td>
+      <td>${p.bridge?`<a href="https://claude.ai/code/${esc(p.bridge)}" target=_blank rel=noopener>claude.ai ↗</a>`:'<span class=dim>not bridged</span>'}</td>
+      <td class=num>${p.seen}</td>
+      <td><button class=unlink data-kind=project data-id="${esc(p.id)}" data-sess="${esc(p.session||'')}">unlink</button></td></tr>`).join('');
+    const pingRows=d.pings.map(p=>`<tr>
+      <td class=cmd>${p.url?`<a href="${esc(p.url)}" target=_blank rel=noopener>${esc(p.id)}</a>`:esc(p.id)}</td>
+      <td>${esc(p.who||'—')}</td>
+      <td>${esc(p.session||'_dashboard (default)')} ${p.alive?'<span class="pill live">live</span>':'<span class="pill idle">gone</span>'}</td>
+      <td class=num>${p.last||0}</td>
+      <td><button class=unlink data-kind=ping data-id="${esc(p.id)}" data-sess="${esc(p.session||'')}">unlink</button></td></tr>`).join('');
     const histRows=d.hist.map(h=>{
-      const k=h.kind==='sent'?'sent':(h.kind==='hold'?'held':'in');
+      const k=h.kind==='sent'?'sent':(h.kind==='hold'?'held':(h.kind==='comment'||h.kind==='ping'?'in':h.kind));
       const cls=h.kind==='sent'?'acct':(h.kind==='hold'?'idle':'live');
       return `<tr><td class=num title="${esc(new Date((h.ts||0)*1000).toISOString())}">${ago(h.ts)}</td>
-        <td><span class="pill ${cls}">${k}</span></td>
-        <td>${esc(h.title||h.thread||h.circle||'')}</td>
+        <td><span class="pill ${cls}">${esc(k)}</span></td>
+        <td>${h.url?`<a href="${esc(h.url)}" target=_blank rel=noopener>${esc(h.title||h.thread||h.project||'')}</a>`:esc(h.title||h.thread||h.project||h.circle||'')}</td>
         <td>${esc(h.frm||(h.kind==='sent'?((d.self||{}).name||'us'):''))}</td>
         <td>${esc(h.session||'')}</td>
-        <td class=msg>${esc(h.text||(h.why?('('+h.why+', '+(h.count||0)+' waiting)'):'')).replace(/(…\[CUT[^\]]*\])/,'<span class=cut>$1</span>')}</td></tr>`;
+        <td class=msg>${esc(h.text||(h.why?('('+h.why+')'):'')).replace(/(…\[CUT[^\]]*\])/,'<span class=cut>$1</span>')}</td></tr>`;
     }).join('');
     res.writeHead(200,{'Content-Type':'text/html'});
     return res.end(`<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Basecamp · Claude box</title>
@@ -529,20 +524,19 @@ td.cmd{font-family:ui-monospace,Menlo,monospace;color:#7dd3fc}
 td.msg{color:#cbd5e1;max-width:760px;white-space:pre-wrap;word-break:break-word}
 td.msg .cut{color:#fbbf24}
 .dim{color:#64748b;font-size:11.5px}
-.chip{display:inline-block;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.3);color:#7dd3fc;border-radius:7px;padding:1px 7px;font-size:11.5px;margin:1px 0}
 a{color:#7dd3fc;text-decoration:none} a:hover{text-decoration:underline}
 .hookurl{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:#64748b;word-break:break-all}
 .unlink{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.32);color:#f87171;border-radius:8px;padding:3px 10px;font-size:11.5px;cursor:pointer}
 .unlink:hover{background:#ef4444;color:#fff;border-color:#ef4444}
 </style></head><body><div class=wrap>
-<header><div><h1>Basecamp bridge</h1><span class=sub>${d.projects.length} project(s) · ${d.threads.length} watched · ${d.hist.length} events · posting as ${esc((d.self||{}).name||'?')}</span></div>
+<header><div><h1>Basecamp bridge</h1><span class=sub>${d.projects.length} project(s) · ${d.hist.length} events · posting as ${esc((d.self||{}).name||'?')}</span></div>
 <div class=nav><a href="/">Sessions</a><a href="/monitor">📊 Monitor</a><a href="/basecamp" class=on>Basecamp</a></div></header>
-<h2>This box ↔ projects</h2>
-<div class=dim style="margin-bottom:6px">One webhook per project, owned by the box. Independent of threads and sessions — unlinking a thread leaves the connection alone.</div>
-<table><thead><tr><th>Project</th><th>Connection</th><th>Watched threads</th><th>Sessions</th><th></th></tr></thead><tbody>${hookRows||'<tr><td colspan=5 class=dim>not connected to any project</td></tr>'}</tbody></table>
+<h2>Projects → sessions</h2>
+<div class=dim style="margin-bottom:6px">One project, one session. Every comment in the project goes to that session — no per-thread wiring.</div>
+<table><thead><tr><th>Project</th><th>Session</th><th>Webhook</th><th>Web</th><th>Received</th><th></th></tr></thead><tbody>${projRows||'<tr><td colspan=6 class=dim>no projects linked — bc-threads link &lt;project&gt; &lt;session&gt;</td></tr>'}</tbody></table>
 <div class=hookurl>receiver: ${esc((d.hooks.url||'').replace(/\/[^/]+$/,'/••••••'))} · snapshot ${ago(d.hooks.checked)} ago</div>
-<h2>Thread ↔ session links</h2>
-<table><thead><tr><th>Kind</th><th>Thread</th><th>Project</th><th>Session</th><th>Web</th><th>Sent</th><th></th></tr></thead><tbody>${linkRows||'<tr><td colspan=7 class=dim>nothing registered</td></tr>'}</tbody></table>
+${d.pings.length?`<h2>Pings</h2>
+<table><thead><tr><th>Circle</th><th>With</th><th>Session</th><th>Last line</th><th></th></tr></thead><tbody>${pingRows}</tbody></table>`:''}
 <h2>Message history</h2>
 <table><thead><tr><th>When</th><th></th><th>Thread</th><th>From</th><th>Session</th><th>Message</th></tr></thead><tbody>${histRows||'<tr><td colspan=6 class=dim>no messages yet</td></tr>'}</tbody></table>
 </div><script>
@@ -550,20 +544,12 @@ var RELOAD=setTimeout(function(){location.reload();},20000);
 document.addEventListener('click',async function(e){
   var b=e.target.closest('.unlink'); if(!b) return;
   clearTimeout(RELOAD);
-  if(b.dataset.act==='disconnect'){
-    var n=+b.dataset.n||0;
-    if(!confirm('Disconnect this box from project '+b.dataset.id+'?\\n\\nIts webhook is deleted. '+(n?(n+' watched thread(s) stay registered and fall back to 2-minute polling.'):'No threads are watched there.')+'\\n\\nReconnect with: bc-threads projects --connect '+b.dataset.id)){ RELOAD=setTimeout(function(){location.reload();},20000); return; }
-    b.disabled=true; b.textContent='\u2026';
-    var rr=await(await fetch('/api/basecamp/disconnect?project='+encodeURIComponent(b.dataset.id),{method:'POST'})).json();
-    if(!rr.ok){ alert('Could not disconnect: '+(rr.out||'')); b.disabled=false; b.textContent='disconnect'; return; }
-    location.reload(); return;
-  }
   var kind=b.dataset.kind, sess=b.dataset.sess;
-  var what=(kind==='ping')
-    ? 'Unlink this ping from '+(sess||'its session')+'?\\n\\nIt will route to _dashboard again.'
-    : 'Unlink "'+b.dataset.label+'" from '+(sess||'its session')+'?\\n\\nThe thread stops being watched \u2014 new comments will not reach any session. Re-add it later with: bc-threads register '+b.dataset.id+' -s <session>';
-  if(!confirm(what)){ RELOAD=setTimeout(function(){location.reload();},20000); return; }
-  b.disabled=true; b.textContent='\u2026';
+  var msg=(kind==='ping')
+    ? 'Unlink this ping from '+(sess||'its session')+'?'
+    : 'Unlink project '+b.dataset.id+' from '+(sess||'its session')+'?\\n\\nIts webhook is removed and its comments stop reaching any session.\\n\\nRelink with: bc-threads link '+b.dataset.id+' <session>';
+  if(!confirm(msg)){ RELOAD=setTimeout(function(){location.reload();},20000); return; }
+  b.disabled=true; b.textContent='\\u2026';
   var r=await(await fetch('/api/basecamp/unlink?kind='+kind+'&id='+encodeURIComponent(b.dataset.id),{method:'POST'})).json();
   if(!r.ok){ alert('Could not unlink'+(r.err?': '+r.err:'')); b.disabled=false; b.textContent='unlink'; return; }
   location.reload();

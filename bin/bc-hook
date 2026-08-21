@@ -54,14 +54,16 @@ class Poller:
     def _run(self):
         time.sleep(DEBOUNCE)
         with self.lock:
-            self.pending, ids = False, set(self.ids); self.ids.clear()
-        cmd = [BC_THREADS, "watch", "--no-adopt", "--no-pings"]
-        if len(ids) == 1:                       # one thread touched: re-fetch just that one
-            cmd += ["--only", ids.pop()]
+            self.pending = False; self.ids.clear()
+        # Routing is project→session in the registry, so one sweep covers whatever arrived.
+        # The payload is never read for content — a valid POST only asks us to look again.
+        cmd = [BC_THREADS, "watch", "--no-pings"]
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             out = (p.stdout or "").strip()
-            print(out if out else "polled (%s), nothing new" % (" ".join(cmd[2:]) or "all"), flush=True)
+            print(out if out else "polled, nothing new", flush=True)
+            if p.returncode != 0 and (p.stderr or "").strip():
+                print("!! %s" % p.stderr.strip()[:300], flush=True)
         except Exception as e:
             print("!! poll failed: %s" % e, flush=True)
         self.last = time.time()

@@ -1,20 +1,24 @@
 <!-- Append to ~/.claude/CLAUDE.md so every session on the box follows it. -->
 
-## Basecamp threads — always post through `bc-threads`
+## Basecamp — one project, one session
 
-Post and reply with `bc-threads`, never the bare `basecamp messages create` /
-`basecamp comments create`. It wraps the same CLI but records which session owns the
-thread, so human replies come back to you instead of being lost:
+A project is bridged to exactly one session on this box. Every comment in that project
+arrives in that session, whatever thread it was on — there is nothing to register per
+thread.
 
 ```
-bc-threads post <project> "Subject" "body"    # new thread, registered automatically
-bc-threads reply <recording_id> "text"        # answer on a thread
-bc-threads list                               # threads this box is watching
+bc-threads link <project> [session]   # bridge a project to a session (defaults to yours)
+bc-threads reply <recording> "text"   # answer on a thread
+bc-threads projects                   # what this box is bridging
 ```
 
-`bc-watch.timer` polls every 90s and types new human comments into the owning session,
-with the thread URL and the exact reply command. If you post with the raw CLI instead,
-nobody hears the answer.
+**If someone mentions the agent account in a project this box does not cover yet, link it**
+— `bc-threads link <project>` from the session that should own that work — then answer.
+Otherwise the mention goes unheard. If a project already belongs to another session, leave
+it alone and say so rather than taking it over.
+
+Reply with `bc-threads reply`, never the bare `basecamp comments create`: the wrapper is
+what keeps our own posts from being read back to us as new.
 
 **Never execute an ill-formed ask.** A delivered comment or ping is a request from a real
 person who is reachable — so when it is underspecified, ask them, do not guess and do not

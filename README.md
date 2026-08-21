@@ -217,9 +217,9 @@ Notes:
 
 ## Basecamp bridge (optional)
 
-Sessions post to Basecamp; humans reply on the thread; the reply comes back to the session
-that owns it. Needs the [Basecamp CLI](https://github.com/basecamp/claude-plugins) on PATH
-and authenticated (`basecamp auth login`).
+Bridge a Basecamp project to the session that works on it: every comment in the project is
+delivered to that session, and replies go back out from there. One project, one session, no
+per-thread wiring. Needs the Basecamp CLI on PATH and authenticated (`basecamp auth login`).
 
 ```bash
 sudo cp bin/bc-threads bin/bc-hook /usr/local/bin/
@@ -228,32 +228,26 @@ echo dev.example.com > ~/.claude/bc-hook-domain     # your wildcard domain
 sudo systemctl enable --now bc-hook.service bc-watch.timer bc-authcheck.timer
 ```
 
-From a session:
-
 ```bash
-bc-threads post <project> "Subject" "body"   # post, register the thread, connect the project
-bc-threads reply <recording> "text"          # answer on a thread
-bc-threads list                              # threads → sessions, with claude.ai links
-bc-threads projects                          # which projects this box is connected to
+bc-threads link <project> [session]    # bridge a project (creates its webhook)
+bc-threads projects                    # what this box is bridging
+bc-threads reply <recording> "text"    # answer on a thread
+bc-threads unlink <project>            # unbridge and remove the webhook
 ```
 
-**How replies get home.** `~/.claude/bc-threads.json` maps a Basecamp recording to the tmux
-session that owns it. A comment arrives by webhook (seconds); the receiver never trusts the
-payload, it only triggers a re-fetch through the API, so a forged POST buys an extra poll and
-nothing else. The 2-minute timer is the fallback for a missed hook, and the only route for
-**pings** — direct messages have no webhook event type in Basecamp, so they are discovered
-through notifications and read from the Circle chat lines API.
+**How it works.** `~/.claude/bc-threads.json` maps a project to a session and remembers the
+last comment seen there. A comment arrives by webhook within seconds; the receiver never
+reads the payload for content, it only triggers a sweep, so a forged POST buys an extra poll
+and nothing else. The sweep is a single `comments list --all-projects` call covering every
+bridged project at once. `bc-watch.timer` runs the same sweep every 2 minutes as the fallback
+for a missed hook, and is the only route for **pings** — direct messages have no webhook
+event type in Basecamp, so they are found via notifications and read from the Circle chat
+lines API.
 
-**Webhooks belong to the box↔project pair**, not to any thread or session: threads come and
-go, sessions get unlinked, the connection outlives both. `bc-threads projects --connect/
---disconnect` manages it, and the dashboard's `/basecamp` page shows connections, thread↔
-session links, and message history, with buttons to unlink a thread or disconnect a project.
-
-**Delivery is gated on the session being idle** — messages are typed into the pane, so
-delivering mid-turn would drop keystrokes into a running tool call. A busy session holds its
-watermark and takes the batch on the next sweep. Nothing is dropped, and nothing is
-truncated silently: an over-long comment is cut with a marker naming both lengths and
-linking the original.
+**Delivery is gated on the session being idle**, because messages are typed into its pane and
+arriving mid-turn would drop keystrokes into a running tool call. A busy session keeps its
+watermark and takes the batch on the next sweep. Nothing is truncated silently either: an
+over-long comment is cut with a marker naming both lengths and linking the original.
 
 Config lives in `~/.claude/bc-threads.json`, never in this repo:
 
@@ -265,9 +259,10 @@ Config lives in `~/.claude/bc-threads.json`, never in this repo:
 | `self` | the person id the CLI posts as, so our own comments never loop back |
 
 **Sessions clarify before they build.** Append `docs/CLAUDE.md.basecamp.md` to
-`~/.claude/CLAUDE.md` and a session receiving an underspecified request asks the person
-back on the thread — numbered questions, all in one reply — rather than guessing, and does
-the work once the answers land.
+`~/.claude/CLAUDE.md`: a session given an underspecified request asks the person back on the
+thread — numbered questions, all in one reply — rather than guessing, and does the work once
+the answers land. It also tells a session to `bc-threads link` a project it gets mentioned in
+but does not yet cover.
 
 ## Multiple Claude accounts (spillover to a second plan)
 
