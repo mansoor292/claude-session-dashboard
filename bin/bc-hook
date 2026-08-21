@@ -16,6 +16,7 @@ a flood of events collapses into one poll.
 import http.server, json, os, secrets, subprocess, sys, threading, time, argparse
 
 SECRET_FILE = os.path.expanduser(os.environ.get("BC_HOOK_SECRET_FILE", "~/.claude/bc-hook-secret"))
+DOMAIN_FILE = os.path.expanduser(os.environ.get("BC_HOOK_DOMAIN_FILE", "~/.claude/bc-hook-domain"))
 BC_THREADS  = os.environ.get("BC_THREADS_BIN", "/usr/local/bin/bc-threads")
 DEBOUNCE    = float(os.environ.get("BC_HOOK_DEBOUNCE", "3"))    # seconds to collect a burst
 
@@ -111,7 +112,15 @@ def main():
     a = ap.parse_args()
 
     Handler.secret = load_secret()
-    domain = os.environ.get("DEV_DOMAIN", "dev.catalogshub.com")
+    # The URL must come out the same however this runs — under systemd, from a shell, or
+    # from bc-threads deciding whether a project's webhook already exists. A wrong domain
+    # there means duplicate webhooks pointing at a host that does not exist, so the box's
+    # domain is kept in a file rather than relying on the environment being set.
+    domain = os.environ.get("DEV_DOMAIN") or ""
+    if not domain:
+        try: domain = open(DOMAIN_FILE).read().strip()
+        except Exception: domain = ""
+    domain = domain or "dev.example.com"
     url = "https://p%d.%s/%s" % (a.port, domain, Handler.secret)
     if a.print_url:
         print(url); return

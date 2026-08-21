@@ -32,8 +32,11 @@ MAXLEN   = int(os.environ.get("BC_MAXLEN", "6000"))     # per comment/line
 BATCHMAX = int(os.environ.get("BC_BATCHMAX", "24000"))  # whole delivery
 HISTLEN  = int(os.environ.get("BC_HISTLEN", "4000"))    # what the dashboard stores
 CODE_ROOT = os.path.expanduser(os.environ.get("CODE_ROOT", "~/Code"))
-ACCOUNT  = os.environ.get("BC_ACCOUNT", "4156959")      # for rebuilding circle URLs
-PING_FROM = ["Mansoor Razzaq"]                          # only these senders get handled (registry overrides)
+# Site config lives in the registry (~/.claude/bc-threads.json), not here:
+#   ping_from         list of sender names to act on; empty/absent = everyone
+#   ping_repo_filter  substring picking which checkouts to offer for an unlinked ping
+#   account           Basecamp account id, discovered on first use
+PING_FROM = []                                          # no sender allowlist by default
 
 
 # ---- registry -------------------------------------------------------------
@@ -76,8 +79,9 @@ def bc(*args, check=True):
 def whoami(reg):
     """The person id the CLI posts as, cached in the registry.
 
-    The agent account (CatalogsAI) is a different person from the humans on the thread,
-    so 'skip our own comments' is now a clean author test rather than a footer sniff.
+    When the CLI authenticates as a dedicated agent user rather than as one of the humans
+    on the thread, 'skip our own comments' is a clean author test rather than a footer
+    sniff — and the footer still covers anything posted before such a switch.
     """
     me = reg.get("self") or {}
     if me.get("id"): return me
@@ -143,15 +147,26 @@ def deliver(name, text):
 
 
 # ---- helpers --------------------------------------------------------------
-def repo_choices(pattern="digitalCatalogs"):
-    """Candidate checkouts a ping could be linked to: the repo plus its worktrees."""
+def account_id(reg):
+    """Basecamp account id, discovered once and cached — used to rebuild circle URLs."""
+    if os.environ.get("BC_ACCOUNT"): return os.environ["BC_ACCOUNT"]
+    if reg.get("account"): return reg["account"]
+    d = bc("accounts", "list", check=False) or []
+    if d:
+        reg["account"] = str(d[0].get("id") or ""); save(reg)
+        return reg["account"]
+    return ""
+
+
+def repo_choices(pattern=""):
+    """Candidate checkouts a ping could be linked to: matching repos plus their worktrees."""
     out = []
     for base in (CODE_ROOT, CODE_ROOT + "/catalogs", CODE_ROOT + "/.worktrees"):
         try: entries = sorted(os.listdir(base))
         except Exception: continue
         for e in entries:
             full = os.path.join(base, e)
-            if pattern.lower() not in e.lower(): continue
+            if pattern and pattern.lower() not in e.lower(): continue
             if os.path.isdir(full) and os.path.exists(os.path.join(full, ".git")):
                 out.append(full)
     return out
@@ -338,7 +353,8 @@ def cmd_pings(a):
     for circle, st in (seen or {}).items():
         if circle in circles or not st.get("chat"): continue
         circles[circle] = {"chat": st["chat"], "who": st.get("who") or "",
-                           "url": "https://app.basecamp.com/%s/circles/%s" % (ACCOUNT, circle)}
+                           "url": st.get("url") or ("https://app.basecamp.com/%s/circles/%s"
+                                                    % (account_id(reg), circle))}
     if not circles:
         if a.verbose: print("no ping threads known or in notifications")
         return
@@ -347,7 +363,8 @@ def cmd_pings(a):
         lines = bc("api", "get", "/buckets/%s/chats/%s/lines.json" % (circle, info["chat"]), check=False) or []
         if not isinstance(lines, list) or not lines: continue
         if circle not in seen:      # persist on discovery so `ping-link` can target it at once
-            seen[circle] = {"last_line_id": 0, "who": info["who"], "chat": info["chat"]}
+            seen[circle] = {"last_line_id": 0, "who": info["who"], "chat": info["chat"],
+                            "url": info.get("url") or ""}   # keep it, so no id juggling later
             save(reg)
         st = seen[circle]
         st["chat"] = info["chat"]
@@ -376,13 +393,13 @@ def cmd_pings(a):
         body = "  ".join('%s: "%s"' % ((l.get("creator") or {}).get("name") or "?",
                                        clip(detag(l.get("content")), MAXLEN, info["url"])) for l in fresh)
         # Only pitch checkouts while the thread has no home; once linked it just routes.
-        repos = [] if st.get("session") else repo_choices(reg.get("ping_repo_filter") or "digitalCatalogs")
+        repos = [] if st.get("session") else repo_choices(reg.get("ping_repo_filter") or "")
         busy = sessions_in(set(repos)) if repos else {}
         offer = ""
         if repos:
             listed = ", ".join("%s%s" % (os.path.basename(r), (" [session %s]" % n) if (n := next((k for k, v in busy.items() if v == r), None)) else "")
                                for r in repos)
-            offer = (" This ping is not linked to a repo yet. Offer these digitalCatalogs checkouts and ask which one it belongs to: "
+            offer = (" This ping is not linked to a repo yet. Offer these checkouts and ask which one it belongs to: "
                      + listed + ". Once they pick, run: bc-threads ping-link " + circle + " <session-name> "
                      "(or start a session in that checkout first, then link it).")
         msg = ('Basecamp ping — %d new message(s) from %s. %s Thread: %s .%s DO NOT reply on the '

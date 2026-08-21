@@ -6,7 +6,8 @@ After=network.target
 User=ubuntu
 Group=ubuntu
 Environment=HOME=/home/ubuntu
-Environment=DEV_DOMAIN=dev.catalogshub.com
+# Point at your own wildcard domain (must match session-dashboard.service):
+Environment=DEV_DOMAIN=dev.example.com
 Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/local/bin/bc-hook --port 8977
 Restart=always

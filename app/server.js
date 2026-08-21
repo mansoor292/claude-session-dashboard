@@ -289,7 +289,7 @@ function bcState(){
   }));
   const pings=Object.entries(reg.pings||{}).map(([id,t])=>({
     id, kind:'ping', title:t.who||'', session:t.session||'_dashboard', project:'',
-    url:'https://app.basecamp.com/4156959/circles/'+id, last:t.last_line_id||0, ours:0,
+    url:t.url||'', last:t.last_line_id||0, ours:0,
     bridge:(live[t.session||'_dashboard']||{}).bridge||null, alive:!!live[t.session||'_dashboard']
   }));
   const projects=Object.entries(reg.projects||{}).map(([id,r])=>({
@@ -513,7 +513,7 @@ http.createServer((req,res)=>{
       return `<tr><td class=num title="${esc(new Date((h.ts||0)*1000).toISOString())}">${ago(h.ts)}</td>
         <td><span class="pill ${cls}">${k}</span></td>
         <td>${esc(h.title||h.thread||h.circle||'')}</td>
-        <td>${esc(h.frm||(h.kind==='sent'?'CatalogsAI':''))}</td>
+        <td>${esc(h.frm||(h.kind==='sent'?((d.self||{}).name||'us'):''))}</td>
         <td>${esc(h.session||'')}</td>
         <td class=msg>${esc(h.text||(h.why?('('+h.why+', '+(h.count||0)+' waiting)'):'')).replace(/(…\[CUT[^\]]*\])/,'<span class=cut>$1</span>')}</td></tr>`;
     }).join('');
