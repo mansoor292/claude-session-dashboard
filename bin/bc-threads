@@ -236,8 +236,111 @@ def cmd_adopt(a):
         }
         found += 1
         print("adopted %s -> %s  %s" % (rid, sess, title[:50]))
+    # Threads adopted from a comment can land without bucket/title (the payload carries
+    # neither); fill them in so `list` and webhook registration have something to work with.
+    for rid, t in reg["threads"].items():
+        if t.get("project") and t.get("title"): continue
+        cs = bc("comments", "list", rid, check=False) or []
+        if not cs: continue
+        par = cs[0].get("parent") or {}
+        t["project"] = t.get("project") or (cs[0].get("bucket") or {}).get("id")
+        t["title"] = t.get("title") or par.get("title") or ""
+        t["url"] = t.get("url") or par.get("app_url") or ""
+        found += 1
+        print("filled in %s: project=%s %s" % (rid, t.get("project"), (t.get("title") or "")[:40]))
     if found: save(reg)
     elif a.verbose: print("nothing new to adopt")
+
+
+def cmd_pings(a):
+    """Deliver Basecamp pings (direct messages) into a session.
+
+    Pings have no webhook event type and are not in `recordings`, so notifications are the
+    only way to find them. They live as chat transcripts in Circle buckets and are read
+    through the raw lines API.
+    """
+    reg = load(); me = whoami(reg); live = sessions()
+    seen = reg.setdefault("pings", {})
+    d = bc("notifications", "list", check=False) or {}
+    items = (d.get("unreads") or []) + (d.get("reads") or []) if isinstance(d, dict) else []
+    circles = {}
+    for r in items:
+        if r.get("section") != "pings": continue
+        m = re.search(r"/buckets/(\d+)/recordings/(\d+)/", r.get("subscription_url") or "")
+        if m: circles[m.group(1)] = {"chat": m.group(2), "who": r.get("bucket_name") or "",
+                                     "url": r.get("app_url") or ""}
+    if not circles:
+        if a.verbose: print("no ping threads in notifications")
+        return
+    target = a.to or reg.get("ping_session") or "_dashboard"
+    for circle, info in sorted(circles.items()):
+        lines = bc("api", "get", "/buckets/%s/chats/%s/lines.json" % (circle, info["chat"]), check=False) or []
+        if not isinstance(lines, list) or not lines: continue
+        st = seen.setdefault(circle, {"last_line_id": 0, "who": info["who"]})
+        last = int(st.get("last_line_id") or 0)
+        fresh = [l for l in sorted(lines, key=lambda l: int(l["id"]))
+                 if int(l["id"]) > last and not (me.get("id") and (l.get("creator") or {}).get("id") == me["id"])]
+        newest = max(int(l["id"]) for l in lines)
+        if not fresh:
+            if newest > last: st["last_line_id"] = newest; save(reg)
+            if a.verbose: print("   ping %s: nothing new" % info["who"])
+            continue
+        sess = st.get("session") or target
+        if not live.get(sess, {}).get("alive"):
+            print("-- ping %s: %d new, but %s is not running — holding" % (info["who"], len(fresh), sess)); continue
+        if live[sess].get("status") == "busy":
+            print("-- ping %s: %d new, but %s is busy — holding" % (info["who"], len(fresh), sess)); continue
+        body = "  ".join('%s: "%s"' % ((l.get("creator") or {}).get("name") or "?",
+                                       detag(l.get("content"))[:MAXLEN]) for l in fresh)
+        msg = ('Basecamp ping — %d new message(s) from %s. %s Thread: %s . To answer run: '
+               'bc-threads ping-reply %s "your reply"' % (len(fresh), info["who"], body, info["url"], circle))
+        if a.dry_run:
+            print("   would deliver to %s: %s" % (sess, msg[:180])); continue
+        ensure_bridge(sess); deliver(sess, msg)
+        st["last_line_id"] = max(int(l["id"]) for l in fresh); st["chat"] = info["chat"]; save(reg)
+        print("-> %s: delivered %d ping line(s) from %s" % (sess, len(fresh), info["who"]))
+
+
+def cmd_ping_reply(a):
+    reg = load()
+    st = (reg.get("pings") or {}).get(str(a.circle))
+    chat = a.chat or (st or {}).get("chat")
+    if not chat: sys.exit("unknown chat id for circle %s — run `bc-threads pings` first" % a.circle)
+    sess = a.session or cur_session()
+    text = a.text + (("\n\n" + FOOTER + " " + sess) if sess else "")
+    body = json.dumps({"content": "<p>%s</p>" % html.escape(text).replace("\n", "<br>")})
+    bc("api", "post", "/buckets/%s/chats/%s/lines.json" % (a.circle, chat), "--data", body)
+    print("ping sent to circle %s" % a.circle)
+
+
+def cmd_hooks(a):
+    """Keep one Comment webhook per project we actually watch.
+
+    Webhooks are per-project, threads are per-recording, so the set of projects is derived
+    from the registry and reconciled on every run: create what is missing, delete ours
+    where nothing is watched any more.
+    """
+    url = subprocess.run([os.environ.get("BC_HOOK_BIN", "/usr/local/bin/bc-hook"), "--print-url"],
+                         capture_output=True, text=True).stdout.strip()
+    if not url: sys.exit("could not work out the webhook url (is bc-hook installed?)")
+    reg = load()
+    want = {str(t.get("project")) for t in reg["threads"].values() if t.get("project")}
+    print("watching %d project(s): %s" % (len(want), ", ".join(sorted(want)) or "-"))
+    for proj in sorted(want):
+        hooks = bc("webhooks", "list", "--in", proj, check=False) or []
+        mine = [h for h in hooks if (h.get("payload_url") or "").rstrip("/") == url.rstrip("/")]
+        if mine:
+            print("  %s: already hooked (%s)" % (proj, mine[0].get("id"))); continue
+        if a.dry_run:
+            print("  %s: would create webhook" % proj); continue
+        d = bc("webhooks", "create", url, "--in", proj, "--types", a.types, check=False)
+        print("  %s: %s" % (proj, ("created " + str((d or {}).get("id"))) if d else "FAILED"))
+    if a.prune:
+        for proj in sorted({str(p) for p in (a.prune_projects or [])} - want):
+            for h in bc("webhooks", "list", "--in", proj, check=False) or []:
+                if (h.get("payload_url") or "").rstrip("/") == url.rstrip("/"):
+                    bc("webhooks", "delete", str(h["id"]), "--in", proj, check=False)
+                    print("  %s: removed webhook %s" % (proj, h["id"]))
 
 
 def cmd_authcheck(a):
@@ -268,6 +371,9 @@ def cmd_authcheck(a):
 
 
 def cmd_watch(a):
+    if not a.no_pings:
+        try: cmd_pings(argparse.Namespace(to=None, dry_run=False, verbose=a.verbose))
+        except Exception as e: print("!! ping sweep failed: %s" % e)
     if not a.no_adopt:
         try: cmd_adopt(argparse.Namespace(limit=a.adopt_limit, verbose=False))
         except Exception as e: print("!! adopt failed: %s" % e)
@@ -278,6 +384,7 @@ def cmd_watch(a):
         return
     dirty = False
     for rid, t in sorted(reg["threads"].items()):
+        if a.only and rid != str(a.only): continue
         comments = bc("comments", "list", rid, check=False)
         if comments is None:
             print("!! %s: could not fetch comments" % rid); continue
@@ -331,6 +438,14 @@ sp = sub.add_parser("reply"); sp.add_argument("recording"); sp.add_argument("tex
 sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_reply)
 sp = sub.add_parser("list"); sp.set_defaults(fn=cmd_list)
 sp = sub.add_parser("unregister"); sp.add_argument("recording"); sp.set_defaults(fn=cmd_unregister)
+sp = sub.add_parser("pings"); sp.add_argument("--to", help="session to deliver into (default _dashboard)")
+sp.add_argument("--dry-run", action="store_true"); sp.add_argument("-v", "--verbose", action="store_true")
+sp.set_defaults(fn=cmd_pings)
+sp = sub.add_parser("ping-reply"); sp.add_argument("circle"); sp.add_argument("text")
+sp.add_argument("--chat"); sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_ping_reply)
+sp = sub.add_parser("hooks"); sp.add_argument("--types", default="Comment")
+sp.add_argument("--dry-run", action="store_true"); sp.add_argument("--prune", action="store_true")
+sp.add_argument("--prune-projects", nargs="*"); sp.set_defaults(fn=cmd_hooks)
 sp = sub.add_parser("authcheck"); sp.add_argument("--warn-hours", type=float, default=48.0)
 sp.add_argument("--notify", default="_dashboard", help="session to tell (empty to only log)")
 sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_authcheck)
@@ -339,6 +454,8 @@ sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_
 sp = sub.add_parser("watch"); sp.add_argument("--once", action="store_true"); sp.add_argument("--dry-run", action="store_true")
 sp.add_argument("--no-adopt", action="store_true", help="skip the auto-registration sweep")
 sp.add_argument("--adopt-limit", type=int, default=50)
+sp.add_argument("--only", help="poll just this recording id (used by the webhook receiver)")
+sp.add_argument("--no-pings", action="store_true", help="skip the ping sweep")
 sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_watch)
 
 a = p.parse_args()

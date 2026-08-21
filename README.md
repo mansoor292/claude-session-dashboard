@@ -46,7 +46,9 @@ Encrypt **wildcard** cert (DNS-01), behind HTTP basic auth.
    │                     │
    │                     └── tmux-web → `tmux attach -t <arg>`  (attach by name, never creates)
    │
-   └── bc-watch.timer  → `bc-threads watch`  (Basecamp replies → the owning session)
+   ├── bc-hook.service → webhook receiver, p8977 (Basecamp comment → immediate poll)
+   ├── bc-watch.timer  → `bc-threads watch`  (safety net + pings, every 2m)
+   └── bc-authcheck.timer → warns before the Basecamp token expires
    │
    └── reads: tmux + ~/.claude*/sessions/*.json (all accounts) + transcript mtimes + /proc
        writes: spawn/kill tmux sessions, create/remove git worktrees

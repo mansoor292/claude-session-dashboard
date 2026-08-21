@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Basecamp webhook receiver — turns a comment event into an immediate poll.
+
+Caddy publishes any local port at https://p<PORT>.dev.<domain> with NO auth, so this
+endpoint is reachable by anyone who guesses it. It is therefore built to be useless to
+an attacker: the request body is never trusted or delivered. A valid POST only *triggers*
+`bc-threads watch`, which re-fetches the thread from the Basecamp API and applies the
+same filters as the timer. A forged request can at most cause an extra poll.
+
+  bc-hook --port 8977            # reads the secret from ~/.claude/bc-hook-secret
+  curl -X POST https://p8977.dev.example.com/<secret>
+
+Cheap defences on top: a long random path segment, a POST-only route, and a debounce so
+a flood of events collapses into one poll.
+"""
+import http.server, json, os, secrets, subprocess, sys, threading, time, argparse
+
+SECRET_FILE = os.path.expanduser(os.environ.get("BC_HOOK_SECRET_FILE", "~/.claude/bc-hook-secret"))
+BC_THREADS  = os.environ.get("BC_THREADS_BIN", "/usr/local/bin/bc-threads")
+DEBOUNCE    = float(os.environ.get("BC_HOOK_DEBOUNCE", "3"))    # seconds to collect a burst
+
+
+def load_secret():
+    """One long random path segment, generated on first run and kept 0600."""
+    if os.path.exists(SECRET_FILE):
+        s = open(SECRET_FILE).read().strip()
+        if s: return s
+    s = secrets.token_urlsafe(32)
+    os.makedirs(os.path.dirname(SECRET_FILE), exist_ok=True)
+    with open(SECRET_FILE, "w") as f: f.write(s + "\n")
+    os.chmod(SECRET_FILE, 0o600)
+    return s
+
+
+class Poller:
+    """Collapses a burst of events into a single `bc-threads watch`."""
+    def __init__(self):
+        self.lock, self.pending, self.last = threading.Lock(), False, 0.0
+
+    def trigger(self):
+        with self.lock:
+            if self.pending: return
+            self.pending = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        time.sleep(DEBOUNCE)
+        with self.lock: self.pending = False
+        try:
+            p = subprocess.run([BC_THREADS, "watch", "--no-adopt"], capture_output=True,
+                               text=True, timeout=300)
+            out = (p.stdout or "").strip()
+            if out: print(out, flush=True)
+        except Exception as e:
+            print("!! poll failed: %s" % e, flush=True)
+        self.last = time.time()
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    secret, poller = "", None
+
+    def _reply(self, code, body=b"ok"):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try: self.wfile.write(body)
+        except Exception: pass
+
+    def do_POST(self):
+        if self.path.strip("/") != self.secret:
+            self._reply(404, b"not found"); return
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(min(n, 65536)) if n else b""
+        kind = ""
+        try:                                     # logged only — never delivered
+            kind = (json.loads(raw or b"{}").get("kind") or "")[:60]
+        except Exception:
+            pass
+        print("event %s from %s — polling" % (kind or "?", self.client_address[0]), flush=True)
+        self.poller.trigger()
+        self._reply(200)
+
+    def do_GET(self):
+        # Basecamp verifies nothing, but a health probe is useful. Never echo the secret.
+        self._reply(200 if self.path == "/healthz" else 404,
+                    b"ok" if self.path == "/healthz" else b"not found")
+
+    def log_message(self, *a):                   # quiet: we print our own lines
+        pass
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=int(os.environ.get("BC_HOOK_PORT", "8977")))
+    ap.add_argument("--bind", default="127.0.0.1")   # Caddy fronts it; no need to bind wide
+    ap.add_argument("--print-url", action="store_true", help="print the webhook URL and exit")
+    a = ap.parse_args()
+
+    Handler.secret = load_secret()
+    domain = os.environ.get("DEV_DOMAIN", "dev.catalogshub.com")
+    url = "https://p%d.%s/%s" % (a.port, domain, Handler.secret)
+    if a.print_url:
+        print(url); return
+
+    Handler.poller = Poller()
+    srv = http.server.ThreadingHTTPServer((a.bind, a.port), Handler)
+    print("bc-hook listening on %s:%d" % (a.bind, a.port), flush=True)
+    print("webhook url: %s" % url, flush=True)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

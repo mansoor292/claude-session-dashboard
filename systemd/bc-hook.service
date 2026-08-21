@@ -1,0 +1,16 @@
+[Unit]
+Description=Basecamp webhook receiver (triggers an immediate thread poll)
+After=network.target
+
+[Service]
+User=ubuntu
+Group=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=DEV_DOMAIN=dev.catalogshub.com
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/bc-hook --port 8977
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

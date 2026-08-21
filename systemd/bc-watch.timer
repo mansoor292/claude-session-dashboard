@@ -2,9 +2,11 @@
 Description=Poll registered Basecamp threads for human replies
 
 [Timer]
+# Comments now arrive by webhook (bc-hook.service), so this is the safety net for a
+# missed or deleted hook — and the only route for pings, which have no webhook event.
 OnBootSec=3min
-OnUnitActiveSec=90s
-AccuracySec=15s
+OnUnitActiveSec=2min
+AccuracySec=20s
 
 [Install]
 WantedBy=timers.target
