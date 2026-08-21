@@ -55,6 +55,30 @@ def bc(*args, check=True):
     return env.get("data")
 
 
+def whoami(reg):
+    """The person id the CLI posts as, cached in the registry.
+
+    The agent account (CatalogsAI) is a different person from the humans on the thread,
+    so 'skip our own comments' is now a clean author test rather than a footer sniff.
+    """
+    me = reg.get("self") or {}
+    if me.get("id"): return me
+    d = bc("people", "show", "me", check=False) or {}
+    if d.get("id"):
+        reg["self"] = {"id": int(d["id"]), "name": d.get("name") or "", "checked": int(time.time())}
+        save(reg)
+        return reg["self"]
+    return {}
+
+
+def parse_duration(txt):
+    """'335h58m27s' -> hours (float). Returns None if it cannot be read."""
+    m = re.findall(r"(\d+(?:\.\d+)?)\s*([dhms])", str(txt or ""))
+    if not m: return None
+    mult = {"d": 24.0, "h": 1.0, "m": 1 / 60.0, "s": 1 / 3600.0}
+    return sum(float(v) * mult[u] for v, u in m)
+
+
 # ---- sessions -------------------------------------------------------------
 def sessions():
     """tmux session name -> {alive, status} from every account's Claude session registry."""
@@ -216,11 +240,39 @@ def cmd_adopt(a):
     elif a.verbose: print("nothing new to adopt")
 
 
+def cmd_authcheck(a):
+    """Warn before the OAuth token lapses.
+
+    The watcher runs unattended: an expired token just makes every poll fail, so replies
+    stop routing quietly. Shout while there is still time to run `basecamp auth login`.
+    """
+    d = bc("auth", "status", check=False) or {}
+    hours = parse_duration(d.get("expires_in"))
+    ok = d.get("authenticated") and not d.get("expired")
+    if ok and hours is not None and hours > a.warn_hours:
+        if a.verbose: print("basecamp auth ok — %.0fh left" % hours)
+        return
+    if not ok:
+        msg = ("Basecamp auth has EXPIRED — bc-watch cannot poll threads and replies are not "
+               "reaching sessions. Run: basecamp auth login (then paste the callback URL here).")
+    else:
+        msg = ("Basecamp auth expires in about %.0f hours. Re-auth before it lapses or thread "
+               "replies stop routing: basecamp auth login (then paste the callback URL here)." % (hours or 0))
+    print("!!", msg)
+    target = a.notify
+    if target and sessions().get(target, {}).get("alive") and sessions()[target].get("status") != "busy":
+        try:
+            deliver(target, msg); print("-> notified %s" % target)
+        except Exception as e:
+            print("!! could not notify %s: %s" % (target, e))
+
+
 def cmd_watch(a):
     if not a.no_adopt:
         try: cmd_adopt(argparse.Namespace(limit=a.adopt_limit, verbose=False))
         except Exception as e: print("!! adopt failed: %s" % e)
     reg, live = load(), sessions()
+    me = whoami(reg)
     if not reg["threads"]:
         if a.verbose: print("no threads registered")
         return
@@ -229,9 +281,11 @@ def cmd_watch(a):
         comments = bc("comments", "list", rid, check=False)
         if comments is None:
             print("!! %s: could not fetch comments" % rid); continue
-        seen, ours = int(t.get("last_comment_id") or 0), set(t.get("ours") or [])
+        seen, ours, mine = int(t.get("last_comment_id") or 0), set(t.get("ours") or []), me.get("id")
         fresh = [c for c in sorted(comments, key=lambda c: int(c["id"]))
-                 if int(c["id"]) > seen and int(c["id"]) not in ours and FOOTER not in (c.get("content") or "")]
+                 if int(c["id"]) > seen and int(c["id"]) not in ours
+                 and FOOTER not in (c.get("content") or "")
+                 and not (mine and (c.get("creator") or {}).get("id") == mine)]
         newest = max([int(c["id"]) for c in comments] or [seen])
         if not fresh:
             if newest > seen: t["last_comment_id"] = newest; dirty = True   # skip past our own chatter
@@ -277,6 +331,9 @@ sp = sub.add_parser("reply"); sp.add_argument("recording"); sp.add_argument("tex
 sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_reply)
 sp = sub.add_parser("list"); sp.set_defaults(fn=cmd_list)
 sp = sub.add_parser("unregister"); sp.add_argument("recording"); sp.set_defaults(fn=cmd_unregister)
+sp = sub.add_parser("authcheck"); sp.add_argument("--warn-hours", type=float, default=48.0)
+sp.add_argument("--notify", default="_dashboard", help="session to tell (empty to only log)")
+sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_authcheck)
 sp = sub.add_parser("adopt"); sp.add_argument("-n", "--limit", type=int, default=50)
 sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_adopt)
 sp = sub.add_parser("watch"); sp.add_argument("--once", action="store_true"); sp.add_argument("--dry-run", action="store_true")

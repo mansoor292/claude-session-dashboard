@@ -1,0 +1,9 @@
+[Unit]
+Description=Warn before the Basecamp OAuth token expires
+
+[Service]
+Type=oneshot
+User=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/bc-threads authcheck --warn-hours 48

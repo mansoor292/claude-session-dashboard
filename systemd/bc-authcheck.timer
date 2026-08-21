@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Basecamp token expiry check
+
+[Timer]
+OnCalendar=*-*-* 09:07:00
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target
