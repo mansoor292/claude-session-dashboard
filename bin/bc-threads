@@ -184,6 +184,21 @@ def sessions_in(paths):
     return out
 
 
+# What a session must do with a delivered message. Kept here so the wording is identical
+# for comments and pings, and changes in one place.
+_RULE = (
+    "DO NOT start work and DO NOT reply on the thread yet. "
+    "Read whatever you need read-only to understand the ask, then answer HERE with: "
+    "(1) a short plan — what you would change, in what order, and what could break; "
+    "(2) every clarifying question or ambiguity you would otherwise have to guess at; "
+    "(3) anything you need from me first (access, a decision, a file). "
+    "Then stop and wait. Begin only when I say go, and send a thread reply only with "
+    "wording I approved, using: bc-threads %s %s \"the approved text\""
+)
+HANDLE_RULE = _RULE.replace("%s %s", "reply %s", 1) % "%s"
+PING_HANDLE_RULE = _RULE.replace("%s %s", "ping-reply %s", 1) % "%s"
+
+
 def clip(text, n, url=""):
     """Shorten only when we must, and never quietly."""
     text = text or ""
@@ -402,10 +417,8 @@ def cmd_pings(a):
             offer = (" This ping is not linked to a repo yet. Offer these checkouts and ask which one it belongs to: "
                      + listed + ". Once they pick, run: bc-threads ping-link " + circle + " <session-name> "
                      "(or start a session in that checkout first, then link it).")
-        msg = ('Basecamp ping — %d new message(s) from %s. %s Thread: %s .%s DO NOT reply on the '
-               'thread. If this asks for work, write the plan here and wait for me to confirm; only '
-               'after I say go, send it with: bc-threads ping-reply %s "the approved text"'
-               % (len(fresh), info["who"], body, info["url"], offer, circle))
+        msg = ('Basecamp ping — %d new message(s) from %s. %s Thread: %s .%s '
+               + PING_HANDLE_RULE % circle) % (len(fresh), info["who"], body, info["url"], offer)
         if a.dry_run:
             print("   would deliver to %s:\n%s" % (sess, msg)); continue
         ensure_bridge(sess); deliver(sess, msg)
@@ -638,12 +651,10 @@ def cmd_watch(a):
             who = (c.get("creator") or {}).get("name") or "someone"
             parts.append('%s: "%s"' % (who, clip(detag(c.get("content")), MAXLEN,
                                                  c.get("app_url") or t.get("url") or "")))
-        msg = ('Basecamp — %d new %s on "%s". %s Thread: %s . DO NOT reply on the thread. '
-               'If this asks for work, write the plan here and wait for me to confirm; only '
-               'after I say go, send it with: bc-threads reply %s "the approved text"'
-               % (len(fresh), "reply" if len(fresh) == 1 else "replies",
-                  (t.get("title") or rid)[:60], "  ".join(parts),
-                  fresh[-1].get("app_url") or t.get("url") or "", rid))
+        msg = ('Basecamp — %d new %s on "%s". %s Thread: %s . '
+               + HANDLE_RULE % rid) % (len(fresh), "reply" if len(fresh) == 1 else "replies",
+                                       (t.get("title") or rid)[:60], "  ".join(parts),
+                                       fresh[-1].get("app_url") or t.get("url") or "")
         msg = clip(msg, BATCHMAX, fresh[-1].get("app_url") or t.get("url") or "")
         if a.dry_run:
             print("   would deliver to %s (%d chars):\n%s" % (sess, len(msg), msg))
