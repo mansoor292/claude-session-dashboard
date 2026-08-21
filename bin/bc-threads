@@ -202,6 +202,14 @@ def cmd_register(a):
     }
     save(reg)
     print("watching %s -> session %s (from comment %s)" % (rid, sess, reg["threads"][rid]["last_comment_id"]))
+    proj = reg["threads"][rid].get("project")
+    if not proj:
+        # Project comes from a comment's bucket, so a thread with none leaves it unknown —
+        # and an unknown project cannot be hooked. Say so instead of quietly polling.
+        print("   ! no project resolved for %s — falling back to 2-minute polling. "
+              "Re-run with -p <project> to hook it for instant delivery." % rid)
+    elif not getattr(a, "no_hook", False):
+        ensure_hook(proj)
 
 def cmd_post(a):
     body = a.body or ""
@@ -211,7 +219,8 @@ def cmd_post(a):
     rid = str(d.get("id") or "")
     if not rid: sys.exit("posted but no recording id came back: %s" % str(d)[:300])
     print("posted %s %s" % (rid, d.get("app_url", "")))
-    cmd_register(argparse.Namespace(recording=rid, session=sess, project=a.project, from_start=False))
+    cmd_register(argparse.Namespace(recording=rid, session=sess, project=a.project,
+                                    from_start=False, no_hook=False))
 
 def cmd_reply(a):
     rid = recording_id(a.recording)
@@ -277,6 +286,7 @@ def cmd_adopt(a):
         }
         found += 1
         print("adopted %s -> %s  %s" % (rid, sess, title[:50]))
+        ensure_hook(bucket)
     # Threads adopted from a comment can land without bucket/title (the payload carries
     # neither); fill them in so `list` and webhook registration have something to work with.
     for rid, t in reg["threads"].items():
@@ -289,6 +299,7 @@ def cmd_adopt(a):
         t["url"] = t.get("url") or par.get("app_url") or ""
         found += 1
         print("filled in %s: project=%s %s" % (rid, t.get("project"), (t.get("title") or "")[:40]))
+        ensure_hook(t.get("project"))
     if found: save(reg)
     elif a.verbose: print("nothing new to adopt")
 
@@ -401,6 +412,28 @@ def cmd_ping_link(a):
     st["session"] = a.session
     save(reg)
     print("ping circle %s now routes to %s" % (a.circle, a.session))
+
+
+def ensure_hook(project, quiet=True):
+    """Make sure this project has our Comment webhook, so a new thread is instant.
+
+    Without one the thread is still watched, just by the 2-minute timer — working but
+    silently slower, which is the kind of gap nobody notices until it matters.
+    """
+    if not project: return False
+    try:
+        url = subprocess.run([os.environ.get("BC_HOOK_BIN", "/usr/local/bin/bc-hook"), "--print-url"],
+                             capture_output=True, text=True, timeout=30).stdout.strip()
+        if not url: return False
+        hooks = bc("webhooks", "list", "--in", str(project), check=False) or []
+        if any((h.get("payload_url") or "").rstrip("/") == url.rstrip("/") for h in hooks):
+            return True
+        d = bc("webhooks", "create", url, "--in", str(project), "--types", "Comment", check=False)
+        if d and not quiet: print("hooked project %s (webhook %s)" % (project, d.get("id")))
+        elif d: print("   webhook created for project %s" % project)
+        return bool(d)
+    except Exception as e:
+        print("!! could not set up webhook for %s: %s" % (project, e)); return False
 
 
 def cmd_hooks(a):
@@ -538,6 +571,7 @@ p = argparse.ArgumentParser(prog="bc-threads", description=__doc__, formatter_cl
 sub = p.add_subparsers(dest="cmd", required=True)
 
 sp = sub.add_parser("register"); sp.add_argument("recording"); sp.add_argument("-s", "--session"); sp.add_argument("-p", "--project")
+sp.add_argument("--no-hook", action="store_true", help="skip creating the project's webhook")
 sp.add_argument("--from-start", action="store_true", help="replay existing comments instead of only new ones"); sp.set_defaults(fn=cmd_register)
 sp = sub.add_parser("post"); sp.add_argument("project"); sp.add_argument("subject"); sp.add_argument("body", nargs="?")
 sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_post)
