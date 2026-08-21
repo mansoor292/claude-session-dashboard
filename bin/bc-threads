@@ -25,7 +25,12 @@ STORE    = os.path.expanduser(os.environ.get("BC_THREADS_FILE", "~/.claude/bc-th
 HISTORY  = os.path.expanduser(os.environ.get("BC_HISTORY_FILE", "~/.claude/bc-history.jsonl"))
 HOOKSNAP = os.path.expanduser(os.environ.get("BC_HOOKS_FILE", "~/.claude/bc-hooks.json"))
 FOOTER   = "— via Claude session"                       # marks our own comments, for humans and for us
-MAXLEN   = 1200                                         # per-comment body cut, keeps the pane sane
+# tmux send-keys carries 16k+ intact, so these are generous. Anything actually cut says
+# so and links the original — a silently shortened comment makes a session act on half a
+# request without knowing it.
+MAXLEN   = int(os.environ.get("BC_MAXLEN", "6000"))     # per comment/line
+BATCHMAX = int(os.environ.get("BC_BATCHMAX", "24000"))  # whole delivery
+HISTLEN  = int(os.environ.get("BC_HISTLEN", "4000"))    # what the dashboard stores
 CODE_ROOT = os.path.expanduser(os.environ.get("CODE_ROOT", "~/Code"))
 ACCOUNT  = os.environ.get("BC_ACCOUNT", "4156959")      # for rebuilding circle URLs
 PING_FROM = ["Mansoor Razzaq"]                          # only these senders get handled (registry overrides)
@@ -164,6 +169,13 @@ def sessions_in(paths):
     return out
 
 
+def clip(text, n, url=""):
+    """Shorten only when we must, and never quietly."""
+    text = text or ""
+    if len(text) <= n: return text
+    return text[:n] + " …[CUT after %d of %d chars%s]" % (n, len(text), (" — full text: " + url) if url else "")
+
+
 def detag(s):
     s = re.sub(r"<bc-attachment[^>]*>.*?</bc-attachment>", " [attachment] ", s or "", flags=re.S)
     s = re.sub(r"<br\s*/?>|</p>", " ", s)
@@ -233,7 +245,7 @@ def cmd_reply(a):
         t.setdefault("ours", []).append(int(d["id"]))       # never feed our own reply back in
         save(reg)
     note("sent", thread=rid, title=(t or {}).get("title") or "", session=sess or "",
-         cid=str(d.get("id") or ""), text=a.text[:400])
+         cid=str(d.get("id") or ""), text=clip(a.text, HISTLEN))
     print("replied %s" % d.get("id", "?"))
 
 def cmd_list(a):
@@ -362,7 +374,7 @@ def cmd_pings(a):
             print("-- ping %s: %d new, but %s is busy — holding" % (info["who"], len(fresh), sess))
             note("hold", circle=circle, title=info["who"], session=sess, count=len(fresh), why="session busy"); continue
         body = "  ".join('%s: "%s"' % ((l.get("creator") or {}).get("name") or "?",
-                                       detag(l.get("content"))[:MAXLEN]) for l in fresh)
+                                       clip(detag(l.get("content")), MAXLEN, info["url"])) for l in fresh)
         # Only pitch checkouts while the thread has no home; once linked it just routes.
         repos = [] if st.get("session") else repo_choices(reg.get("ping_repo_filter") or "digitalCatalogs")
         busy = sessions_in(set(repos)) if repos else {}
@@ -385,7 +397,7 @@ def cmd_pings(a):
         for l in fresh:
             note("ping", circle=circle, title=info["who"], session=sess,
                  frm=(l.get("creator") or {}).get("name") or "", cid=str(l["id"]),
-                 url=info["url"], text=detag(l.get("content"))[:400])
+                 url=info["url"], text=clip(detag(l.get("content")), HISTLEN))
 
 
 def cmd_ping_reply(a):
@@ -399,7 +411,7 @@ def cmd_ping_reply(a):
     # reader sees literal <p> and <br> tags. Send the text as-is, newlines included.
     body = json.dumps({"content": text})
     bc("api", "post", "/buckets/%s/chats/%s/lines.json" % (a.circle, chat), "--data", body)
-    note("sent", circle=str(a.circle), title=(st or {}).get("who") or "", session=sess or "", text=a.text[:400])
+    note("sent", circle=str(a.circle), title=(st or {}).get("who") or "", session=sess or "", text=clip(a.text, HISTLEN))
     print("ping sent to circle %s" % a.circle)
 
 
@@ -607,15 +619,17 @@ def cmd_watch(a):
         parts = []
         for c in fresh:
             who = (c.get("creator") or {}).get("name") or "someone"
-            parts.append('%s: "%s"' % (who, detag(c.get("content"))[:MAXLEN]))
+            parts.append('%s: "%s"' % (who, clip(detag(c.get("content")), MAXLEN,
+                                                 c.get("app_url") or t.get("url") or "")))
         msg = ('Basecamp — %d new %s on "%s". %s Thread: %s . DO NOT reply on the thread. '
                'If this asks for work, write the plan here and wait for me to confirm; only '
                'after I say go, send it with: bc-threads reply %s "the approved text"'
                % (len(fresh), "reply" if len(fresh) == 1 else "replies",
                   (t.get("title") or rid)[:60], "  ".join(parts),
                   fresh[-1].get("app_url") or t.get("url") or "", rid))
+        msg = clip(msg, BATCHMAX, fresh[-1].get("app_url") or t.get("url") or "")
         if a.dry_run:
-            print("   would deliver to %s: %s" % (sess, msg[:200]))
+            print("   would deliver to %s (%d chars):\n%s" % (sess, len(msg), msg))
         else:
             if not ensure_bridge(sess):
                 print("!! %s: no Remote Control bridge — delivering, but it will not show in claude.ai" % sess)
@@ -627,7 +641,7 @@ def cmd_watch(a):
                 note("comment", thread=rid, title=t.get("title") or "", session=sess,
                      frm=(c.get("creator") or {}).get("name") or "", cid=str(c["id"]),
                      url=c.get("app_url") or t.get("url") or "", bridge=bridge,
-                     text=detag(c.get("content"))[:400])
+                     text=clip(detag(c.get("content")), HISTLEN))
             t["last_comment_id"] = max(int(c["id"]) for c in fresh); dirty = True
     if dirty and not a.dry_run: save(reg)
 

@@ -515,7 +515,7 @@ http.createServer((req,res)=>{
         <td>${esc(h.title||h.thread||h.circle||'')}</td>
         <td>${esc(h.frm||(h.kind==='sent'?'CatalogsAI':''))}</td>
         <td>${esc(h.session||'')}</td>
-        <td class=msg>${esc(h.text||(h.why?('('+h.why+', '+(h.count||0)+' waiting)'):''))}</td></tr>`;
+        <td class=msg>${esc(h.text||(h.why?('('+h.why+', '+(h.count||0)+' waiting)'):'')).replace(/(…\[CUT[^\]]*\])/,'<span class=cut>$1</span>')}</td></tr>`;
     }).join('');
     res.writeHead(200,{'Content-Type':'text/html'});
     return res.end(`<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Basecamp · Claude box</title>
@@ -526,7 +526,8 @@ th{text-align:left;color:#94a3b8;font-weight:600;font-size:11px;text-transform:u
 td{padding:8px 11px;border-bottom:1px solid rgba(148,163,184,.07);vertical-align:top}
 td.num{font-variant-numeric:tabular-nums;color:#94a3b8;white-space:nowrap}
 td.cmd{font-family:ui-monospace,Menlo,monospace;color:#7dd3fc}
-td.msg{color:#cbd5e1;max-width:640px}
+td.msg{color:#cbd5e1;max-width:760px;white-space:pre-wrap;word-break:break-word}
+td.msg .cut{color:#fbbf24}
 .dim{color:#64748b;font-size:11.5px}
 .chip{display:inline-block;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.3);color:#7dd3fc;border-radius:7px;padding:1px 7px;font-size:11.5px;margin:1px 0}
 a{color:#7dd3fc;text-decoration:none} a:hover{text-decoration:underline}
