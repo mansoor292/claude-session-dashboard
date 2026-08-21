@@ -24,6 +24,8 @@ SOCKET   = os.environ.get("TMUX_SOCKET", "default")     # sessions live on the d
 STORE    = os.path.expanduser(os.environ.get("BC_THREADS_FILE", "~/.claude/bc-threads.json"))
 FOOTER   = "— via Claude session"                       # marks our own comments, for humans and for us
 MAXLEN   = 1200                                         # per-comment body cut, keeps the pane sane
+CODE_ROOT = os.path.expanduser(os.environ.get("CODE_ROOT", "~/Code"))
+PING_FROM = ["Mansoor Razzaq"]                          # only these senders get handled (registry overrides)
 
 
 # ---- registry -------------------------------------------------------------
@@ -125,6 +127,32 @@ def deliver(name, text):
 
 
 # ---- helpers --------------------------------------------------------------
+def repo_choices(pattern="digitalCatalogs"):
+    """Candidate checkouts a ping could be linked to: the repo plus its worktrees."""
+    out = []
+    for base in (CODE_ROOT, CODE_ROOT + "/catalogs", CODE_ROOT + "/.worktrees"):
+        try: entries = sorted(os.listdir(base))
+        except Exception: continue
+        for e in entries:
+            full = os.path.join(base, e)
+            if pattern.lower() not in e.lower(): continue
+            if os.path.isdir(full) and os.path.exists(os.path.join(full, ".git")):
+                out.append(full)
+    return out
+
+
+def sessions_in(paths):
+    """Live sessions already working in one of those checkouts, name -> path."""
+    out = {}
+    res = subprocess.run([TMUX, "-L", SOCKET, "list-sessions", "-F", "#{session_name}"],
+                         capture_output=True, text=True)
+    for name in (res.stdout or "").split():
+        p = subprocess.run([TMUX, "-L", SOCKET, "display-message", "-p", "-t", name, "#{pane_current_path}"],
+                           capture_output=True, text=True).stdout.strip()
+        if p in paths: out[name] = p
+    return out
+
+
 def detag(s):
     s = re.sub(r"<bc-attachment[^>]*>.*?</bc-attachment>", " [attachment] ", s or "", flags=re.S)
     s = re.sub(r"<br\s*/?>|</p>", " ", s)
@@ -276,10 +304,21 @@ def cmd_pings(a):
     for circle, info in sorted(circles.items()):
         lines = bc("api", "get", "/buckets/%s/chats/%s/lines.json" % (circle, info["chat"]), check=False) or []
         if not isinstance(lines, list) or not lines: continue
-        st = seen.setdefault(circle, {"last_line_id": 0, "who": info["who"]})
+        if circle not in seen:      # persist on discovery so `ping-link` can target it at once
+            seen[circle] = {"last_line_id": 0, "who": info["who"], "chat": info["chat"]}
+            save(reg)
+        st = seen[circle]
+        st["chat"] = info["chat"]
         last = int(st.get("last_line_id") or 0)
-        fresh = [l for l in sorted(lines, key=lambda l: int(l["id"]))
-                 if int(l["id"]) > last and not (me.get("id") and (l.get("creator") or {}).get("id") == me["id"])]
+        allow = [x.lower() for x in (reg.get("ping_from") or PING_FROM)]
+        fresh, ignored = [], []
+        for l in sorted(lines, key=lambda l: int(l["id"])):
+            if int(l["id"]) <= last: continue
+            who = (l.get("creator") or {}).get("name") or ""
+            if me.get("id") and (l.get("creator") or {}).get("id") == me["id"]: continue
+            (fresh if (not allow or who.lower() in allow) else ignored).append(l)
+        for l in ignored:
+            print("   ignoring ping line from %s (not in ping_from)" % ((l.get("creator") or {}).get("name") or "?"))
         newest = max(int(l["id"]) for l in lines)
         if not fresh:
             if newest > last: st["last_line_id"] = newest; save(reg)
@@ -292,10 +331,20 @@ def cmd_pings(a):
             print("-- ping %s: %d new, but %s is busy — holding" % (info["who"], len(fresh), sess)); continue
         body = "  ".join('%s: "%s"' % ((l.get("creator") or {}).get("name") or "?",
                                        detag(l.get("content"))[:MAXLEN]) for l in fresh)
-        msg = ('Basecamp ping — %d new message(s) from %s. %s Thread: %s . To answer run: '
-               'bc-threads ping-reply %s "your reply"' % (len(fresh), info["who"], body, info["url"], circle))
+        # Only pitch checkouts while the thread has no home; once linked it just routes.
+        repos = [] if st.get("session") else repo_choices(reg.get("ping_repo_filter") or "digitalCatalogs")
+        busy = sessions_in(set(repos)) if repos else {}
+        offer = ""
+        if repos:
+            listed = ", ".join("%s%s" % (os.path.basename(r), (" [session %s]" % n) if (n := next((k for k, v in busy.items() if v == r), None)) else "")
+                               for r in repos)
+            offer = (" This ping is not linked to a repo yet. Offer these digitalCatalogs checkouts and ask which one it belongs to: "
+                     + listed + ". Once they pick, run: bc-threads ping-link " + circle + " <session-name> "
+                     "(or start a session in that checkout first, then link it).")
+        msg = ('Basecamp ping — %d new message(s) from %s. %s Thread: %s .%s To answer run: '
+               'bc-threads ping-reply %s "your reply"' % (len(fresh), info["who"], body, info["url"], offer, circle))
         if a.dry_run:
-            print("   would deliver to %s: %s" % (sess, msg[:180])); continue
+            print("   would deliver to %s:\n%s" % (sess, msg)); continue
         ensure_bridge(sess); deliver(sess, msg)
         st["last_line_id"] = max(int(l["id"]) for l in fresh); st["chat"] = info["chat"]; save(reg)
         print("-> %s: delivered %d ping line(s) from %s" % (sess, len(fresh), info["who"]))
@@ -311,6 +360,17 @@ def cmd_ping_reply(a):
     body = json.dumps({"content": "<p>%s</p>" % html.escape(text).replace("\n", "<br>")})
     bc("api", "post", "/buckets/%s/chats/%s/lines.json" % (a.circle, chat), "--data", body)
     print("ping sent to circle %s" % a.circle)
+
+
+def cmd_ping_link(a):
+    """Hand a ping thread to the session that owns the work, so later lines route there."""
+    reg = load()
+    st = (reg.setdefault("pings", {})).get(str(a.circle))
+    if st is None: sys.exit("circle %s is not known — run `bc-threads pings` first" % a.circle)
+    if not tmux_has(a.session): sys.exit("no such session: %s" % a.session)
+    st["session"] = a.session
+    save(reg)
+    print("ping circle %s now routes to %s" % (a.circle, a.session))
 
 
 def cmd_hooks(a):
@@ -443,6 +503,8 @@ sp.add_argument("--dry-run", action="store_true"); sp.add_argument("-v", "--verb
 sp.set_defaults(fn=cmd_pings)
 sp = sub.add_parser("ping-reply"); sp.add_argument("circle"); sp.add_argument("text")
 sp.add_argument("--chat"); sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_ping_reply)
+sp = sub.add_parser("ping-link"); sp.add_argument("circle"); sp.add_argument("session")
+sp.set_defaults(fn=cmd_ping_link)
 sp = sub.add_parser("hooks"); sp.add_argument("--types", default="Comment")
 sp.add_argument("--dry-run", action="store_true"); sp.add_argument("--prune", action="store_true")
 sp.add_argument("--prune-projects", nargs="*"); sp.set_defaults(fn=cmd_hooks)
