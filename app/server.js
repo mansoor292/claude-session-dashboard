@@ -13,6 +13,28 @@ const HOST = os.hostname();
 const CODE_ROOT = process.env.CODE_ROOT || (HOMEDIR + '/Code');
 const DIR = process.env.REPO_DIR || CODE_ROOT;
 const CLAUDE_BIN = process.env.CLAUDE_BIN || (HOMEDIR + '/.local/bin/claude');
+// Secrets live in one 0600 file and are handed to each session as process environment.
+// They are never copied into settings.json or any other file, never logged, and never
+// echoed back — a session uses $NAME and the shell expands it, so the value stays out of
+// the transcript entirely. Read fresh per spawn so editing the file needs no restart.
+const SECRET_ENV = process.env.SECRET_ENV_FILE || (HOMEDIR + '/.claude/secrets/.env');
+function secretEnvArgs(){
+  let txt; try{ txt=fs.readFileSync(SECRET_ENV,'utf8'); }catch{ return []; }
+  const out=[];
+  for(const raw of txt.split('\n')){
+    const line=raw.trim();
+    if(!line || line.startsWith('#') || !line.includes('=')) continue;
+    let [k,...rest]=line.replace(/^export\s+/,'').split('=');
+    k=k.trim(); let v=rest.join('=').trim();
+    if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) continue;
+    if(v.length>=2 && v[0]===v[v.length-1] && (v[0]==='"'||v[0]==="'")) v=v.slice(1,-1);
+    out.push('-e', k+'='+v);
+  }
+  return out;
+}
+function secretEnvNames(){                    // for the UI: names only, never values
+  return secretEnvArgs().filter((_,i)=>i%2===1).map(x=>x.slice(0,x.indexOf('=')));
+}
 function repos(){
   const out=[]; const add=q=>out.push({name:q.slice(CODE_ROOT.length+1),path:q});
   let top; try{top=fs.readdirSync(CODE_ROOT,{withFileTypes:true});}catch{return[];}
@@ -336,7 +358,7 @@ http.createServer((req,res)=>{
     const worktree=u.searchParams.get('worktree')==='1';
     const account=(u.searchParams.get('account')||'primary');
     const cfgDir=accountDir(account);
-    const envArgs=(account!=='primary')?['-e','CLAUDE_CONFIG_DIR='+cfgDir]:[];
+    const envArgs=((account!=='primary')?['-e','CLAUDE_CONFIG_DIR='+cfgDir]:[]).concat(secretEnvArgs());
     let sid=(u.searchParams.get('session')||'').trim();
     if(sid.includes('/')) sid=(sid.split(/[?#]/)[0].split('/').filter(Boolean).pop())||'';
     sid=sid.replace(/[^A-Za-z0-9_-]/g,'').slice(0,120);

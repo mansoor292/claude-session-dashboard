@@ -264,6 +264,21 @@ thread — numbered questions, all in one reply — rather than guessing, and do
 the answers land. It also tells a session to `bc-threads link` a project it gets mentioned in
 but does not yet cover.
 
+## Shared API keys
+
+Keys live in one file, `~/.claude/secrets/.env` (0600), and are handed to each session as
+process environment — the dashboard passes them with `tmux -e` at spawn, and `~/.bashrc`
+exports them for interactive shells so a hand-started `claude` gets them too.
+
+They are never copied into `settings.json` or any other file. That matters more than it
+sounds: a session references `$SENDGRID_API_KEY` and the shell expands it, so the value
+never passes through the model or the transcript. Writing secrets into a config file
+instead means anything that reads that file back — a diff, an editor, a file-change
+notice — puts every value into a conversation, and the only remedy then is rotating them.
+
+`docs/CLAUDE.md.secrets.md` carries the session-facing rule: use keys by name, never render
+one into output, and check presence with `[ -n "$KEY" ]` rather than by printing it.
+
 ## Multiple Claude accounts (spillover to a second plan)
 
 Claude's login is scoped to one account per config dir (`~/.claude`). To run sessions
