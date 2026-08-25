@@ -233,7 +233,7 @@ function sessions(){
       const alive = d.pid && fs.existsSync('/proc/'+d.pid);
       const tname = (d.tmux||'').split(':')[0];
       const lu = transcriptMtime(a.dir, d.sessionId, d.cwd);
-      if (tname && tnames.has(tname)) { if(!meta[tname]) meta[tname]={account:a.id, bridge:d.bridgeSessionId||null, lastUsed:lu, sid:(alive?d.sessionId:null), status:d.status||''}; else { if(lu>(meta[tname].lastUsed||0)) meta[tname].lastUsed=lu; if(alive && d.sessionId && !meta[tname].sid){ meta[tname].sid=d.sessionId; meta[tname].status=d.status||''; } } continue; }
+      if (tname && tnames.has(tname)) { if(!meta[tname]) meta[tname]={account:a.id, bridge:d.bridgeSessionId||null, lastUsed:lu, sid:(alive?d.sessionId:null), status:d.status||'', cname:((alive&&d.nameSource!=='derived')?(d.name||''):'')}; else { if(lu>(meta[tname].lastUsed||0)) meta[tname].lastUsed=lu; if(alive && d.sessionId && !meta[tname].sid){ meta[tname].sid=d.sessionId; meta[tname].status=d.status||''; } if(alive && d.name && d.nameSource!=='derived' && !meta[tname].cname) meta[tname].cname=d.name; } continue; }
       if (!alive || !d.bridgeSessionId) continue;                // rc-hosted needs alive + registered
       const nm = tname || d.name || ('rc-'+d.pid);
       if (nm.startsWith('_')) continue;                          // hidden/internal session
@@ -242,14 +242,16 @@ function sessions(){
       let st; try{ st=fs.statSync(a.dir+'/sessions/'+f); }catch{ st=null; }
       const fileAct = st?Math.floor(st.mtimeMs/1000):0;
       rc.push({name:nm, rc:true, account:a.id, bridge:d.bridgeSessionId, cwd:d.cwd||'',
-        title:(d.nameSource && d.nameSource!=='derived')?(d.name||''):'',
+        cname:(d.nameSource!=='derived')?(d.name||''):'', title:(d.nameSource!=='derived')?(d.name||''):'',
         cmd:'remote-control host', status:d.status||'', wins:1, attached:false, running:true, preview:'',
         created: st?Math.floor((st.birthtimeMs||st.mtimeMs)/1000):0, activity: Math.max(fileAct, lu)});
     }
   }
   const use = usage();
-  tsess.forEach(s=>{ const m=meta[s.name]; s.account = m?m.account:'primary'; s.bridge = m?m.bridge:null; if(m && m.lastUsed>s.activity) s.activity=m.lastUsed; const u=use[s.name]; s.mem = u?u.mem:0; s.cpu = u?u.cpu:0;
+  tsess.forEach(s=>{ const m=meta[s.name]; s.account = m?m.account:'primary'; s.bridge = m?m.bridge:null;
+    s.cname = (m&&m.cname)||''; s.title = s.cname; if(m && m.lastUsed>s.activity) s.activity=m.lastUsed; const u=use[s.name]; s.mem = u?u.mem:0; s.cpu = u?u.cpu:0;
     s.canBranch = !!(m && m.sid && inGitRepo(s.cwd));   // forking needs a live Claude conversation; a worktree needs git
+    s.canSplit  = !!(m && m.sid);                      // a split needs a conversation to distil, nothing more
   });
   rc.forEach(s=>{ s.mem = 0; s.cpu = 0; });
   return tsess.concat(rc).sort((a,b)=>a.name.localeCompare(b.name));
@@ -276,9 +278,9 @@ function bcSave(reg){
 function bcNote(rec){
   try{ fs.appendFileSync(BC_HISTORY, JSON.stringify(Object.assign({ts:Math.floor(Date.now()/1000)},rec))+'\n'); }catch{}
 }
-// Drop the routing between a thread (or ping) and its session. A thread with no session
-// has nothing to deliver to, so unlinking stops watching it; a ping falls back to the
-// dashboard, which is where unrouted pings go anyway.
+// Drop the routing between a place (or ping) and its session. Untracking a place stops
+// watching it, and takes the project's webhook with it if it was the last place tracked
+// there; a ping falls back to the dashboard, which is where unrouted pings go anyway.
 function bcUnlink(kind, id){
   // Delegate to bc-threads: it owns the Basecamp side (removing the project's webhook).
   if(kind==='ping'){
@@ -290,12 +292,12 @@ function bcUnlink(kind, id){
     return {ok:true,was:''};
   }
   try{
-    const out=execFileSync('/usr/local/bin/bc-threads',['unlink',id],{encoding:'utf8',timeout:120000});
+    const out=execFileSync('/usr/local/bin/bc-threads',['untrack',id],{encoding:'utf8',timeout:120000});
     return {ok:true,out:out.trim()};
   }catch(e){ return {ok:false,err:String((e&&(e.stdout||e.message))||e).slice(0,300)}; }
 }
 function bcState(){
-  let reg={projects:{},pings:{}}, hooks={projects:{}}, hist=[];
+  let reg={places:{},pings:{}}, hooks={projects:{}}, hist=[];
   try{ reg=JSON.parse(fs.readFileSync(BC_STORE,'utf8')); }catch{}
   try{ hooks=JSON.parse(fs.readFileSync(BC_HOOKS,'utf8')); }catch{}
   try{
@@ -304,17 +306,31 @@ function bcState(){
   }catch{}
   hist.reverse();                                   // newest first
   const live={}; for(const x of sessions()) live[x.name]={bridge:x.bridge,rc:!!x.rc,cwd:x.cwd};
-  const projects=Object.entries(reg.projects||{}).map(([id,r])=>({
-    id, session:r.session||'', hook:r.hook_id||null, active:!!r.active,
+  const cname={};
+  for(const a of accounts()){
+    let files=[]; try{ files=fs.readdirSync(a.dir+'/sessions'); }catch{ continue; }
+    for(const f of files){
+      if(!f.endsWith('.json')) continue;
+      let d; try{ d=JSON.parse(fs.readFileSync(a.dir+'/sessions/'+f,'utf8')); }catch{ continue; }
+      const t=(d.tmux||'').split(':')[0];
+      if(t && d.name && d.nameSource!=='derived' && d.pid && fs.existsSync('/proc/'+d.pid)) cname[t]=d.name;
+    }
+  }
+  // A place is what a session actually spoke in — a board, a card, a to-do — never a
+  // whole project. Its webhook is the project's, shared by every place tracked in it.
+  const places=Object.entries(reg.places||{}).map(([id,r])=>({
+    id, session:r.session||'', cname:cname[r.session]||'', project:r.project||'', kind:r.kind||'', title:r.title||'',
+    url:r.url||'', hook:((reg.hooks||{})[r.project]||{}).hook_id||null,
+    active:!!((reg.hooks||{})[r.project]||{}).active,
     last:r.last_comment_id||0, connected:r.connected||0,
     bridge:(live[r.session]||{}).bridge||null, alive:!!live[r.session],
-    seen:hist.filter(h=>h.project===id&&h.kind==='comment').length
-  })).sort((a,b)=>a.id.localeCompare(b.id));
+    seen:hist.filter(h=>h.place===id&&(h.kind==='comment'||h.kind==='message')).length
+  })).sort((a,b)=>(a.project+a.id).localeCompare(b.project+b.id));
   const pings=Object.entries(reg.pings||{}).map(([id,t])=>({
     id, who:t.who||'', session:t.session||'', url:t.url||'', last:t.last_line_id||0,
     bridge:(live[t.session||'_dashboard']||{}).bridge||null, alive:!!live[t.session||'_dashboard']
   }));
-  return {projects, pings, hooks, hist, self:reg.self||null};
+  return {places, pings, hooks, hist, self:reg.self||null};
 }
 const gb = b => (b/1073741824);
 const fmtGB = b => gb(b).toFixed(1)+'G';
@@ -486,21 +502,62 @@ http.createServer((req,res)=>{
     })().catch(e=>{ try{ done({ok:false,err:String((e&&e.message)||e)}); }catch{} });
     return;
   }
+  // ---- Split: a NEW session seeded with a distilled brief, NOT a copy of the parent's
+  // history. --fork-session carries the whole transcript, which is exactly the noise you
+  // are trying to shed. Here the parent writes down what matters and the child starts
+  // clean, so the brief is the only context it has — and the only context it can get wrong.
+  if(req.method==='POST'&&u.pathname==='/api/split'){
+    const parent=clean(u.searchParams.get('name'));
+    const wantName=clean(u.searchParams.get('as')||'');
+    const wantCwd=u.searchParams.get('cwd')||'';
+    let body='';
+    req.on('data',c=>{ body+=c; if(body.length>400000){ body=''; req.destroy(); } });
+    req.on('end',()=>{
+      const done=o=>{ res.writeHead(200,{'Content-Type':'application/json'}); res.end(JSON.stringify(o)); };
+      try{
+        const brief=body.trim();
+        if(!parent||!hasSession(parent)) return done({ok:false,err:'no such parent session: '+parent});
+        if(!wantName) return done({ok:false,err:'a name for the new session is required (as=)'});
+        // A split with nothing in it is just a new session, and a session that thinks it
+        // was briefed but was not is worse than one that knows it is starting cold.
+        if(brief.length<80) return done({ok:false,err:'the brief is only '+brief.length+' chars \u2014 too thin to be a handoff'});
+        const ps=claudeSession(parent);
+        const cwd=wantCwd||(ps&&ps.cwd)||CODE_ROOT;
+        if(!fs.existsSync(cwd)) return done({ok:false,err:'cwd does not exist: '+cwd});
+        let name=wantName; const b0=name; let k=2; while(hasSession(name)){ name=b0+'-'+k; k++; }
+        const cfgDir=(ps&&ps.dir)||(HOMEDIR+'/.claude');
+        const account=(ps&&ps.account)||'primary';
+        const dir=HOMEDIR+'/.claude/splits';
+        fs.mkdirSync(dir,{recursive:true});
+        const file=dir+'/'+name+'.md';
+        fs.writeFileSync(file,[
+          'You are a SPLIT of the session \u201c'+parent+'\u201d: a new session, started on purpose with a clean context.',
+          'You do NOT have that session\u2019s conversation history and are not meant to. The brief below is everything you were given.',
+          'If the brief leaves something open \u2014 a decision, a file, a constraint \u2014 ASK. Do not assume it was settled somewhere you cannot see.',
+          'Do not pick up whatever the parent was doing beyond what this brief asks for.',
+          'Your working directory is '+cwd+'.',
+          '',
+          '--- BRIEF WRITTEN BY \u201c'+parent+'\u201d ---',
+          brief,
+          '--- END OF BRIEF ---'
+        ].join('\n'),'utf8');
+        const envArgs=((account!=='primary')?['-e','CLAUDE_CONFIG_DIR='+cfgDir]:[]).concat(secretEnvArgs());
+        const shq = v => "'"+String(v).replace(/'/g,"'\\''")+"'";
+        const cmd = CLAUDE_BIN+' --remote-control '+shq(name)+' --dangerously-skip-permissions'
+                  +' --append-system-prompt-file '+shq(file);
+        tmux(['new-session','-d','-s',name,'-c',cwd].concat(envArgs).concat([cmd]));
+        autoAnswer(name,'claude');
+        sendWhenReady(name,'You were split off from \u201c'+parent+'\u201d with a written brief \u2014 it is in your system prompt. Read it, then tell me in a few lines: what you understand the task to be, what the brief leaves unanswered, and what you would do first. Do not change any files until I answer.');
+        return done({ok:true,name,parent,cwd,brief:file,chars:brief.length});
+      }catch(e){ return done({ok:false,err:String((e&&e.message)||e)}); }
+    });
+    return;
+  }
   if(req.method==='POST'&&u.pathname==='/api/kill'){ const n=clean(u.searchParams.get('name')); const rmwt=u.searchParams.get('worktree')==='1'; const cwd=u.searchParams.get('cwd')||''; if(n) tmux(['kill-session','-t',n]); let wt=null; if(rmwt) wt=removeWorktree(cwd); res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({ok:true,wt})); }
   if(u.pathname==='/api/sessions'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(sessions())); }
   if(u.pathname==='/api/stats'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(stats())); }
 
   // ---- Monitor page ----
-  if(req.method==='POST'&&(u.pathname==='/api/basecamp/connect'||u.pathname==='/api/basecamp/disconnect')){
-    const proj=(u.searchParams.get('project')||'').replace(/[^0-9]/g,'');
-    const flag=(u.pathname.endsWith('/connect'))?'--connect':'--disconnect';
-    if(!proj){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({ok:false,err:'missing project'})); }
-    let out='',ok=true;
-    try{ out=execFileSync('/usr/local/bin/bc-threads',['projects',flag,proj],{encoding:'utf8',timeout:120000}); }
-    catch(e){ ok=false; out=String((e&&(e.stdout||e.message))||e); }
-    bcNote({kind:flag==='--connect'?'connect':'disconnect',title:'project '+proj,text:out.trim().slice(0,300)});
-    res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({ok,out:out.trim()}));
-  }
   if(req.method==='POST'&&u.pathname==='/api/basecamp/unlink'){
     const kind=(u.searchParams.get('kind')==='ping')?'ping':'thread';
     const id=(u.searchParams.get('id')||'').replace(/[^0-9]/g,'');
@@ -511,13 +568,16 @@ http.createServer((req,res)=>{
   if(u.pathname==='/basecamp'){
     const d=bcState();
     const ago=t=>{ if(!t) return '—'; const s=Math.floor(Date.now()/1000)-t; if(s<60) return s+'s'; if(s<3600) return Math.floor(s/60)+'m'; if(s<86400) return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d'; };
-    const projRows=d.projects.map(p=>`<tr>
-      <td class=cmd><a href="https://basecamp.com" onclick="return false" title="project id">${esc(p.id)}</a></td>
-      <td>${esc(p.session||'—')} ${p.alive?'<span class="pill live">live</span>':'<span class="pill idle">gone</span>'}</td>
+    const placeRows=d.places.map(p=>`<tr>
+      <td class=cmd>${p.url?`<a href="${esc(p.url)}" target=_blank rel=noopener>${esc(p.id)}</a>`:esc(p.id)}
+        <div class=dim>${esc(p.kind||'place')} · project ${esc(p.project||'?')}</div></td>
+      <td>${esc(p.title||'—')}</td>
+      <td>${esc((p.cname&&p.cname!==p.session)?p.cname:(p.session||'—'))} ${p.alive?'<span class="pill live">live</span>':'<span class="pill idle">gone</span>'}
+        ${(p.cname&&p.cname!==p.session)?`<div class=dim>tmux ${esc(p.session)}</div>`:''}</td>
       <td>${p.hook?`<span class="pill live">webhook ${esc(String(p.hook))}${p.active?'':' (inactive)'}</span>`:'<span class="pill idle">polling only</span>'}</td>
       <td>${p.bridge?`<a href="https://claude.ai/code/${esc(p.bridge)}" target=_blank rel=noopener>claude.ai ↗</a>`:'<span class=dim>not bridged</span>'}</td>
       <td class=num>${p.seen}</td>
-      <td><button class=unlink data-kind=project data-id="${esc(p.id)}" data-sess="${esc(p.session||'')}">unlink</button></td></tr>`).join('');
+      <td><button class=unlink data-kind=place data-id="${esc(p.id)}" data-sess="${esc(p.cname||p.session||'')}">untrack</button></td></tr>`).join('');
     const pingRows=d.pings.map(p=>`<tr>
       <td class=cmd>${p.url?`<a href="${esc(p.url)}" target=_blank rel=noopener>${esc(p.id)}</a>`:esc(p.id)}</td>
       <td>${esc(p.who||'—')}</td>
@@ -525,14 +585,14 @@ http.createServer((req,res)=>{
       <td class=num>${p.last||0}</td>
       <td><button class=unlink data-kind=ping data-id="${esc(p.id)}" data-sess="${esc(p.session||'')}">unlink</button></td></tr>`).join('');
     const histRows=d.hist.map(h=>{
-      const k=h.kind==='sent'?'sent':(h.kind==='hold'?'held':(h.kind==='comment'||h.kind==='ping'?'in':h.kind));
-      const cls=h.kind==='sent'?'acct':(h.kind==='hold'?'idle':'live');
+      const k=h.kind==='sent'?'sent':(h.kind==='hold'?'held':(h.kind==='mention'?'@you':(h.kind==='comment'||h.kind==='ping'||h.kind==='message'?'in':h.kind)));
+      const cls=h.kind==='sent'?'acct':(h.kind==='hold'?'idle':(h.kind==='mention'?'rc':'live'));
       return `<tr><td class=num title="${esc(new Date((h.ts||0)*1000).toISOString())}">${ago(h.ts)}</td>
         <td><span class="pill ${cls}">${esc(k)}</span></td>
         <td>${h.url?`<a href="${esc(h.url)}" target=_blank rel=noopener>${esc(h.title||h.thread||h.project||'')}</a>`:esc(h.title||h.thread||h.project||h.circle||'')}</td>
         <td>${esc(h.frm||(h.kind==='sent'?((d.self||{}).name||'us'):''))}</td>
         <td>${esc(h.session||'')}</td>
-        <td class=msg>${esc(h.text||(h.why?('('+h.why+')'):'')).replace(/(…\[CUT[^\]]*\])/,'<span class=cut>$1</span>')}</td></tr>`;
+        <td class=msg>${esc(h.text||'').replace(/(…\[CUT[^\]]*\])/,'<span class=cut>$1</span>')}${h.why?`<div class=dim>${esc(h.kind==='mention'?('routed here because '+h.why):('('+h.why+')'))}</div>`:''}</td></tr>`;
     }).join('');
     res.writeHead(200,{'Content-Type':'text/html'});
     return res.end(`<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Basecamp · Claude box</title>
@@ -551,11 +611,11 @@ a{color:#7dd3fc;text-decoration:none} a:hover{text-decoration:underline}
 .unlink{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.32);color:#f87171;border-radius:8px;padding:3px 10px;font-size:11.5px;cursor:pointer}
 .unlink:hover{background:#ef4444;color:#fff;border-color:#ef4444}
 </style></head><body><div class=wrap>
-<header><div><h1>Basecamp bridge</h1><span class=sub>${d.projects.length} project(s) · ${d.hist.length} events · posting as ${esc((d.self||{}).name||'?')}</span></div>
+<header><div><h1>Basecamp bridge</h1><span class=sub>${d.places.length} place(s) · ${d.hist.length} events · posting as ${esc((d.self||{}).name||'?')}</span></div>
 <div class=nav><a href="/">Sessions</a><a href="/monitor">📊 Monitor</a><a href="/basecamp" class=on>Basecamp</a></div></header>
-<h2>Projects → sessions</h2>
-<div class=dim style="margin-bottom:6px">One project, one session. Every comment in the project goes to that session — no per-thread wiring.</div>
-<table><thead><tr><th>Project</th><th>Session</th><th>Webhook</th><th>Web</th><th>Received</th><th></th></tr></thead><tbody>${projRows||'<tr><td colspan=6 class=dim>no projects linked — bc-threads link &lt;project&gt; &lt;session&gt;</td></tr>'}</tbody></table>
+<h2>Places → sessions</h2>
+<div class=dim style="margin-bottom:6px">A session hears only the places it has spoken in — the board it posted to, the card or to-do it commented on. Everything else in the same project stays silent. Tracking starts on the first post; the webhook is the project's, shared by its places.</div>
+<table><thead><tr><th>Place</th><th>Title</th><th>Session</th><th>Webhook</th><th>Web</th><th>Received</th><th></th></tr></thead><tbody>${placeRows||'<tr><td colspan=7 class=dim>nothing tracked — a place is tracked when a session posts: bc-threads post &lt;project&gt; &lt;subject&gt; &lt;body&gt;, or bc-threads track &lt;recording&gt;</td></tr>'}</tbody></table>
 <div class=hookurl>receiver: ${esc((d.hooks.url||'').replace(/\/[^/]+$/,'/••••••'))} · snapshot ${ago(d.hooks.checked)} ago</div>
 ${d.pings.length?`<h2>Pings</h2>
 <table><thead><tr><th>Circle</th><th>With</th><th>Session</th><th>Last line</th><th></th></tr></thead><tbody>${pingRows}</tbody></table>`:''}
@@ -569,7 +629,7 @@ document.addEventListener('click',async function(e){
   var kind=b.dataset.kind, sess=b.dataset.sess;
   var msg=(kind==='ping')
     ? 'Unlink this ping from '+(sess||'its session')+'?'
-    : 'Unlink project '+b.dataset.id+' from '+(sess||'its session')+'?\\n\\nIts webhook is removed and its comments stop reaching any session.\\n\\nRelink with: bc-threads link '+b.dataset.id+' <session>';
+    : 'Stop tracking place '+b.dataset.id+' for '+(sess||'its session')+'?\\n\\nIts replies stop reaching any session. If it is the last place tracked in its project, that project\\u2019s webhook is removed too.\\n\\nTrack it again with: bc-threads track '+b.dataset.id+' <session>';
   if(!confirm(msg)){ RELOAD=setTimeout(function(){location.reload();},20000); return; }
   b.disabled=true; b.textContent='\\u2026';
   var r=await(await fetch('/api/basecamp/unlink?kind='+kind+'&id='+encodeURIComponent(b.dataset.id),{method:'POST'})).json();
@@ -631,7 +691,7 @@ render(INIT);tick();setInterval(tick,2000);
   const multiAcct = accounts().length>1;
   const acctBadge = x => (multiAcct && x.account) ? `<span class="pill acct">${esc(x.account)}</span>` : '';
   const rccard=x=>`<div class="card rc" data-name="${esc(x.name)}"><div class=body onclick="window.open('https://claude.ai/code/${esc(x.bridge)}','_blank')"><div class=row><span class=name>${esc(x.title||x.name)}</span>${acctBadge(x)}<span class="pill rc">RC</span></div><div class=cid>${esc(x.name)}</div><div class=cmd>▶ ${esc(x.cmd)}${x.status?' · '+esc(x.status):''}</div><pre class=preview><span class=e>rc-hosted · not in tmux · opens in claude.ai</span></pre><div class=meta>claude.ai ↗ <a class=vscode href="${CODE}/?folder=${encodeURIComponent(x.cwd||HOMEDIR)}" target=_blank rel=noopener onclick="event.stopPropagation()">‹/› VS Code</a></div></div></div>`;
-  const card=x=> x.rc ? rccard(x) : `<div class="card ${x.attached?'on':''}" data-name="${esc(x.name)}" data-cwd="${esc(x.cwd||'')}">${x.canBranch?`<button class=branch title="branch into a worktree" onclick="branchSession('${esc(x.name)}',event)">⑂</button>`:''}<button class=kill title="kill session" onclick="killSession('${esc(x.name)}',event)">✕</button><div class=body onclick="open_('${encodeURIComponent(x.name)}')"><div class=row><span class=name>${esc(x.title||x.name)}</span>${acctBadge(x)}<span class="pill ${x.attached?'live':'idle'}">${x.attached?'LIVE':'idle'}</span></div><div class=cid>${esc(x.name)}</div><div class=cmd>${x.running?'▶':'○'} ${esc(x.cmd||'shell')}</div><pre class=preview>${esc(x.preview)||'<span class=e>— no output yet —</span>'}</pre><div class=meta>${x.wins} win · open ↗ <a class=vscode href="${CODE}/?folder=${encodeURIComponent(x.cwd||HOMEDIR)}" target=_blank rel=noopener onclick="event.stopPropagation()">‹/› VS Code</a>${x.bridge?` · <a class=vscode href="https://claude.ai/code/${esc(x.bridge)}" target=_blank rel=noopener onclick="event.stopPropagation()">claude.ai ↗</a>`:''}</div></div></div>`;
+  const card=x=> x.rc ? rccard(x) : `<div class="card ${x.attached?'on':''}" data-name="${esc(x.name)}" data-cwd="${esc(x.cwd||'')}">${x.canBranch?`<button class=branch title="branch into a worktree" onclick="branchSession('${esc(x.name)}',event)">⑂</button>`:''}${x.canSplit?`<button class=split title="split a slice of context into a fresh session" onclick="splitSession('${esc(x.name)}',event)">✂</button>`:''}<button class=kill title="kill session" onclick="killSession('${esc(x.name)}',event)">✕</button><div class=body onclick="open_('${encodeURIComponent(x.name)}')"><div class=row><span class=name>${esc(x.title||x.name)}</span>${acctBadge(x)}<span class="pill ${x.attached?'live':'idle'}">${x.attached?'LIVE':'idle'}</span></div><div class=cid>${esc(x.name)}</div><div class=cmd>${x.running?'▶':'○'} ${esc(x.cmd||'shell')}</div><pre class=preview>${esc(x.preview)||'<span class=e>— no output yet —</span>'}</pre><div class=meta>${x.wins} win · open ↗ <a class=vscode href="${CODE}/?folder=${encodeURIComponent(x.cwd||HOMEDIR)}" target=_blank rel=noopener onclick="event.stopPropagation()">‹/› VS Code</a>${x.bridge?` · <a class=vscode href="https://claude.ai/code/${esc(x.bridge)}" target=_blank rel=noopener onclick="event.stopPropagation()">claude.ai ↗</a>`:''}</div></div></div>`;
   res.writeHead(200,{'Content-Type':'text/html'});
   res.end(`<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Claude Sessions</title>
 <style>${CSS}
@@ -641,6 +701,7 @@ render(INIT);tick();setInterval(tick,2000);
 .card.on{border-color:rgba(34,197,94,.45)}.body{display:block;padding:15px 16px;cursor:pointer}
 .kill{position:absolute;top:8px;right:8px;z-index:2;width:24px;height:24px;border-radius:7px;border:1px solid rgba(248,113,113,.35);background:rgba(248,113,113,.12);color:#f87171;font-size:12px;cursor:pointer;line-height:1;padding:0}
 .kill:hover{background:#ef4444;color:#fff;border-color:#ef4444}
+.split{position:absolute;top:8px;right:68px;z-index:2;width:24px;height:24px;border-radius:7px;border:1px solid rgba(45,212,191,.35);background:rgba(45,212,191,.12);color:#2dd4bf;font-size:12px;cursor:pointer;line-height:1;padding:0}
 .branch{position:absolute;top:8px;right:38px;z-index:2;width:24px;height:24px;border-radius:7px;border:1px solid rgba(129,140,248,.35);background:rgba(129,140,248,.12);color:#818cf8;font-size:13px;cursor:pointer;line-height:1;padding:0}
 .branch:hover{background:#6366f1;color:#fff;border-color:#6366f1}
 .row{display:flex;align-items:center;justify-content:space-between;padding-right:26px}
@@ -708,6 +769,14 @@ render(INIT);tick();setInterval(tick,2000);
 <label class=fld style="text-transform:none;letter-spacing:0;font-weight:400"><label class=wtlbl><input type=checkbox id=b_wait checked> wait for the parent to finish its current turn</label><span class=fldhint>forking mid-turn copies a half-written transcript</span></label>
 <div class=sheetbtns><button class=ghost onclick="closeBModal()">Cancel</button><button class=add id=b_go onclick="doBranch()">Branch</button></div>
 </div></div>
+<div id=smodal class=modal hidden onclick="if(event.target===this)closeSModal()"><div class=sheet>
+<div class=sheettitle>Split context into a new session</div>
+<div class=fldhint id=s_ctx style="text-transform:none;letter-spacing:0"></div>
+<label class=fld>Session name<input id=s_name type=text spellcheck=false><span class=fldhint>a fresh session \u2014 it gets NO history from the parent, only the brief below</span></label>
+<label class=fld>Working directory<input id=s_cwd type=text spellcheck=false><span class=fldhint>defaults to the parent&#39;s</span></label>
+<label class=fld>Brief<textarea id=s_brief rows=14 spellcheck=false style="width:100%;font:12px ui-monospace,Menlo,monospace;background:rgba(2,6,23,.5);color:#e2e8f0;border:1px solid rgba(148,163,184,.25);border-radius:9px;padding:9px;resize:vertical"></textarea><span class=fldhint>GOAL \u00b7 DECIDED (and why) \u00b7 STATE of the files \u00b7 OUT OF SCOPE \u00b7 OPEN questions. Anything you leave out, it will ask about \u2014 it is told to ask rather than assume.</span></label>
+<div class=sheetbtns><button class=ghost onclick="closeSModal()">Cancel</button><button class=add id=s_go onclick="doSplit()">Split</button></div>
+</div></div>
 <script>
 function open_(n){window.open('${TERM}/?arg='+n,'_blank');}
 var CODEBASE='${CODE}';
@@ -724,7 +793,7 @@ function fmtMem(mb){if(!mb)return '—';return mb>=1024?(mb/1024).toFixed(1)+' G
 function fmtCpu(x){if(x.rc)return '—';var p=x.cpu||0;var cls=p>=80?'hi':(p>=25?'mid':'');return '<span class="cpuval '+cls+'">'+p+'%</span>';}
 function esc2(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function sortData(a){var k=SORT,dir=DIR==='asc'?1:-1;return a.slice().sort(function(p,q){var x,y;if(k==='name'){x=(p.title||p.name||'').toLowerCase();y=(q.title||q.name||'').toLowerCase();}else if(k==='repo'){x=repoOf(p).toLowerCase();y=repoOf(q).toLowerCase();}else if(k==='launch'){x=p.created||0;y=q.created||0;}else if(k==='cpu'){x=p.cpu||0;y=q.cpu||0;}else if(k==='mem'){x=p.mem||0;y=q.mem||0;}else{x=p.activity||0;y=q.activity||0;}return x<y?-1*dir:(x>y?1*dir:0);});}
-function renderList(){var tb=document.getElementById('ltbody');if(!tb)return;var arr=sortData(DATA);tb.innerHTML=arr.map(function(x){var st=x.rc?'RC':(x.attached?'LIVE':'idle');var pc='pill '+(x.rc?'rc':(x.attached?'live':'idle'));return '<tr data-name="'+esc2(x.name)+'" data-cwd="'+esc2(x.cwd||'')+'" data-rc="'+(x.rc?'1':'')+'" data-bridge="'+esc2(x.bridge||'')+'"><td class=lname><span class=lopen>'+esc2(x.title||x.name)+'</span>'+((MULTIACCT&&x.account)?' <span class="pill acct">'+esc2(x.account)+'</span>':'')+'<span class=lsub>'+esc2(x.name)+'</span></td><td class=lrepo>'+esc2(repoOf(x)||'—')+'</td><td class=num title="'+esc2(fmtWhen(x.created))+'">'+fmtAgo(x.created)+'</td><td class=num title="'+esc2(fmtWhen(x.activity))+'">'+fmtAgo(x.activity)+'</td><td class="num cpu">'+fmtCpu(x)+'</td><td class=num>'+fmtMem(x.mem)+'</td><td><span class="'+pc+'">'+st+'</span></td><td class=lact>'+(x.bridge?'<a class=vs href="https://claude.ai/code/'+esc2(x.bridge)+'" target=_blank rel=noopener title="claude.ai">◎</a>':'')+'<a class=vs href="'+CODEBASE+'/?folder='+encodeURIComponent(x.cwd||HOMEBASE)+'" target=_blank rel=noopener title="VS Code">‹/›</a>'+(x.rc?'':((x.canBranch?'<button class=lbranch title="branch into a worktree">⑂</button>':'')+'<button class=lkill title="kill">✕</button>'))+'</td></tr>';}).join('');document.querySelectorAll('th.sortable').forEach(function(th){var k=th.dataset.k;th.classList.remove('asc','desc');if(SORT===k)th.classList.add(DIR);});}
+function renderList(){var tb=document.getElementById('ltbody');if(!tb)return;var arr=sortData(DATA);tb.innerHTML=arr.map(function(x){var st=x.rc?'RC':(x.attached?'LIVE':'idle');var pc='pill '+(x.rc?'rc':(x.attached?'live':'idle'));return '<tr data-name="'+esc2(x.name)+'" data-cwd="'+esc2(x.cwd||'')+'" data-rc="'+(x.rc?'1':'')+'" data-bridge="'+esc2(x.bridge||'')+'"><td class=lname><span class=lopen>'+esc2(x.title||x.name)+'</span>'+((MULTIACCT&&x.account)?' <span class="pill acct">'+esc2(x.account)+'</span>':'')+'<span class=lsub>'+esc2(x.name)+'</span></td><td class=lrepo>'+esc2(repoOf(x)||'—')+'</td><td class=num title="'+esc2(fmtWhen(x.created))+'">'+fmtAgo(x.created)+'</td><td class=num title="'+esc2(fmtWhen(x.activity))+'">'+fmtAgo(x.activity)+'</td><td class="num cpu">'+fmtCpu(x)+'</td><td class=num>'+fmtMem(x.mem)+'</td><td><span class="'+pc+'">'+st+'</span></td><td class=lact>'+(x.bridge?'<a class=vs href="https://claude.ai/code/'+esc2(x.bridge)+'" target=_blank rel=noopener title="claude.ai">◎</a>':'')+'<a class=vs href="'+CODEBASE+'/?folder='+encodeURIComponent(x.cwd||HOMEBASE)+'" target=_blank rel=noopener title="VS Code">‹/›</a>'+(x.rc?'':((x.canBranch?'<button class=lbranch title="branch into a worktree">⑂</button>':'')+(x.canSplit?'<button class=lsplit title="split context into a fresh session">✂</button>':'')+'<button class=lkill title="kill">✕</button>'))+'</td></tr>';}).join('');document.querySelectorAll('th.sortable').forEach(function(th){var k=th.dataset.k;th.classList.remove('asc','desc');if(SORT===k)th.classList.add(DIR);});}
 function setView(v){VIEW=v;localStorage.setItem('view',v);var g=document.getElementById('g'),l=document.getElementById('listwrap');if(g)g.style.display=(v==='grid')?'':'none';if(l)l.style.display=(v==='list')?'':'none';document.querySelectorAll('.viewbtn').forEach(function(b){b.classList.toggle('on',b.dataset.v===v);});if(v==='list')renderList();}
 function setSort(k){if(SORT===k){DIR=(DIR==='asc')?'desc':'asc';}else{SORT=k;DIR=(k==='name'||k==='repo')?'asc':'desc';}localStorage.setItem('sortk',SORT);localStorage.setItem('sortd',DIR);renderList();}
 function killByName(name,cwd,ev,disp){if(ev)ev.stopPropagation();var isWt=(cwd||'').indexOf('/.worktrees/')>=0;if(!confirm('Kill session "'+(disp||name)+'"?'))return;var wt=0;if(isWt){wt=confirm('This session runs in a git worktree:\\n'+cwd+'\\n\\nAlso remove the worktree and its branch?\\nUncommitted changes there will be lost.')?1:0;}var url='/api/kill?name='+encodeURIComponent(name);if(wt)url+='&worktree=1&cwd='+encodeURIComponent(cwd);fetch(url,{method:'POST'});DATA=DATA.filter(function(z){return z.name!==name;});var c=document.querySelector('.card[data-name="'+CSS.escape(name)+'"]');if(c)c.remove();renderList();}
@@ -769,6 +838,31 @@ async function doBranch(){var as=(document.getElementById('b_name').value||'').t
  if(!r.ok){go.disabled=false;go.textContent='Branch';alert('Could not branch'+(r.err?': '+r.err:''));return;}
  closeBModal();
  setTimeout(function(){location.reload();},1200);}
+var S_PARENT='';
+function closeSModal(){document.getElementById('smodal').hidden=true;}
+var S_TEMPLATE=['GOAL','  ','','DECIDED','  ','','STATE','  ','','OUT OF SCOPE','  ','','OPEN','  '].join('\\n');
+function splitSession(n,e){if(e)e.stopPropagation();
+ S_PARENT=n;
+ var row=(DATA||[]).filter(function(x){return x.name===n;})[0]||{};
+ document.getElementById('s_ctx').innerHTML='from <b>'+esc2(n)+'</b>'
+  +(row.status==='busy'?' \u00b7 <span style="color:#fbbf24">busy right now \u2014 the brief is yours to write, so this is safe</span>':'');
+ document.getElementById('s_name').value=n+'-split';
+ document.getElementById('s_cwd').value=row.cwd||'';
+ if(!document.getElementById('s_brief').value.trim())document.getElementById('s_brief').value=S_TEMPLATE;
+ document.getElementById('s_go').textContent='Split';document.getElementById('s_go').disabled=false;
+ document.getElementById('smodal').hidden=false;document.getElementById('s_name').focus();}
+async function doSplit(){var as=(document.getElementById('s_name').value||'').trim();
+ var cwd=(document.getElementById('s_cwd').value||'').trim();
+ var brief=(document.getElementById('s_brief').value||'').trim();
+ if(!as){alert('Give the new session a name');return;}
+ if(brief.length<80){alert('The brief is only '+brief.length+' characters. A split with no context is just a new session \u2014 write what the goal is, what is already decided and why, the state of the files, and what is out of scope.');return;}
+ var go=document.getElementById('s_go');go.disabled=true;go.textContent='Splitting\u2026';
+ var q='/api/split?name='+encodeURIComponent(S_PARENT)+'&as='+encodeURIComponent(as)+(cwd?('&cwd='+encodeURIComponent(cwd)):'');
+ var r=await(await fetch(q,{method:'POST',headers:{'Content-Type':'text/plain'},body:brief})).json();
+ if(!r.ok){go.disabled=false;go.textContent='Split';alert('Could not split'+(r.err?': '+r.err:''));return;}
+ document.getElementById('s_brief').value='';
+ closeSModal();
+ setTimeout(function(){location.reload();},1200);}
 async function killSession(n,e){e.stopPropagation();const c=document.querySelector('.card[data-name="'+CSS.escape(n)+'"]');const cwd=c?(c.dataset.cwd||''):'';const disp=(c&&c.querySelector('.name'))?c.querySelector('.name').textContent.trim():n;const isWt=cwd.indexOf('/.worktrees/')>=0;if(!confirm('Kill session "'+disp+'"?'))return;let wt=0;if(isWt){wt=confirm('This session runs in a git worktree:\\n'+cwd+'\\n\\nAlso remove the worktree and its branch?\\nUncommitted changes there will be lost.')?1:0;}let url='/api/kill?name='+encodeURIComponent(n);if(wt)url+='&worktree=1&cwd='+encodeURIComponent(cwd);await fetch(url,{method:'POST'});if(c)c.remove();}
 async function tick(){try{const d=await(await fetch('/api/sessions')).json();DATA=d;
  if(VIEW==='list'){renderList();return;}
@@ -776,6 +870,6 @@ async function tick(){try{const d=await(await fetch('/api/sessions')).json();DAT
  d.forEach(x=>{const c=document.querySelector('.card[data-name="'+CSS.escape(x.name)+'"]');if(!c||x.rc)return;const p=c.querySelector('.pill');p.className='pill '+(x.attached?'live':'idle');p.textContent=x.attached?'LIVE':'idle';c.classList.toggle('on',x.attached);c.querySelector('.name').textContent=x.title||x.name;c.querySelector('.cmd').textContent=(x.running?'▶ ':'○ ')+(x.cmd||'shell');c.querySelector('.preview').textContent=x.preview||'— no output yet —';});
 }catch(e){}}
 setInterval(tick,4000);
-(function(){var tb=document.getElementById('ltbody');if(tb){tb.addEventListener('click',function(e){var tr=e.target.closest('tr');if(!tr)return;var name=tr.dataset.name;if(e.target.closest('.lkill')){killByName(name,tr.dataset.cwd,e,((tr.querySelector('.lopen')||{}).textContent||name).trim());return;}if(e.target.closest('.lbranch')){branchSession(name,e);return;}if(e.target.closest('.vs'))return;if(tr.dataset.rc){window.open('https://claude.ai/code/'+tr.dataset.bridge,'_blank');}else{open_(encodeURIComponent(name));}});}setView(VIEW);})();
+(function(){var tb=document.getElementById('ltbody');if(tb){tb.addEventListener('click',function(e){var tr=e.target.closest('tr');if(!tr)return;var name=tr.dataset.name;if(e.target.closest('.lkill')){killByName(name,tr.dataset.cwd,e,((tr.querySelector('.lopen')||{}).textContent||name).trim());return;}if(e.target.closest('.lbranch')){branchSession(name,e);return;}if(e.target.closest('.lsplit')){splitSession(name,e);return;}if(e.target.closest('.vs'))return;if(tr.dataset.rc){window.open('https://claude.ai/code/'+tr.dataset.bridge,'_blank');}else{open_(encodeURIComponent(name));}});}setView(VIEW);})();
 </script></body></html>`);
 }).listen(PORT,'127.0.0.1',()=>console.log('dashboard on '+PORT));

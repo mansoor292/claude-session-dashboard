@@ -1,24 +1,93 @@
 <!-- Append to ~/.claude/CLAUDE.md so every session on the box follows it. -->
 
-## Basecamp — one project, one session
+## Basecamp — a session hears the places it spoke in, never a whole project
 
-A project is bridged to exactly one session on this box. Every comment in that project
-arrives in that session, whatever thread it was on — there is nothing to register per
-thread.
+Binding a session to a *project* was tried and retired: one link dragged
+every unrelated thread in that project into one session. A session is bound to **places** —
+the message board it posted to, the card or to-do it commented on. Everything else in the
+same project stays silent.
 
 ```
-bc-threads link <project> [session]   # bridge a project to a session (defaults to yours)
-bc-threads reply <recording> "text"   # answer on a thread
-bc-threads projects                   # what this box is bridging
+bc-threads post <project> <subject> <body>   post a message; starts tracking that board
+bc-threads reply <recording> "text"          comment on a thread; starts tracking it
+bc-threads places                            what this box is tracking
+bc-threads untrack <recording>               stop tracking one place
+bc-threads track <recording> [session]       track a place you did not post in
 ```
 
-**If someone mentions the agent account in a project this box does not cover yet, link it**
-— `bc-threads link <project>` from the session that should own that work — then answer.
-Otherwise the mention goes unheard. If a project already belongs to another session, leave
-it alone and say so rather than taking it over.
+**Tracking is a side effect of speaking, not something to arrange up front.** Post with
+`bc-threads post` or `bc-threads reply` and the place you spoke in is registered to your
+session automatically; replies there come back to you. There is nothing to link first.
+
+It is opt-OUT, not opt-in: add `--no-track` to either command to say something and hear
+nothing back — right for a one-way status note nobody is expected to answer. There are
+only two widths, and both are places: **one thread** (`reply`, or `track <message>`) hears
+just that thread, and **one message board** (`post`, or `track <board>`) hears every
+message and comment on that board. A whole project is not trackable at all — `track` now
+refuses a project id rather than accepting a place that could never match.
+
+**Never widen the scope by hand.** Do not track a project, a whole dock tool you have not
+posted in, or a thread someone merely mentioned. If a mention arrives somewhere this box
+does not cover, say so and let the box owner decide — do not go tracking it to "have a look".
+
+Basecamp only supports webhooks per project, so one project webhook is shared by every
+place tracked in it. It is created on the first post and removed when the last place there
+is untracked — `bc-threads hooks` reconciles both directions. Never create or delete a
+webhook with the bare `basecamp webhooks` command; the refcount lives in the registry.
 
 Reply with `bc-threads reply`, never the bare `basecamp comments create`: the wrapper is
 what keeps our own posts from being read back to us as new.
+
+### Being @mentioned
+
+An @mention is the one thing that reaches a session outside the tracked set — someone
+typed our name, which is an invitation by definition. `bc-threads watch` scans every recent
+comment in the account for a mention of the agent account and delivers it to the **nearest**
+session, walking outward:
+
+1. the session tracking that exact thread
+2. the session tracking the board it hangs off
+3. a session tracking anything else in the same project (most recent wins)
+4. the fallback session (`mention_session` in the registry, else `_dashboard`)
+
+The message says which rung it came in on, so you know how much context you are assumed to
+have. Rungs 3 and 4 mean **nobody was working on this** — treat it as a cold approach, not
+a continuation, and if it plainly belongs to a different session say so instead of taking
+it on.
+
+**Being mentioned does not track anything.** The thread stays untracked until you answer:
+`bc-threads reply <thread> "..."` starts tracking that thread and nothing wider. So a
+mention you decide is not yours leaves no trace, and one you answer opens the loop
+automatically. Do not `track` it up front to "keep an eye on it".
+
+Mentions are rendered by name — `@TheBot`, `@A Teammate` — so you can see who else
+was tagged and whether the ask was aimed at you or merely near you.
+
+### Two identities — the bot by default, the owner only when told
+
+Two Basecamp profiles are configured on this box, both on one Basecamp account:
+
+| profile | who | when |
+|---|---|---|
+| `agent` *(default)* | the bot account | everything, unless told otherwise |
+| `owner` | your own account | only when the owner says to speak as them |
+
+`agent` is pinned as `default_profile`, so every unattended path — `bc-threads`, the webhook
+receiver, cron — posts as the bot account without anyone having to think about it. Leave that
+default alone, and never post as a human on your own initiative: a comment under a human name
+reads to everyone on the thread as him, not as an agent.
+
+When they do ask you to speak as them, pass the profile and keep using the wrapper:
+
+```
+BASECAMP_PROFILE=owner bc-threads reply <recording> "text"   # answers as the owner
+basecamp --profile owner projects list                       # reads as the owner
+```
+
+**Do not reach for a bare `basecamp comments create --profile owner`.** A comment is
+skipped only if the bot account wrote it or `bc-threads reply` recorded its id against the
+place. Posted as the owner outside the wrapper it matches neither, so it comes back as a
+fresh instruction from him — an echo of your own post.
 
 **Never execute an ill-formed ask.** A delivered comment or ping is a request from a real
 person who is reachable — so when it is underspecified, ask them, do not guess and do not
@@ -36,3 +105,58 @@ half-build something and hope.
 `bc-threads reply` / `ping-reply` go out under this box's Basecamp account and are visible
 immediately to everyone on the thread, clients included, so write them for that audience:
 plain, brief, no internal jargon or file paths nobody there recognises.
+
+### Writing to Basecamp — the CLI reports success for bodies it did not store
+
+Hit twice on 2026-08-24, both times returning `{ok:true}` with a real id and URL
+for a post that was empty or half-missing. **Always read the recording back and
+check the content length before calling a post delivered:**
+
+```
+basecamp api get "/buckets/<project>/messages/<id>.json" --json \
+  --jq '.data.content | length'
+```
+
+Two known causes:
+
+- **stdin `-` is not supported**, despite the skill documenting it. `printf ... |
+  basecamp messages create "Title" - --in <p>` takes `-` as the *literal body*
+  and Markdown-renders it to `<ul><li></li></ul>` — a blank post. Pass the body
+  as a real argument instead: `BODY="$(cat body.md)"` then
+  `messages create "Title" "$BODY"` or `messages update <id> --body "$BODY"`.
+- **An unclosed `<bc-attachment>` swallows the rest of the document.** A missing
+  `</bc-attachment>` stored 2.7 KB of a 7.9 KB body — one image and half the
+  sections gone, silently.
+
+### Inline images in a message
+
+`messages update` has no `--attach`; `messages create --attach <file>`
+(repeatable) does. To get images into an **existing** post without re-notifying
+everyone: create a throwaway `--draft` carrying the attachments to mint sgids,
+pull them out, then `messages update --body` with
+
+```
+<bc-attachment sgid="..." content-type="image/png" caption="..."></bc-attachment>
+```
+
+placed where you want each image, and trash the draft. Do not reuse the server's
+expanded tag from the draft — it wraps a `<figure>`, so a `<bc-attachment[^>]*>`
+regex captures only the opening tag, which is exactly what truncates the body.
+Files made with `files uploads create` carry **no** `attachable_sgid` and cannot
+be embedded — they only land in Docs & Files. `api post` sends JSON only, so it
+cannot reach `/attachments.json` with binary. Raw HTML (`h2`, `ul`, `ol`,
+`strong`) passes through the Markdown converter unchanged.
+
+### Check the audience before posting
+
+`bc-threads` can only *reply* — a new message board post must go through
+`basecamp messages create`, bypassing the wrapper. That is safe for read-back
+(the bridge filters this box's own account via `self` in
+`~/.claude/bc-threads.json`), but nothing stops you posting internal detail into
+a **client** project, and several bridged projects are named for clients. Before
+posting, confirm the audience:
+
+```
+basecamp projects show <id> --jq '.data.clients_enabled'
+basecamp people list --project <id> --jq '[.data[] | {name, client}]'
+```

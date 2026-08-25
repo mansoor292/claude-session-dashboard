@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Split a slice of this session's context into a new session.
+
+Not a fork. `--fork-session` copies the whole transcript, which is exactly the noise you
+are trying to shed. A split starts a session with a CLEAN context and hands it one thing:
+a brief you wrote. Whatever is not in the brief, the new session does not know.
+
+  session-split <new-name> <brief-file>      brief from a file
+  session-split <new-name> -                 brief on stdin
+  session-split <new-name> brief.md --cwd ~/Code/foo --parent other-session
+
+A good brief is not a summary of the conversation. It is a working handoff:
+
+  GOAL          what "done" looks like, in one or two sentences
+  DECIDED       what has already been settled, and WHY — so it is not relitigated
+  STATE         files touched, what is committed, what is half-finished
+  OUT OF SCOPE  what the new session must NOT wander into
+  OPEN          what is genuinely still undecided — name it rather than let it be guessed
+
+Leave something out and the new session will ask about it, which is the point: it is told
+to ask rather than assume. A brief that hides an open question is worse than a short one.
+"""
+import argparse, json, os, subprocess, sys, urllib.request, urllib.parse
+
+DASH = os.environ.get("DASHBOARD_URL", "http://127.0.0.1:5000")
+TMUX = os.environ.get("TMUX_BIN", "/usr/bin/tmux")
+MINCHARS = 80
+
+
+def cur_session():
+    p = subprocess.run([TMUX, "display-message", "-p", "#{session_name}"],
+                       capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="session-split", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("name", help="name for the new session")
+    ap.add_argument("brief", help="path to the brief, or - for stdin")
+    ap.add_argument("--cwd", default="", help="working directory (default: the parent's)")
+    ap.add_argument("--parent", default="", help="session to split from (default: this one)")
+    a = ap.parse_args()
+
+    brief = sys.stdin.read() if a.brief == "-" else open(os.path.expanduser(a.brief)).read()
+    brief = brief.strip()
+    if len(brief) < MINCHARS:
+        sys.exit("the brief is only %d chars — too thin to be a handoff. A split with no "
+                 "context is just a new session; write the goal, what is already decided and "
+                 "why, the state of the files, and what is out of scope." % len(brief))
+
+    parent = a.parent or cur_session()
+    if not parent:
+        sys.exit("no parent session: not running inside tmux, so pass --parent <session>")
+
+    q = {"name": parent, "as": a.name}
+    if a.cwd: q["cwd"] = os.path.abspath(os.path.expanduser(a.cwd))
+    req = urllib.request.Request(DASH + "/api/split?" + urllib.parse.urlencode(q),
+                                 data=brief.encode(), method="POST",
+                                 headers={"Content-Type": "text/plain; charset=utf-8"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            d = json.loads(r.read())
+    except Exception as e:
+        sys.exit("could not reach the dashboard at %s (%s). It owns session launching — "
+                 "check: systemctl status session-dashboard" % (DASH, e))
+
+    if not d.get("ok"):
+        sys.exit("split failed: %s" % d.get("err"))
+    print("split → %s   cwd %s   brief %s (%d chars)"
+          % (d["name"], d["cwd"], d["brief"], d["chars"]))
+    print("It starts with NO history from %s — only the brief. It will read the brief and "
+          "report back what it thinks is missing before touching anything." % parent)
+
+
+if __name__ == "__main__":
+    main()
