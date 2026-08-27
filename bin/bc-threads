@@ -576,27 +576,47 @@ def thread_comments(project, thread_id):
     return sorted(d, key=lambda c: int(c["id"])) if isinstance(d, list) else []
 
 
-def history_since_us(project, thread_id, me_id, upto_id, cap=25):
-    """What was said on this thread since we last spoke, ending at the trigger.
+TRDIR = os.path.expanduser(os.environ.get("BC_TRANSCRIPTS_DIR", "~/.claude/bc-transcripts"))
 
-    Only @mentions reach a session now, so between one mention and the next the thread has
-    been moving without us. Delivering the mention alone would hand over the last line of a
-    conversation and nothing else. The natural cut is our own last comment: everything after
-    it is what we missed.
+
+def transcript_path(tid):
+    return os.path.join(TRDIR, "%s.md" % tid)
+
+
+def sync_transcript(reg, project, thread_id, title="", url="", write=True):
+    """Append whatever is new on a thread to its transcript file.
+
+    The transcript IS the stream a session subscribes to. Instructions used to ride along
+    with every delivery and the thread content was flattened into the pane message; both
+    repeated, and repetition dilutes. Now the file accumulates the conversation once, in
+    order, ours included, and a delivery is only a pointer to the first unread marker.
+
+    Returns (path, first_new_comment_id, n_new).
     """
-    cl = thread_comments(project, thread_id)
-    if not cl: return None, []
-    # Everything is measured against the trigger, not against "now". We may already have
-    # replied past this mention on a busy thread, and anchoring on our latest comment then
-    # labels a FUTURE comment as "you last said here" and yields no history at all.
-    upto = [c for c in cl if int(c["id"]) <= int(upto_id)]
-    if not upto: return None, []
-    anchor = None
-    for c in upto:
-        if str((c.get("creator") or {}).get("id")) == me_id: anchor = c
-    after = ([c for c in upto if int(c["id"]) > int(anchor["id"])] if anchor
-             else upto[-cap:])                 # never spoke here: recent context, bounded
-    return anchor, after[-cap:]
+    tid = str(thread_id)
+    cl = thread_comments(project, tid)
+    tr = reg.setdefault("transcripts", {}).setdefault(tid, {"last_id": 0})
+    path = transcript_path(tid)
+    os.makedirs(TRDIR, exist_ok=True)
+    fresh = [c for c in cl if int(c["id"]) > int(tr.get("last_id") or 0)]
+    if not write:      # dry run: report what would land, touch nothing
+        return path, (str(fresh[0]["id"]) if fresh else ""), len(fresh)
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write("# %s\n\nthread %s · project %s%s\n\nEach entry is one Basecamp "
+                    "comment, oldest first. Appended by bc-threads — do not edit; "
+                    "reply with `bc-threads reply %s \"...\"`.\n"
+                    % (title or "Basecamp thread " + tid, tid, project,
+                       (" · " + url) if url else "", tid))
+    if fresh:
+        with open(path, "a") as f:
+            for c in fresh:
+                who = (c.get("creator") or {}).get("name") or "someone"
+                when = (c.get("created_at") or "")[:16].replace("T", " ")
+                f.write("\n#### %s · %s · %s\n\n%s\n"
+                        % (c["id"], who, when, detag(c.get("content"))))
+        tr["last_id"] = max(int(c["id"]) for c in fresh)
+    return path, (str(fresh[0]["id"]) if fresh else ""), len(fresh)
 
 
 def cmd_watch(a):
@@ -669,43 +689,31 @@ def cmd_watch(a):
         if not ready(sess, live, label):
             held.extend(int(c["id"]) for c, _, _, _ in items); continue
         whys = sorted({w for _, _, _, w in items})
-        # group by thread so history is fetched once per thread, not once per mention
+        # one transcript sync per thread; the pane message is only a pointer into it
         by_thread = {}
         for c, par, proj, why in items:
             by_thread.setdefault((proj, str(par.get("id") or "")), []).append((c, par))
         parts = []
         for (proj, tid), cs in sorted(by_thread.items()):
             title = (cs[-1][1].get("title") or "")[:60]
-            trigger_ids = {int(c["id"]) for c, _ in cs}
-            anchor, hist = history_since_us(proj, tid, me_id, max(trigger_ids))
-            lines = []
-            if anchor:
-                lines.append('(you last said here: "%s")'
-                             % clip(detag(anchor.get("content")), 600))
-            elif hist:
-                lines.append("(you have not posted on this thread before \u2014 recent context)")
-            for h in hist:
-                who = (h.get("creator") or {}).get("name") or "someone"
-                mark = ">> THE @MENTION >> " if int(h["id"]) in trigger_ids else ""
-                lines.append('%s%s: "%s"'
-                             % (mark, who, clip(detag(h.get("content")), MAXLEN, h.get("app_url") or "")))
-            if not hist:                       # history fetch failed; the mention still goes
-                for c, _ in cs:
-                    lines.append('>> THE @MENTION >> %s: "%s"'
-                                 % ((c.get("creator") or {}).get("name") or "someone",
-                                    clip(detag(c.get("content")), MAXLEN, c.get("app_url") or "")))
-            parts.append('[thread %s "%s" \u2014 project %s] %s  %s'
-                         % (tid, title, proj, "  ".join(lines), cs[-1][0].get("app_url") or ""))
-        msg = clip("Basecamp \u2014 you were @mentioned %d time(s) across %d thread(s) (%s). "
-                   "Each thread below is replayed from your own last comment onwards, so you "
-                   "have what you missed while not being mentioned; the line marked THE "
-                   "@MENTION is what triggered this. "
-                   "%s "
-                   "Answering is what starts tracking: bc-threads reply <thread id> \"...\" "
-                   "tracks that thread and nothing wider. A later comment may supersede an "
-                   "earlier one \u2014 read the whole batch before replying. If any of this "
-                   "belongs to a different session, say so rather than taking it on. %s"
-                   % (len(items), len(by_thread), "; ".join(whys), "  ".join(parts), HANDLE_RULE),
+            path, first_new, n_new = sync_transcript(reg, proj, tid, title,
+                                                     cs[-1][0].get("app_url") or "",
+                                                     write=not a.dry_run)
+            if not a.dry_run: dirty = True
+            who = ", ".join(sorted({(c.get("creator") or {}).get("name") or "someone"
+                                    for c, _ in cs}))
+            marker = ("read from the '#### %s' marker onward" % first_new) if first_new \
+                     else "you have read it all before; the mention is the newest entry"
+            parts.append('[%s on "%s", thread %s: read %s — %d new entr%s, %s]'
+                         % (who, title, tid, path, n_new, "y" if n_new == 1 else "ies", marker))
+        msg = clip("Basecamp — @mentioned %d time(s) across %d thread(s) (%s). %s "
+                   "The transcript file is the conversation — read the new entries "
+                   "before doing anything; a later comment may supersede an earlier one. "
+                   "Reply with bc-threads reply <thread id> \"...\" (that also starts "
+                   "tracking). Handle it per the Basecamp rules in your CLAUDE.md — "
+                   "ask if underspecified, and never claim a fix before the prod-tested "
+                   "gate is green."
+                   % (len(items), len(by_thread), "; ".join(whys), "  ".join(parts)),
                    BATCHMAX)
         if a.dry_run:
             print("   would deliver %d @mention(s) across %d thread(s) to %s (%s)"
@@ -743,9 +751,28 @@ def cmd_watch(a):
         save(reg)
 
 
+# Words that read as "this is resolved, stop worrying". Prompting sessions not to jump
+# ahead did not work — the claim has to be stopped at the door instead.
+CLAIM_RE = re.compile(
+    r"\b(fixed|deployed|resolved|patched|is (now )?live|live now|now works|working now|"
+    r"should (now )?(work|be working))\b", re.I)
+
+
 def cmd_reply(a):
     """Comment on a recording — and start tracking that recording, nothing wider."""
     reg = load()
+    m0 = CLAIM_RE.search(a.text or "")
+    if m0 and not a.proven:
+        sys.exit('REFUSED: this reply claims a fix ("%s") but carries no proof.\n'
+                 "The gate: reproduce the reporter's case; write a Playwright test that "
+                 "fails without your change and passes with it; run it locally; commit; "
+                 "deploy; re-run the SAME test against prod. Only a prod-green run earns "
+                 "the words you just used.\n"
+                 "When that is true, re-run with:  --proven \"<test file> green against "
+                 "<prod url>\"\n"
+                 "If the gate cannot apply (no harness, nothing to deploy), say that ON "
+                 "THE THREAD and ask how they want it verified — do not reword the claim "
+                 "to slip past this check." % m0.group(0))
     rid = recording_id(a.recording)
     sess = a.session or cur_session()
     d = bc("comments", "create", rid, a.text, *(["--in", a.project] if a.project else [])) or {}
@@ -762,8 +789,21 @@ def cmd_reply(a):
         # Belt and braces: the author filter already covers our own comments.
         rec.setdefault("ours", []).append(int(d["id"]))
     save(reg)
+    # our reply joins the transcript too, so the file stays the whole conversation
+    if d.get("id"):
+        try:
+            tr = reg.setdefault("transcripts", {}).get(rid)
+            if tr is not None and os.path.exists(transcript_path(rid)):
+                me = reg.get("self") or {}
+                with open(transcript_path(rid), "a") as f:
+                    f.write("\n#### %s · %s (us) · %s\n\n%s\n"
+                            % (d["id"], me.get("name") or "us",
+                               time.strftime("%Y-%m-%d %H:%M"), a.text))
+                tr["last_id"] = max(int(tr.get("last_id") or 0), int(d["id"]))
+                save(reg)
+        except Exception: pass
     note("sent", project=project, place=rid, thread=rid, session=sess or "",
-         cid=str(d.get("id") or ""), text=clip(a.text, HISTLEN))
+         cid=str(d.get("id") or ""), proven=(a.proven or ""), text=clip(a.text, HISTLEN))
     print("replied %s%s" % (d.get("id", "?"),
                             "" if rec is None else " (tracking %s -> %s)" % (rid, rec.get("session"))))
 
@@ -938,23 +978,21 @@ def cmd_assign(a):
               "`bc-threads assign %s %s` when it is idle, or let the thread\u2019s next "
               "mention carry it." % (label_session(sess), a.cid, a.session))
         return
-    anchor, hist = history_since_us(proj, tid, me_id, int(a.cid))
-    lines = []
-    if anchor: lines.append('(you last said here: "%s")' % clip(detag(anchor.get("content")), 600))
-    elif hist: lines.append("(you have not posted on this thread before \u2014 recent context)")
-    for h in hist:
-        mark = ">> THE @MENTION >> " if str(h["id"]) == str(a.cid) else ""
-        lines.append('%s%s: "%s"' % (mark, (h.get("creator") or {}).get("name") or "someone",
-                                     clip(detag(h.get("content")), MAXLEN, h.get("app_url") or "")))
-    if not hist:
-        lines.append('>> THE @MENTION >> %s: "%s"' % (o.get("frm") or "someone", o.get("text") or ""))
-    msg = clip("Basecamp \u2014 you have been given this thread by hand: nobody owned it, so it "
-               "waited to be assigned rather than being guessed at. [thread %s \"%s\" \u2014 "
-               "project %s] %s  %s "
-               "It is now tracked to you. Answering keeps it: bc-threads reply %s \"...\". "
-               "If it plainly belongs elsewhere, say so rather than taking it on. %s"
-               % (tid, (o.get("title") or "?")[:60], proj, "  ".join(lines),
-                  o.get("url") or "", tid, HANDLE_RULE), BATCHMAX)
+    path, first_new, n_new = sync_transcript(reg, proj, tid,
+                                             o.get("title") or "", o.get("url") or "")
+    save(reg)
+    marker = ("read from the '#### %s' marker onward" % first_new) if first_new \
+             else "the mention is the newest entry"
+    msg = clip("Basecamp — you have been given a thread by hand: nobody owned it, so it "
+               "waited to be assigned rather than being guessed at. %s @mentioned the agent "
+               "on \"%s\" (thread %s, project %s). The conversation is in %s — %s. Read "
+               "it before doing anything. It is now tracked to you; reply with bc-threads "
+               "reply %s \"...\". Handle it per the Basecamp rules in your CLAUDE.md — "
+               "ask if underspecified, never claim a fix before the prod-tested gate is "
+               "green — and if it plainly belongs elsewhere, say so rather than taking "
+               "it on."
+               % (o.get("frm") or "someone", (o.get("title") or "?")[:60], tid, proj,
+                  path, marker, tid), BATCHMAX)
     ensure_bridge(sess)
     deliver(sess, msg)
     bridge = sessions().get(sess, {}).get("bridge") or ""
@@ -1038,7 +1076,10 @@ sp.add_argument("--limit", type=int, default=SWEEP)
 sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_watch)
 sp = sub.add_parser("reply"); sp.add_argument("recording"); sp.add_argument("text")
 sp.add_argument("-p", "--project"); sp.add_argument("-s", "--session")
-sp.add_argument("--no-track", action="store_true"); sp.set_defaults(fn=cmd_reply)
+sp.add_argument("--no-track", action="store_true")
+sp.add_argument("--proven", metavar="EVIDENCE",
+                help='required when the text claims a fix: e.g. "tests/offer.spec.ts green against https://prod..."')
+sp.set_defaults(fn=cmd_reply)
 sp = sub.add_parser("post"); sp.add_argument("project"); sp.add_argument("subject")
 sp.add_argument("body"); sp.add_argument("-s", "--session")
 sp.add_argument("--no-track", action="store_true",

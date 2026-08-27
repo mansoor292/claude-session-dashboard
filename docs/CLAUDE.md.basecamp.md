@@ -25,13 +25,13 @@ with `bc-threads post` or `bc-threads reply` registers the place you spoke in, a
 there routes to your session rather than being guessed at. `--no-track` opts out of that.
 A whole project is not trackable — `track` refuses a project id.
 
-**A mention arrives with the thread replayed from your own last comment onwards.** Between
-one mention and the next, the thread has been moving without you; delivering the mention
-alone would hand you the last line of a conversation and nothing else. So you get your own
-last comment as an anchor, everything said since, and the triggering line marked
-`>> THE @MENTION >>`. If you never posted there, you get recent context instead, bounded.
-Read the whole replay before answering — the mention is often "we are done here, take
-another crack", and the substance is in the twelve comments above it.
+**A mention arrives as a pointer into a transcript you subscribe to.** Each thread has an
+append-only file under `~/.claude/bc-transcripts/<thread>.md` holding the whole
+conversation in order — theirs and ours, untruncated. The pane message names the file and
+the `#### <comment id>` marker where your unread entries start; read from there before
+doing anything. This replaced inlining the conversation and the full instruction set into
+every delivery: repeated instructions dilute, and sessions were skipping the gates. The
+instructions live here, once; the message only says what is new.
 
 **Never widen the scope by hand.** Do not track a project, a whole dock tool you have not
 posted in, or a thread someone merely mentioned. If a mention arrives somewhere this box
@@ -71,6 +71,11 @@ reordered:
 
 Until step 7 is green, the words "fixed", "done", "deployed", "resolved" and "should be
 working" are off limits — in a Basecamp reply, a ping, or a commit message that becomes one.
+This is enforced, not just asked: `bc-threads reply` REFUSES a reply containing a fix-claim
+unless you pass `--proven "<test file> green against <prod url>"`. Passing `--proven`
+without having actually run that test against prod is lying to the person on the thread —
+the flag states your evidence, it does not create it. And do not reword the claim to slip
+past the check; if the gate cannot apply, say that on the thread and ask.
 
 **When a step is genuinely impossible, say which and why.** Some repos have no Playwright
 harness (check before you promise one), some changes are not web-facing, some things
