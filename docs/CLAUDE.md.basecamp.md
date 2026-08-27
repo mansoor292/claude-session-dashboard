@@ -2,7 +2,7 @@
 
 ## Basecamp — a session hears the places it spoke in, never a whole project
 
-Binding a session to a *project* was tried and retired: one link dragged
+Binding a session to a *project* was tried and retired on 2026-08-25: one link dragged
 every unrelated thread in that project into one session. A session is bound to **places** —
 the message board it posted to, the card or to-do it commented on. Everything else in the
 same project stays silent.
@@ -15,16 +15,23 @@ bc-threads untrack <recording>               stop tracking one place
 bc-threads track <recording> [session]       track a place you did not post in
 ```
 
-**Tracking is a side effect of speaking, not something to arrange up front.** Post with
-`bc-threads post` or `bc-threads reply` and the place you spoke in is registered to your
-session automatically; replies there come back to you. There is nothing to link first.
+**Nothing reaches you unless it @mentions the agent account.** An ordinary comment on a
+thread you track is silence. People talk on these threads constantly without needing us,
+and forwarding all of it buried the asks that were actually addressed to us. A mention is
+someone deciding they want us; that is the only trigger.
 
-It is opt-OUT, not opt-in: add `--no-track` to either command to say something and hear
-nothing back — right for a one-way status note nobody is expected to answer. There are
-only two widths, and both are places: **one thread** (`reply`, or `track <message>`) hears
-just that thread, and **one message board** (`post`, or `track <board>`) hears every
-message and comment on that board. A whole project is not trackable at all — `track` now
-refuses a project id rather than accepting a place that could never match.
+**Tracking no longer decides WHETHER something is delivered, only WHERE it goes.** Posting
+with `bc-threads post` or `bc-threads reply` registers the place you spoke in, and a mention
+there routes to your session rather than being guessed at. `--no-track` opts out of that.
+A whole project is not trackable — `track` refuses a project id.
+
+**A mention arrives with the thread replayed from your own last comment onwards.** Between
+one mention and the next, the thread has been moving without you; delivering the mention
+alone would hand you the last line of a conversation and nothing else. So you get your own
+last comment as an anchor, everything said since, and the triggering line marked
+`>> THE @MENTION >>`. If you never posted there, you get recent context instead, bounded.
+Read the whole replay before answering — the mention is often "we are done here, take
+another crack", and the substance is in the twelve comments above it.
 
 **Never widen the scope by hand.** Do not track a project, a whole dock tool you have not
 posted in, or a thread someone merely mentioned. If a mention arrives somewhere this box
@@ -38,27 +45,66 @@ webhook with the bare `basecamp webhooks` command; the refcount lives in the reg
 Reply with `bc-threads reply`, never the bare `basecamp comments create`: the wrapper is
 what keeps our own posts from being read back to us as new.
 
+### Never claim a fix you have not proven
+
+A person on a thread reads "fixed" as *I can stop worrying about this*. Saying it before it
+is true costs them a re-test, a second report, and their trust in every later "fixed" you
+send. So the claim waits for evidence, in this order, with no steps skipped and none
+reordered:
+
+1. **Reproduce their case first.** Their words, their data, their browser path — not a
+   proxy you find easier. If you cannot reproduce it, say so on the thread and ask for the
+   missing detail. Never fix by guess.
+2. **Make the change.**
+3. **Write or extend a Playwright test for their case.** Then check it **fails without your
+   change and passes with it** — stash or revert the change and watch it go red. A test
+   that passes either way proves nothing and is worse than none, because it will convince
+   you.
+4. **Run it locally. Green.**
+5. **Only now commit.** An unproven change does not enter the history.
+6. **Deploy to prod.**
+7. **Re-run that same test against prod.** Point the suite at the deployed url rather than
+   writing a second test — your web repo's Playwright config may take `BASE_URL` and
+   `COACHING_BASE_URL` for exactly this. Local green and prod green are different claims;
+   only the second is the one they care about.
+8. **Now reply on the thread**, saying what was wrong and that it is verified on prod.
+
+Until step 7 is green, the words "fixed", "done", "deployed", "resolved" and "should be
+working" are off limits — in a Basecamp reply, a ping, or a commit message that becomes one.
+
+**When a step is genuinely impossible, say which and why.** Some repos have no Playwright
+harness (check before you promise one), some changes are not web-facing, some things
+have nothing to deploy. Post that on the thread and ask how they want it verified. What you
+must never do is skip a gate silently and report success as though you had passed it — a
+missing harness is a thing to raise, not a licence to guess.
+
+**This gates the claim, not the conversation.** Clarifying questions go out immediately, as
+always, and a short "looking at this now" is welcome when something will take a while. Only
+the assertion that it is fixed waits for prod.
+
 ### Being @mentioned
 
-An @mention is the one thing that reaches a session outside the tracked set — someone
-typed our name, which is an invitation by definition. `bc-threads watch` scans every recent
-comment in the account for a mention of the agent account and delivers it to the **nearest**
-session, walking outward:
+`bc-threads watch` scans every recent comment in the account for a mention of the agent
+account. A mention reaches a session only when that session **demonstrably owns** where it
+landed — either it tracks that exact thread, or it tracks the board the thread sits on.
 
-1. the session tracking that exact thread
-2. the session tracking the board it hangs off
-3. a session tracking anything else in the same project (most recent wins)
-4. the fallback session (`mention_session` in the registry, else `_dashboard`)
+**Anything else is not guessed at.** A mention on a thread nobody owns is queued as an
+unrouted mention for a human to assign, on the Basecamp page or with `bc-threads assign
+<comment id> <session>`. Routing used to fall back on "some session that works elsewhere in
+this project" and then on a catch-all session; both were guesses and both misfired, putting
+one client's thread into another client's session. Waiting to be assigned is better than
+arriving in the wrong place.
 
-The message says which rung it came in on, so you know how much context you are assumed to
-have. Rungs 3 and 4 mean **nobody was working on this** — treat it as a cold approach, not
-a continuation, and if it plainly belongs to a different session say so instead of taking
-it on.
+So if a thread is quiet, it is not being withheld from you — nobody owns it, and it is
+sitting in the queue. Do not go looking for it or `track` it yourself.
 
-**Being mentioned does not track anything.** The thread stays untracked until you answer:
-`bc-threads reply <thread> "..."` starts tracking that thread and nothing wider. So a
-mention you decide is not yours leaves no trace, and one you answer opens the loop
-automatically. Do not `track` it up front to "keep an eye on it".
+A mention delivered by assignment says so: *you have been given this thread by hand*. Treat
+that as a cold start — read the replayed history before assuming continuity, and if it
+plainly belongs somewhere else, say so rather than taking it on.
+
+**Being mentioned does not track anything by itself.** Answering is what keeps a thread:
+`bc-threads reply <thread> "..."` tracks that thread and nothing wider. A mention you
+decide is not yours leaves no trace.
 
 Mentions are rendered by name — `@TheBot`, `@A Teammate` — so you can see who else
 was tagged and whether the ask was aimed at you or merely near you.

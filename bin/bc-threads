@@ -52,8 +52,22 @@ _RULE = (
     "Instead ask the person back on the thread: numbered, specific questions, everything you "
     "need in ONE reply, via bc-threads %s. Do not ask what you could answer yourself by "
     "reading the code or the thread. Their answers come back to you here. Once the ask is "
-    "fully clear \u2014 straight away if it already was \u2014 do the work, then report back "
-    "the same way."
+    "fully clear \u2014 straight away if it already was \u2014 do the work. "
+    "PROVE IT BEFORE YOU CLAIM IT: if the work is a code change, do not tell them it is "
+    "fixed until it is proven fixed, in this order. (1) Reproduce THEIR case, in their "
+    "words, before changing anything \u2014 if you cannot reproduce it, say so and ask, do "
+    "not guess at a fix. (2) Make the change. (3) Write or extend a Playwright test that "
+    "covers their case specifically, and check it FAILS without your change and PASSES with "
+    "it \u2014 a test that passes either way proves nothing. (4) Run it locally and get it "
+    "green. (5) Only now commit. (6) Deploy to prod. (7) Re-run that same test against the "
+    "PROD url (override the base url, e.g. BASE_URL=<prod>) and get it green there too. "
+    "(8) Only then reply on the thread. "
+    "Never write \"fixed\", \"done\", \"deployed\", \"should be working\" or anything "
+    "like it before step 7 is green. If a step is impossible \u2014 the repo has no "
+    "Playwright harness, there is nothing to deploy, the change is not web-facing \u2014 say "
+    "exactly which step and why on the thread and ask how they want it verified; do not "
+    "quietly skip it and report success anyway. Questions, and a short \"looking at this "
+    "now\", can go out at any time: it is only the CLAIM OF A FIX that waits for prod."
 )
 HANDLE_RULE = _RULE % 'reply <the recording id shown above> "your questions"'
 PING_HANDLE_RULE = _RULE % 'ping-reply %s "your questions"'
@@ -69,6 +83,7 @@ def load():
     reg.setdefault("hooks", {})      # project id -> {hook_id}      (refcounted by places)
     reg.setdefault("parents", {})    # recording id -> parent id    (cache: message -> board)
     reg.setdefault("pings", {})
+    reg.setdefault("orphans", {})   # @mentions nobody owns, waiting to be assigned
     # The project-wide model was retired on 2026-08-25: one link pulled every thread in a
     # project into one session. Its links were already removed; drop the empty key quietly
     # rather than silently reinterpreting a project id as a place id.
@@ -261,6 +276,9 @@ def ready(sess, live, label):
     if not info.get("alive"):
         print("-- %s: session %s is not running \u2014 holding" % (label, sess))
         note("hold", title=label, session=sess, why="session not running"); return False
+    if not tmux_has(sess):
+        print("-- %s: %s is not on the %s tmux socket \u2014 holding" % (label, sess, SOCKET))
+        note("hold", title=label, session=sess, why="not on this tmux socket"); return False
     st = info.get("status") or ""
     if st in BLOCKED_STATUS:
         print("-- %s: %s is %s \u2014 holding" % (label, sess, st))
@@ -381,18 +399,20 @@ def nearest_session(reg, project, thread_id):
     project, thread_id = str(project), str(thread_id)
     rec = reg["places"].get(thread_id)
     if rec and rec.get("session"):
-        return rec["session"], "it already tracks this thread"
+        return rec["session"], "it already tracks this thread", True
     gid = parent_id(reg, project, thread_id)
     if gid:
         rec = reg["places"].get(gid)
         if rec and rec.get("session"):
-            return rec["session"], "it tracks the board this thread is on"
+            return rec["session"], "it tracks the board this thread is on", True
+    # Past this point nobody owns it and every answer is a guess. Guessing put one client's
+    # thread into another client's session twice. An unowned mention is queued for a human
+    # to assign instead \u2014 see `bc-threads orphans` and the Basecamp page.
     here = [(r.get("connected") or 0, r.get("session")) for r in reg["places"].values()
             if r.get("project") == project and r.get("session")]
     if here:
-        return max(here)[1], "nothing here is tracked, but it works elsewhere in this project"
-    return ((reg.get("mention_session") or reg.get("ping_session") or "_dashboard"),
-            "nothing in this project is tracked \u2014 this is the fallback session")
+        return max(here)[1], "nobody owns this thread; this session works elsewhere in the project", False
+    return "", "nothing in this project is tracked at all", False
 
 
 def register(reg, pid, project, session, kind="", title="", url="", quiet=False):
@@ -401,8 +421,7 @@ def register(reg, pid, project, session, kind="", title="", url="", quiet=False)
     pid = str(pid)
     rec = reg["places"].get(pid)
     if rec is None:
-        rec = {"connected": int(time.time()), "last_comment_id": 0, "last_message_id": 0,
-               "ours": []}
+        rec = {"connected": int(time.time()), "ours": []}
         reg["places"][pid] = rec
     rec["project"] = str(project)
     if session: rec["session"] = session
@@ -501,11 +520,8 @@ def cmd_track(a):
     rec = register(reg, rid, project, sess,
                    kind=d.get("type") or "", title=d.get("title") or d.get("subject") or "",
                    url=d.get("app_url") or "")
-    # Start from now: tracking a place should not replay its whole history.
-    if not rec.get("last_comment_id"):
-        ids = [int(c["id"]) for c in sweep_comments(SWEEP)
-               if str((c.get("parent") or {}).get("id")) == rid]
-        rec["last_comment_id"] = max(ids) if ids else 0
+    # No per-place watermark any more: delivery is driven by @mentions against one
+    # account-wide watermark, and a mention replays its own thread from our last comment.
     save(reg)
     note("track", project=project, thread=rid, session=sess,
          title=rec.get("title") or "", text="place tracked")
@@ -554,6 +570,35 @@ def sweep_lock():
     return f                                  # held until the process exits
 
 
+def thread_comments(project, thread_id):
+    """Every comment on one thread, oldest first."""
+    d = bc("api", "get", "/buckets/%s/recordings/%s/comments.json" % (project, thread_id), check=False)
+    return sorted(d, key=lambda c: int(c["id"])) if isinstance(d, list) else []
+
+
+def history_since_us(project, thread_id, me_id, upto_id, cap=25):
+    """What was said on this thread since we last spoke, ending at the trigger.
+
+    Only @mentions reach a session now, so between one mention and the next the thread has
+    been moving without us. Delivering the mention alone would hand over the last line of a
+    conversation and nothing else. The natural cut is our own last comment: everything after
+    it is what we missed.
+    """
+    cl = thread_comments(project, thread_id)
+    if not cl: return None, []
+    # Everything is measured against the trigger, not against "now". We may already have
+    # replied past this mention on a busy thread, and anchoring on our latest comment then
+    # labels a FUTURE comment as "you last said here" and yields no history at all.
+    upto = [c for c in cl if int(c["id"]) <= int(upto_id)]
+    if not upto: return None, []
+    anchor = None
+    for c in upto:
+        if str((c.get("creator") or {}).get("id")) == me_id: anchor = c
+    after = ([c for c in upto if int(c["id"]) > int(anchor["id"])] if anchor
+             else upto[-cap:])                 # never spoke here: recent context, bounded
+    return anchor, after[-cap:]
+
+
 def cmd_watch(a):
     lock = sweep_lock()
     if lock is None:
@@ -563,185 +608,135 @@ def cmd_watch(a):
     if not a.no_pings:
         try: cmd_pings(argparse.Namespace(to=None, dry_run=a.dry_run, verbose=a.verbose))
         except Exception as e: print("!! ping sweep failed: %s" % e)
-    # No early return when nothing is tracked: an @mention has to reach someone precisely
-    # when nobody is tracking where it landed — that is what the fallback session is for.
     if not reg["places"] and a.verbose: print("no places tracked")
-    # Resolving a comment's grandparent costs an API call per unseen thread — ~30 on a busy
-    # account. The cache only pays off if it survives a sweep that delivered nothing, so a
-    # grown cache counts as a reason to write the registry back.
     dirty = False
     cached = len(reg["parents"])
+    me_id = str(me.get("id") or "")
+    if not me_id:
+        print("!! cannot tell who we are \u2014 not delivering anything"); return
 
-    # 1. comments, anywhere in the account, that hang off a tracked place
+    # Nothing reaches a session unless it @mentions us. Tracking a place no longer decides
+    # WHETHER something is delivered, only WHERE it goes: an ordinary comment on a tracked
+    # thread is now silence. Flip deliver_unmentioned in the registry to undo that.
+    mentions_only = not reg.get("deliver_unmentioned")
     comments = sweep_comments(a.limit)
-    delivered = set()          # so the mention pass never repeats what a place already sent
-    per = {}
+
+    first = "mention_last_id" not in reg
+    seen_m = int(reg.get("mention_last_id") or 0)
+    newest_m = seen_m
+    hits = []
     for c in comments:
-        pid, rec = place_for(reg, c)
-        if pid: per.setdefault(pid, []).append(c)
+        cid = int(c["id"])
+        if cid > newest_m: newest_m = cid
+        if first or cid <= seen_m: continue
+        if (c.get("creator") or {}).get("id") == me.get("id"): continue
+        if FOOTER in (c.get("content") or ""): continue
+        if mentions_only and me_id not in mentioned_ids(c.get("content")): continue
+        hits.append(c)
+    if first:
+        reg["mention_last_id"] = newest_m; dirty = True
+        if a.verbose: print("   starting from comment %s" % newest_m)
 
-    for pid, cs in sorted(per.items()):
-        rec = reg["places"][pid]
-        cs = sorted(cs, key=lambda c: int(c["id"]))
-        seen = int(rec.get("last_comment_id") or 0)
-        ours, mine = set(rec.get("ours") or []), me.get("id")
-        fresh = [c for c in cs if int(c["id"]) > seen and int(c["id"]) not in ours
-                 and FOOTER not in (c.get("content") or "")
-                 and not (mine and (c.get("creator") or {}).get("id") == mine)]
-        newest = max(int(c["id"]) for c in cs)
-        if not fresh:
-            if newest > seen: rec["last_comment_id"] = newest; dirty = True
-            if a.verbose: print("   place %s: nothing new" % pid)
-            continue
-        sess = rec.get("session") or ""
-        label = "place %s (%s)" % (pid, (rec.get("title") or "")[:40])
-        if not ready(sess, live, label): continue
-        parts = []
-        for c in fresh:
-            par = c.get("parent") or {}
-            who = (c.get("creator") or {}).get("name") or "someone"
-            parts.append('[thread %s "%s"] %s: "%s" %s'
-                         % (par.get("id") or "?", (par.get("title") or "")[:60], who,
-                            clip(detag(c.get("content")), MAXLEN, c.get("app_url") or ""),
-                            c.get("app_url") or ""))
-        msg = clip("Basecamp \u2014 %d new comment(s) in %s \"%s\" (tracked because this session "
-                   "posted there). %s %s"
-                   % (len(fresh), rec.get("kind") or "place", (rec.get("title") or "")[:60],
-                      "  ".join(parts), HANDLE_RULE), BATCHMAX)
-        if a.dry_run:
-            print("   would deliver to %s (%d chars):\n%s" % (sess, len(msg), msg)); continue
-        if not ensure_bridge(sess):
-            print("!! %s: no Remote Control bridge \u2014 delivering, but it will not show in claude.ai" % sess)
-        deliver(sess, msg)
-        bridge = sessions().get(sess, {}).get("bridge") or ""
-        print("-> %s: delivered %d comment(s) from %s%s"
-              % (sess, len(fresh), label, ("  https://claude.ai/code/" + bridge) if bridge else ""))
-        for c in fresh:
-            par = c.get("parent") or {}
-            note("comment", project=rec.get("project") or "", place=pid,
-                 thread=str(par.get("id") or ""), title=par.get("title") or "", session=sess,
-                 frm=(c.get("creator") or {}).get("name") or "", cid=str(c["id"]),
-                 url=c.get("app_url") or "", bridge=bridge,
+    # One message per SESSION: `live` is sampled once per sweep, so a second deliver() to
+    # the same pane would be typed into a session that went busy on the first.
+    held, by_sess = [], {}
+    orphans = reg.setdefault("orphans", {})
+    for c in sorted(hits, key=lambda c: int(c["id"])):
+        par = c.get("parent") or {}
+        proj = str((c.get("bucket") or {}).get("id") or "")
+        sess, why, owned = nearest_session(reg, proj, par.get("id") or "")
+        if not owned:
+            # Park it for assignment. It is safely in the registry, so the watermark may
+            # move past it; nothing is lost and nothing is guessed.
+            orphans[str(c["id"])] = {
+                "project": proj, "thread": str(par.get("id") or ""),
+                "title": par.get("title") or "", "kind": par.get("type") or "",
+                "frm": (c.get("creator") or {}).get("name") or "", "ts": int(time.time()),
+                "url": c.get("app_url") or "", "why": why,
+                "suggest": sess or "", "text": clip(detag(c.get("content")), 600)}
+            dirty = True
+            print("~~ unrouted @mention from %s on %r \u2014 queued for assignment (%s)"
+                  % ((c.get("creator") or {}).get("name") or "?", (par.get("title") or "?")[:40], why))
+            note("orphan", project=proj, thread=str(par.get("id") or ""),
+                 title=par.get("title") or "", frm=(c.get("creator") or {}).get("name") or "",
+                 cid=str(c["id"]), url=c.get("app_url") or "", why=why,
                  text=clip(detag(c.get("content")), HISTLEN))
-        rec["last_comment_id"] = max(int(c["id"]) for c in fresh); dirty = True
-        delivered.update(int(c["id"]) for c in fresh)
-
-    # 2. brand-new messages on a tracked board (a comment sweep never sees these)
-    for pid, rec in sorted(reg["places"].items()):
-        if "board" not in (rec.get("kind") or "").lower(): continue
-        ms = bc("api", "get", "/buckets/%s/message_boards/%s/messages.json"
-                % (rec.get("project"), pid), check=False)
-        if not isinstance(ms, list) or not ms: continue
-        seen = int(rec.get("last_message_id") or 0)
-        ours, mine = set(rec.get("ours") or []), me.get("id")
-        fresh = [m for m in sorted(ms, key=lambda m: int(m["id"]))
-                 if int(m["id"]) > seen and int(m["id"]) not in ours
-                 and not (mine and (m.get("creator") or {}).get("id") == mine)]
-        newest = max(int(m["id"]) for m in ms)
-        if not fresh:
-            if newest > seen: rec["last_message_id"] = newest; dirty = True
             continue
-        sess = rec.get("session") or ""
-        label = "board %s (%s)" % (pid, (rec.get("title") or "")[:40])
-        if not ready(sess, live, label): continue
-        parts = ['[message %s "%s"] %s: "%s" %s'
-                 % (m["id"], (m.get("subject") or "")[:60],
-                    (m.get("creator") or {}).get("name") or "someone",
-                    clip(detag(m.get("content")), MAXLEN, m.get("app_url") or ""),
-                    m.get("app_url") or "") for m in fresh]
-        msg = clip("Basecamp \u2014 %d new message(s) on the \"%s\" board you are tracking. %s %s"
-                   % (len(fresh), (rec.get("title") or "")[:60], "  ".join(parts), HANDLE_RULE),
+        by_sess.setdefault(sess, []).append((c, par, proj, why))
+
+    for sess, items in sorted(by_sess.items()):
+        label = "@mention x%d" % len(items)
+        if not ready(sess, live, label):
+            held.extend(int(c["id"]) for c, _, _, _ in items); continue
+        whys = sorted({w for _, _, _, w in items})
+        # group by thread so history is fetched once per thread, not once per mention
+        by_thread = {}
+        for c, par, proj, why in items:
+            by_thread.setdefault((proj, str(par.get("id") or "")), []).append((c, par))
+        parts = []
+        for (proj, tid), cs in sorted(by_thread.items()):
+            title = (cs[-1][1].get("title") or "")[:60]
+            trigger_ids = {int(c["id"]) for c, _ in cs}
+            anchor, hist = history_since_us(proj, tid, me_id, max(trigger_ids))
+            lines = []
+            if anchor:
+                lines.append('(you last said here: "%s")'
+                             % clip(detag(anchor.get("content")), 600))
+            elif hist:
+                lines.append("(you have not posted on this thread before \u2014 recent context)")
+            for h in hist:
+                who = (h.get("creator") or {}).get("name") or "someone"
+                mark = ">> THE @MENTION >> " if int(h["id"]) in trigger_ids else ""
+                lines.append('%s%s: "%s"'
+                             % (mark, who, clip(detag(h.get("content")), MAXLEN, h.get("app_url") or "")))
+            if not hist:                       # history fetch failed; the mention still goes
+                for c, _ in cs:
+                    lines.append('>> THE @MENTION >> %s: "%s"'
+                                 % ((c.get("creator") or {}).get("name") or "someone",
+                                    clip(detag(c.get("content")), MAXLEN, c.get("app_url") or "")))
+            parts.append('[thread %s "%s" \u2014 project %s] %s  %s'
+                         % (tid, title, proj, "  ".join(lines), cs[-1][0].get("app_url") or ""))
+        msg = clip("Basecamp \u2014 you were @mentioned %d time(s) across %d thread(s) (%s). "
+                   "Each thread below is replayed from your own last comment onwards, so you "
+                   "have what you missed while not being mentioned; the line marked THE "
+                   "@MENTION is what triggered this. "
+                   "%s "
+                   "Answering is what starts tracking: bc-threads reply <thread id> \"...\" "
+                   "tracks that thread and nothing wider. A later comment may supersede an "
+                   "earlier one \u2014 read the whole batch before replying. If any of this "
+                   "belongs to a different session, say so rather than taking it on. %s"
+                   % (len(items), len(by_thread), "; ".join(whys), "  ".join(parts), HANDLE_RULE),
                    BATCHMAX)
         if a.dry_run:
-            print("   would deliver to %s (%d chars):\n%s" % (sess, len(msg), msg)); continue
-        ensure_bridge(sess); deliver(sess, msg)
-        bridge = sessions().get(sess, {}).get("bridge") or ""
-        print("-> %s: delivered %d message(s) from %s" % (sess, len(fresh), label))
-        for m in fresh:
-            note("message", project=rec.get("project") or "", place=pid, thread=str(m["id"]),
-                 title=m.get("subject") or "", session=sess,
-                 frm=(m.get("creator") or {}).get("name") or "", cid=str(m["id"]),
-                 url=m.get("app_url") or "", bridge=bridge,
-                 text=clip(detag(m.get("content")), HISTLEN))
-        rec["last_message_id"] = max(int(m["id"]) for m in fresh); dirty = True
-
-    # 3. @mentions of us, anywhere in the account — including places nobody tracks.
-    # This is the one path that reaches outside the tracked set, because a mention is an
-    # explicit invitation: someone typed our name. It still does not TRACK anything —
-    # tracking stays a side effect of speaking, so answering is what opens the loop.
-    me_id = str(me.get("id") or "")
-    if me_id and not a.no_mentions:
-        first = "mention_last_id" not in reg
-        seen_m = int(reg.get("mention_last_id") or 0)
-        newest_m = seen_m
-        hits = []
-        for c in comments:
-            cid = int(c["id"])
-            if cid > newest_m: newest_m = cid
-            if first or cid <= seen_m or cid in delivered: continue
-            if (c.get("creator") or {}).get("id") == me.get("id"): continue
-            if FOOTER in (c.get("content") or ""): continue
-            if me_id not in mentioned_ids(c.get("content")): continue
-            hits.append(c)
-        if first:
-            # Do not open with a decade of backlog the first time this runs.
-            reg["mention_last_id"] = newest_m; dirty = True
-            if a.verbose: print("   mentions: starting from comment %s" % newest_m)
-        # One message per SESSION, not per mention. `live` is sampled once per sweep, so a
-        # second deliver() to the same pane would be typed into a session that went busy on
-        # the first — straight into a running tool call. Batching also reads better: four
-        # questions on one thread belong together, in the order they were asked.
-        held, by_sess = [], {}
-        for c in sorted(hits, key=lambda c: int(c["id"])):
-            par = c.get("parent") or {}
-            proj = str((c.get("bucket") or {}).get("id") or "")
-            sess, why = nearest_session(reg, proj, par.get("id") or "")
-            by_sess.setdefault(sess, []).append((c, par, proj, why))
-        for sess, items in sorted(by_sess.items()):
-            label = "@mention x%d" % len(items)
-            if not ready(sess, live, label):
-                held.extend(int(c["id"]) for c, _, _, _ in items); continue
-            whys = sorted({w for _, _, _, w in items})
-            parts = []
-            for c, par, proj, why in items:
-                who = (c.get("creator") or {}).get("name") or "someone"
-                parts.append('[thread %s "%s" \u2014 project %s] %s: "%s" %s'
-                             % (par.get("id") or "?", (par.get("title") or "")[:60], proj, who,
-                                clip(detag(c.get("content")), MAXLEN, c.get("app_url") or ""),
-                                c.get("app_url") or ""))
-            threads = sorted({str((par.get("id") or "?")) for _, par, _, _ in items})
-            msg = clip("Basecamp \u2014 you were @mentioned %d time(s) across %d thread(s), "
-                       "oldest first (%s). %s "
-                       "Answering is what starts tracking: bc-threads reply <thread id> \"...\" "
-                       "tracks that thread and nothing wider. A later comment on a thread may "
-                       "supersede an earlier one \u2014 read the whole batch before replying. "
-                       "If any of this belongs to a different session, say so rather than "
-                       "taking it on. %s"
-                       % (len(items), len(threads), "; ".join(whys), "  ".join(parts),
-                          HANDLE_RULE), BATCHMAX)
-            if a.dry_run:
-                print("   would deliver %d @mention(s) to %s (%s)" % (len(items), sess, "; ".join(whys)))
-                continue
-            if not ensure_bridge(sess):
-                print("!! %s: no Remote Control bridge \u2014 delivering anyway" % sess)
+            print("   would deliver %d @mention(s) across %d thread(s) to %s (%s)"
+                  % (len(items), len(by_thread), sess, "; ".join(whys)))
+            continue
+        if not ensure_bridge(sess):
+            print("!! %s: no Remote Control bridge \u2014 delivering anyway" % sess)
+        try:
             deliver(sess, msg)
-            bridge = sessions().get(sess, {}).get("bridge") or ""
-            print("-> %s: delivered %d @mention(s) across %d thread(s)" % (sess, len(items), len(threads)))
-            for c, par, proj, why in items:
-                note("mention", project=proj, thread=str(par.get("id") or ""),
-                     title=par.get("title") or "", session=sess,
-                     frm=(c.get("creator") or {}).get("name") or "", cid=str(c["id"]),
-                     url=c.get("app_url") or "", bridge=bridge, why=why,
-                     text=clip(detag(c.get("content")), HISTLEN))
-        # A held mention must survive to the next sweep. The watermark is a single number
-        # across the whole account, so it can only advance to just below the oldest thing
-        # still waiting — otherwise a busy fallback session silently eats the backlog.
-        if held: newest_m = min(newest_m, min(held) - 1)
-        if not first and newest_m > seen_m:
-            reg["mention_last_id"] = newest_m; dirty = True
+        except Exception as ex:
+            # Batches are delivered in name order, so one bad session used to strand every
+            # session sorted after it. Hold this one, carry on with the rest.
+            print("!! %s: delivery failed (%s) \u2014 holding" % (sess, str(ex)[:120]))
+            note("hold", title=label, session=sess, why="delivery failed")
+            held.extend(int(c["id"]) for c, _, _, _ in items)
+            continue
+        bridge = sessions().get(sess, {}).get("bridge") or ""
+        print("-> %s: delivered %d @mention(s) across %d thread(s)" % (sess, len(items), len(by_thread)))
+        for c, par, proj, why in items:
+            note("mention", project=proj, thread=str(par.get("id") or ""),
+                 title=par.get("title") or "", session=sess,
+                 frm=(c.get("creator") or {}).get("name") or "", cid=str(c["id"]),
+                 url=c.get("app_url") or "", bridge=bridge, why=why,
+                 text=clip(detag(c.get("content")), HISTLEN))
 
-    # --dry-run must not move a watermark. It did, which meant a dry run silently consumed
-    # the very backlog it was supposed to preview.
+    # A held mention must survive to the next sweep. The watermark is one number across the
+    # account, so it can only advance to just below the oldest thing still waiting.
+    if held: newest_m = min(newest_m, min(held) - 1)
+    if not first and newest_m > seen_m:
+        reg["mention_last_id"] = newest_m; dirty = True
+
     if a.dry_run:
         if dirty: print("   (dry run \u2014 watermarks left untouched)")
     elif dirty or len(reg["parents"]) != cached:
@@ -794,7 +789,6 @@ def cmd_post(a):
                    title=(d.get("parent") or {}).get("title") or "Message Board",
                    url=(d.get("parent") or {}).get("app_url") or "")
     rec.setdefault("ours", []).append(int(d["id"]))
-    if not rec.get("last_message_id"): rec["last_message_id"] = int(d["id"])
     save(reg)
     note("sent", project=project, place=board, thread=str(d["id"]),
          title=a.subject, session=sess, cid=str(d["id"]),
@@ -909,6 +903,77 @@ def cmd_ping_link(a):
     print("ping circle %s now routes to %s" % (a.circle, label_session(sess)))
 
 
+def cmd_orphans(a):
+    """@mentions that arrived somewhere nobody owns."""
+    reg = load()
+    orph = reg.get("orphans") or {}
+    if not orph: print("no unrouted mentions"); return
+    for cid, o in sorted(orph.items(), key=lambda kv: int(kv[0])):
+        print("%-13s %-14s %-34s proj=%-10s %s"
+              % (cid, (o.get("frm") or "?")[:14], (o.get("title") or "?")[:34],
+                 o.get("project") or "?", o.get("url") or ""))
+        print("              %s" % clip(o.get("text"), 160))
+
+
+def cmd_assign(a):
+    """Give an unrouted mention an owner: track its thread, then deliver it there."""
+    reg = load()
+    o = (reg.get("orphans") or {}).get(str(a.cid))
+    if not o: sys.exit("no unrouted mention with id %s" % a.cid)
+    sess = resolve_session(a.session)
+    if not tmux_has(sess): sys.exit("no such session: %s" % a.session)
+    me = whoami(reg); me_id = str(me.get("id") or "")
+    proj, tid = str(o.get("project") or ""), str(o.get("thread") or "")
+
+    d = fetch(proj, tid) if proj and tid else {}
+    register(reg, tid, proj, sess, kind=d.get("type") or o.get("kind") or "",
+             title=d.get("title") or d.get("subject") or o.get("title") or "",
+             url=d.get("app_url") or o.get("url") or "")
+    reg["orphans"].pop(str(a.cid), None)
+    save(reg)
+
+    live = sessions()
+    if not ready(sess, live, "assigned @mention"):
+        print("assigned to %s, but it is not deliverable right now \u2014 re-run "
+              "`bc-threads assign %s %s` when it is idle, or let the thread\u2019s next "
+              "mention carry it." % (label_session(sess), a.cid, a.session))
+        return
+    anchor, hist = history_since_us(proj, tid, me_id, int(a.cid))
+    lines = []
+    if anchor: lines.append('(you last said here: "%s")' % clip(detag(anchor.get("content")), 600))
+    elif hist: lines.append("(you have not posted on this thread before \u2014 recent context)")
+    for h in hist:
+        mark = ">> THE @MENTION >> " if str(h["id"]) == str(a.cid) else ""
+        lines.append('%s%s: "%s"' % (mark, (h.get("creator") or {}).get("name") or "someone",
+                                     clip(detag(h.get("content")), MAXLEN, h.get("app_url") or "")))
+    if not hist:
+        lines.append('>> THE @MENTION >> %s: "%s"' % (o.get("frm") or "someone", o.get("text") or ""))
+    msg = clip("Basecamp \u2014 you have been given this thread by hand: nobody owned it, so it "
+               "waited to be assigned rather than being guessed at. [thread %s \"%s\" \u2014 "
+               "project %s] %s  %s "
+               "It is now tracked to you. Answering keeps it: bc-threads reply %s \"...\". "
+               "If it plainly belongs elsewhere, say so rather than taking it on. %s"
+               % (tid, (o.get("title") or "?")[:60], proj, "  ".join(lines),
+                  o.get("url") or "", tid, HANDLE_RULE), BATCHMAX)
+    ensure_bridge(sess)
+    deliver(sess, msg)
+    bridge = sessions().get(sess, {}).get("bridge") or ""
+    note("mention", project=proj, thread=tid, title=o.get("title") or "", session=sess,
+         frm=o.get("frm") or "", cid=str(a.cid), url=o.get("url") or "", bridge=bridge,
+         why="assigned by hand", text=clip(o.get("text"), HISTLEN))
+    print("assigned %s \u2014 %s now tracks %r" % (a.cid, label_session(sess), (o.get("title") or "")[:40]))
+
+
+def cmd_dismiss(a):
+    reg = load()
+    o = (reg.get("orphans") or {}).pop(str(a.cid), None)
+    if o is None: sys.exit("no unrouted mention with id %s" % a.cid)
+    save(reg)
+    note("dismiss", project=o.get("project") or "", thread=o.get("thread") or "",
+         title=o.get("title") or "", cid=str(a.cid), text="dismissed without assigning")
+    print("dismissed %s (%r) \u2014 nothing tracked" % (a.cid, (o.get("title") or "")[:40]))
+
+
 # ---- housekeeping ---------------------------------------------------------
 def cmd_hooks(a):
     """One webhook per project that has a tracked place; none anywhere else."""
@@ -985,6 +1050,10 @@ sp = sub.add_parser("ping-reply"); sp.add_argument("circle"); sp.add_argument("t
 sp.add_argument("--chat"); sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_ping_reply)
 sp = sub.add_parser("ping-link"); sp.add_argument("circle"); sp.add_argument("session")
 sp.set_defaults(fn=cmd_ping_link)
+sp = sub.add_parser("orphans"); sp.set_defaults(fn=cmd_orphans)
+sp = sub.add_parser("assign"); sp.add_argument("cid"); sp.add_argument("session")
+sp.set_defaults(fn=cmd_assign)
+sp = sub.add_parser("dismiss"); sp.add_argument("cid"); sp.set_defaults(fn=cmd_dismiss)
 sp = sub.add_parser("hooks"); sp.add_argument("--dry-run", action="store_true"); sp.set_defaults(fn=cmd_hooks)
 sp = sub.add_parser("authcheck"); sp.add_argument("--warn-hours", type=float, default=48.0)
 sp.add_argument("--notify", default="_dashboard"); sp.add_argument("-v", "--verbose", action="store_true")

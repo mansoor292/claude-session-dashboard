@@ -330,7 +330,16 @@ function bcState(){
     id, who:t.who||'', session:t.session||'', url:t.url||'', last:t.last_line_id||0,
     bridge:(live[t.session||'_dashboard']||{}).bridge||null, alive:!!live[t.session||'_dashboard']
   }));
-  return {places, pings, hooks, hist, self:reg.self||null};
+  // @mentions that landed where nobody owns anything. Deliberately not auto-routed:
+  // guessing put one client's thread into another client's session, twice.
+  const orphans=Object.entries(reg.orphans||{}).map(([cid,o])=>({
+    cid, project:o.project||'', thread:o.thread||'', title:o.title||'', kind:o.kind||'',
+    frm:o.frm||'', ts:o.ts||0, url:o.url||'', why:o.why||'', suggest:o.suggest||'',
+    text:o.text||''
+  })).sort((a,b)=>b.ts-a.ts);
+  const pickable=sessions().filter(x=>!x.rc).map(x=>({name:x.name,label:x.cname||x.name}))
+    .sort((a,b)=>a.label.localeCompare(b.label));
+  return {places, pings, hooks, hist, orphans, pickable, self:reg.self||null};
 }
 const gb = b => (b/1073741824);
 const fmtGB = b => gb(b).toFixed(1)+'G';
@@ -558,6 +567,18 @@ http.createServer((req,res)=>{
   if(u.pathname==='/api/stats'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(stats())); }
 
   // ---- Monitor page ----
+  if(req.method==='POST'&&(u.pathname==='/api/basecamp/assign'||u.pathname==='/api/basecamp/dismiss')){
+    const cid=(u.searchParams.get('cid')||'').replace(/[^0-9]/g,'');
+    const sess=clean(u.searchParams.get('session')||'');
+    const done=o=>{ res.writeHead(200,{'Content-Type':'application/json'}); res.end(JSON.stringify(o)); };
+    if(!cid) return done({ok:false,err:'missing mention id'});
+    const args=(u.pathname.endsWith('/assign'))?['assign',cid,sess]:['dismiss',cid];
+    if(u.pathname.endsWith('/assign')&&!sess) return done({ok:false,err:'pick a session first'});
+    try{
+      const out=execFileSync('/usr/local/bin/bc-threads',args,{encoding:'utf8',timeout:180000});
+      return done({ok:true,out:out.trim()});
+    }catch(e){ return done({ok:false,err:String((e&&(e.stdout||e.message))||e).trim().slice(0,300)}); }
+  }
   if(req.method==='POST'&&u.pathname==='/api/basecamp/unlink'){
     const kind=(u.searchParams.get('kind')==='ping')?'ping':'thread';
     const id=(u.searchParams.get('id')||'').replace(/[^0-9]/g,'');
@@ -578,6 +599,15 @@ http.createServer((req,res)=>{
       <td>${p.bridge?`<a href="https://claude.ai/code/${esc(p.bridge)}" target=_blank rel=noopener>claude.ai ↗</a>`:'<span class=dim>not bridged</span>'}</td>
       <td class=num>${p.seen}</td>
       <td><button class=unlink data-kind=place data-id="${esc(p.id)}" data-sess="${esc(p.cname||p.session||'')}">untrack</button></td></tr>`).join('');
+    const opts=d.pickable.map(x=>`<option value="${esc(x.name)}">${esc(x.label)}</option>`).join('');
+    const orphanRows=d.orphans.map(o=>`<tr>
+      <td class=cmd>${o.url?`<a href="${esc(o.url)}" target=_blank rel=noopener>${esc(o.title||o.thread)}</a>`:esc(o.title||o.thread)}
+        <div class=dim>${esc(o.kind||'thread')} ${esc(o.thread)} · project ${esc(o.project)} · ${esc(o.why)}</div></td>
+      <td>${esc(o.frm||'—')}<div class=dim>${ago(o.ts)} ago</div></td>
+      <td class=msg>${esc(o.text||'')}</td>
+      <td><select class=pick data-cid="${esc(o.cid)}"><option value="">choose a session…</option>${opts}</select></td>
+      <td><button class=assign data-cid="${esc(o.cid)}">Assign</button>
+          <button class=unlink data-kind=orphan data-id="${esc(o.cid)}">Dismiss</button></td></tr>`).join('');
     const pingRows=d.pings.map(p=>`<tr>
       <td class=cmd>${p.url?`<a href="${esc(p.url)}" target=_blank rel=noopener>${esc(p.id)}</a>`:esc(p.id)}</td>
       <td>${esc(p.who||'—')}</td>
@@ -608,6 +638,10 @@ td.msg .cut{color:#fbbf24}
 .dim{color:#64748b;font-size:11.5px}
 a{color:#7dd3fc;text-decoration:none} a:hover{text-decoration:underline}
 .hookurl{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:#64748b;word-break:break-all}
+.pick{background:rgba(2,6,23,.55);color:#e2e8f0;border:1px solid rgba(148,163,184,.3);border-radius:8px;padding:4px 7px;font-size:11.5px;max-width:190px}
+.assign{background:rgba(45,212,191,.12);border:1px solid rgba(45,212,191,.4);color:#2dd4bf;border-radius:8px;padding:3px 10px;font-size:11.5px;cursor:pointer;margin-right:5px}
+.assign:hover{background:#14b8a6;color:#04211e;border-color:#14b8a6}
+.assign:disabled{opacity:.5;cursor:default}
 .unlink{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.32);color:#f87171;border-radius:8px;padding:3px 10px;font-size:11.5px;cursor:pointer}
 .unlink:hover{background:#ef4444;color:#fff;border-color:#ef4444}
 </style></head><body><div class=wrap>
@@ -617,6 +651,9 @@ a{color:#7dd3fc;text-decoration:none} a:hover{text-decoration:underline}
 <div class=dim style="margin-bottom:6px">A session hears only the places it has spoken in — the board it posted to, the card or to-do it commented on. Everything else in the same project stays silent. Tracking starts on the first post; the webhook is the project's, shared by its places.</div>
 <table><thead><tr><th>Place</th><th>Title</th><th>Session</th><th>Webhook</th><th>Web</th><th>Received</th><th></th></tr></thead><tbody>${placeRows||'<tr><td colspan=7 class=dim>nothing tracked — a place is tracked when a session posts: bc-threads post &lt;project&gt; &lt;subject&gt; &lt;body&gt;, or bc-threads track &lt;recording&gt;</td></tr>'}</tbody></table>
 <div class=hookurl>receiver: ${esc((d.hooks.url||'').replace(/\/[^/]+$/,'/••••••'))} · snapshot ${ago(d.hooks.checked)} ago</div>
+${d.orphans.length?`<h2>Unrouted mentions — pick who takes them</h2>
+<div class=dim style="margin-bottom:6px">The agent was @mentioned somewhere no session owns. Nothing is guessed: assigning tracks that thread to the session you choose and delivers the mention with its history. Dismiss drops it and tracks nothing.</div>
+<table><thead><tr><th>Thread</th><th>From</th><th>What they said</th><th>Session</th><th></th></tr></thead><tbody>${orphanRows}</tbody></table>`:''}
 ${d.pings.length?`<h2>Pings</h2>
 <table><thead><tr><th>Circle</th><th>With</th><th>Session</th><th>Last line</th><th></th></tr></thead><tbody>${pingRows}</tbody></table>`:''}
 <h2>Message history</h2>
@@ -624,9 +661,27 @@ ${d.pings.length?`<h2>Pings</h2>
 </div><script>
 var RELOAD=setTimeout(function(){location.reload();},20000);
 document.addEventListener('click',async function(e){
+  var a=e.target.closest('.assign');
+  if(a){
+    clearTimeout(RELOAD);
+    var sel=document.querySelector('.pick[data-cid="'+CSS.escape(a.dataset.cid)+'"]');
+    var sess=sel?sel.value:'';
+    if(!sess){ alert('Choose a session first.'); RELOAD=setTimeout(function(){location.reload();},20000); return; }
+    a.disabled=true; a.textContent='Assigning\u2026';
+    var r=await(await fetch('/api/basecamp/assign?cid='+encodeURIComponent(a.dataset.cid)+'&session='+encodeURIComponent(sess),{method:'POST'})).json();
+    if(!r.ok){ alert('Could not assign'+(r.err?': '+r.err:'')); a.disabled=false; a.textContent='Assign'; return; }
+    location.reload(); return;
+  }
   var b=e.target.closest('.unlink'); if(!b) return;
   clearTimeout(RELOAD);
   var kind=b.dataset.kind, sess=b.dataset.sess;
+  if(kind==='orphan'){
+    if(!confirm('Dismiss this @mention?\\n\\nIt is dropped from the queue and no thread is tracked. Nobody is told.')){ RELOAD=setTimeout(function(){location.reload();},20000); return; }
+    b.disabled=true; b.textContent='\\u2026';
+    var rd=await(await fetch('/api/basecamp/dismiss?cid='+encodeURIComponent(b.dataset.id),{method:'POST'})).json();
+    if(!rd.ok){ alert('Could not dismiss'+(rd.err?': '+rd.err:'')); b.disabled=false; b.textContent='Dismiss'; return; }
+    location.reload(); return;
+  }
   var msg=(kind==='ping')
     ? 'Unlink this ping from '+(sess||'its session')+'?'
     : 'Stop tracking place '+b.dataset.id+' for '+(sess||'its session')+'?\\n\\nIts replies stop reaching any session. If it is the last place tracked in its project, that project\\u2019s webhook is removed too.\\n\\nTrack it again with: bc-threads track '+b.dataset.id+' <session>';
