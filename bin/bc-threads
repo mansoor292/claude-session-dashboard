@@ -571,9 +571,20 @@ def sweep_lock():
 
 
 def thread_comments(project, thread_id):
-    """Every comment on one thread, oldest first."""
-    d = bc("api", "get", "/buckets/%s/recordings/%s/comments.json" % (project, thread_id), check=False)
-    return sorted(d, key=lambda c: int(c["id"])) if isinstance(d, list) else []
+    """Every comment on one thread, oldest first.
+
+    The API pages at 15 and hands back the OLDEST page first, so a single fetch silently
+    drops the newest comments on any busy thread — a transcript missing exactly the part
+    that matters. Walk the pages.
+    """
+    out = []
+    for pg in range(1, 40):
+        d = bc("api", "get", "/buckets/%s/recordings/%s/comments.json?page=%d"
+               % (project, thread_id, pg), check=False)
+        if not isinstance(d, list) or not d: break
+        out += d
+        if len(d) < 15: break
+    return sorted(out, key=lambda c: int(c["id"]))
 
 
 TRDIR = os.path.expanduser(os.environ.get("BC_TRANSCRIPTS_DIR", "~/.claude/bc-transcripts"))
