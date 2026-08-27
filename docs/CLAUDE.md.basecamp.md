@@ -33,6 +33,11 @@ doing anything. This replaced inlining the conversation and the full instruction
 every delivery: repeated instructions dilute, and sessions were skipping the gates. The
 instructions live here, once; the message only says what is new.
 
+The file is current at the moment you are hit; between hits it does not move, because
+ordinary comments deliver nothing. `bc-threads sync <thread>` (or bare `sync` for all your
+threads) pulls it up to now. **Always sync before you reply** — especially before claiming
+a fix: the person may have added constraints, or answered your question, while you worked.
+
 **Never widen the scope by hand.** Do not track a project, a whole dock tool you have not
 posted in, or a thread someone merely mentioned. If a mention arrives somewhere this box
 does not cover, say so and let the box owner decide — do not go tracking it to "have a look".

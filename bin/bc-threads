@@ -954,6 +954,34 @@ def cmd_ping_link(a):
     print("ping circle %s now routes to %s" % (a.circle, label_session(sess)))
 
 
+def cmd_sync(a):
+    """Pull a thread's transcript up to now — the read end of the subscription.
+
+    Deliveries sync at the moment of the hit, so the file is current when a session is
+    pointed at it. Between hits nothing moves it: ordinary comments deliver nothing by
+    design. This is how a session catches up on its own — say, checking for new replies
+    before it posts, or re-orienting after a long task.
+    """
+    reg = load()
+    if a.recording:
+        rid = recording_id(a.recording)
+        rec = reg["places"].get(rid) or {}
+        proj = str(a.project or rec.get("project") or "")
+        if not proj: sys.exit("unknown project for %s — pass --project" % rid)
+        targets = [(rid, proj, rec.get("title") or "", rec.get("url") or "")]
+    else:
+        targets = [(tid, r.get("project"), r.get("title") or "", r.get("url") or "")
+                   for tid, r in sorted(reg["places"].items())
+                   if "board" not in (r.get("kind") or "").lower()]
+    for tid, proj, title, url in targets:
+        path, first, nnew = sync_transcript(reg, proj, tid, title, url)
+        if nnew:
+            print("%-13s +%d new — read %s from '#### %s'" % (tid, nnew, path, first))
+        else:
+            print("%-13s up to date — %s" % (tid, path))
+    save(reg)
+
+
 def cmd_orphans(a):
     """@mentions that arrived somewhere nobody owns."""
     reg = load()
@@ -1102,6 +1130,8 @@ sp = sub.add_parser("ping-reply"); sp.add_argument("circle"); sp.add_argument("t
 sp.add_argument("--chat"); sp.add_argument("-s", "--session"); sp.set_defaults(fn=cmd_ping_reply)
 sp = sub.add_parser("ping-link"); sp.add_argument("circle"); sp.add_argument("session")
 sp.set_defaults(fn=cmd_ping_link)
+sp = sub.add_parser("sync"); sp.add_argument("recording", nargs="?")
+sp.add_argument("-p", "--project"); sp.set_defaults(fn=cmd_sync)
 sp = sub.add_parser("orphans"); sp.set_defaults(fn=cmd_orphans)
 sp = sub.add_parser("assign"); sp.add_argument("cid"); sp.add_argument("session")
 sp.set_defaults(fn=cmd_assign)
