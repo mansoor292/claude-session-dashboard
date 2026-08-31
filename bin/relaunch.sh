@@ -1,10 +1,15 @@
 #!/bin/bash
 # Restore specific Claude sessions after a reboot. Reads ~/relaunch_sessions.tsv
-# (rows: name<TAB>forked_session_id<TAB>cwd) and resumes each EXISTING session id
+# (rows: name<TAB>session_id<TAB>cwd<TAB>config_dir) and resumes each EXISTING session id
 # via `claude --resume <id> --remote-control '<name>'` WITHOUT --fork-session, so the
 # same online (claude.ai) session reconnects instead of minting a duplicate.
 LOG="$HOME/relaunch.log"
+MANIFEST="$HOME/relaunch_sessions.tsv"
 echo "=== relaunch $(date -u +%FT%TZ) ===" >> "$LOG"
+# manifest-sync rebuilds the manifest from LIVE sessions every few minutes, so any row that
+# fails to restore here is pruned from it within minutes and cannot be retried after that.
+# Keep the boot-time copy so a failed restore is still recoverable by hand.
+cp -f "$MANIFEST" "$MANIFEST.lastboot" 2>/dev/null
 answer_prompts() {
   local name="$1"
   for i in 1 2 3 4 5 6; do
@@ -15,17 +20,24 @@ answer_prompts() {
     if echo "$pane" | grep -qE 'Resume full session|Enter to confirm'; then tmux send-keys -t "$name" Enter; continue; fi
   done
 }
-while IFS=$'\t' read -r name sid cwd; do
+while IFS=$'\t' read -r name sid cwd cfg; do
   [ -z "$name" ] && continue
+  cfg="${cfg:-$HOME/.claude}"                   # pre-4-column manifests are all primary
   if tmux has-session -t "$name" 2>/dev/null; then
     cmd=$(tmux display-message -p -t "$name" '#{pane_current_command}' 2>/dev/null)
     case "$cmd" in claude|node|2.1.*) echo "skip running: $name" >>"$LOG"; continue;;
       *) tmux kill-session -t "$name" 2>/dev/null; echo "cleared stale $cmd: $name" >>"$LOG";; esac
   fi
-  proj="$(echo "$cwd" | sed 's#/#-#g')"
-  [ -f "$HOME/.claude/projects/${proj}/${sid}.jsonl" ] || { echo "MISSING transcript: $name" >>"$LOG"; continue; }
-  tmux new-session -d -s "$name" -c "$cwd" \
+  # Claude mangles every '/', '.' AND '_' of the cwd into '-' for its transcript dir, so a
+  # worktree at ~/Code/.worktrees/repo__wt lives in projects/-home-ubuntu-Code--worktrees-repo--wt.
+  # Substituting only '/' silently missed every worktree session (see app/server.js projDir).
+  proj="$(echo "$cwd" | sed 's#[/._]#-#g')"
+  tx="$cfg/projects/${proj}/${sid}.jsonl"
+  [ -f "$tx" ] || { echo "MISSING transcript: $name ($tx)" >>"$LOG"; continue; }
+  # Non-primary accounts keep their transcripts and credentials in their own config dir.
+  env_args=(); [ "$cfg" = "$HOME/.claude" ] || env_args=(-e "CLAUDE_CONFIG_DIR=$cfg")
+  tmux new-session -d -s "$name" -c "$cwd" "${env_args[@]}" \
     "$HOME/.local/bin/claude --resume $sid --remote-control '$name' --dangerously-skip-permissions"
   answer_prompts "$name"
   echo "restored: $name" >>"$LOG"
-done < "$HOME/relaunch_sessions.tsv"
+done < "$MANIFEST"
