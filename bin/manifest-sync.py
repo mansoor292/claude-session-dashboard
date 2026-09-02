@@ -12,8 +12,21 @@ session launched under one was previously invisible here and never restored.
 Each row carries the owning config dir, which relaunch.sh passes back as
 CLAUDE_CONFIG_DIR.
 """
-import json, glob, os, re
+import json, glob, os, re, sys, time
 HOME = os.path.expanduser("~")
+
+# A restore run rebuilds sessions one at a time and takes minutes. Syncing while one is in
+# flight captures only the sessions restored SO FAR and silently drops the rest from the
+# manifest, so the NEXT restore has no row for them at all — that is how tax-api,
+# plan-engine, test and vto-builder were lost on 2026-09-02. Back off while relaunch.sh
+# holds the lock; the staleness cap keeps a crashed run from freezing the manifest forever.
+LOCK = os.path.join(HOME, ".relaunch-in-progress")
+try:
+    if time.time() - os.path.getmtime(LOCK) < 20 * 60:
+        print("restore in progress — manifest left untouched")
+        sys.exit(0)
+except OSError:
+    pass
 
 def account_dirs():
     """~/.claude plus every logged-in ~/.claude-<name> (mirrors accounts() in app/server.js)."""

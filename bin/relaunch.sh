@@ -5,7 +5,15 @@
 # same online (claude.ai) session reconnects instead of minting a duplicate.
 LOG="$HOME/relaunch.log"
 MANIFEST="$HOME/relaunch_sessions.tsv"
+LOCK="$HOME/.relaunch-in-progress"
 echo "=== relaunch $(date -u +%FT%TZ) ===" >> "$LOG"
+# Hold a lock for the whole run. manifest-sync rebuilds the manifest from LIVE sessions,
+# so a sync landing mid-restore sees only the sessions restored SO FAR and drops the rest.
+# On 2026-09-02 the timer fired 90s into a 22-session restore and pruned the last four
+# (tax-api, plan-engine, test, vto-builder); the next restore had no rows for them and
+# they stayed dead. manifest-sync now backs off while this file is fresh.
+: > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
 # manifest-sync rebuilds the manifest from LIVE sessions every few minutes, so any row that
 # fails to restore here is pruned from it within minutes and cannot be retried after that.
 # Keep the boot-time copy so a failed restore is still recoverable by hand.

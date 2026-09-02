@@ -11,6 +11,14 @@ Group=ubuntu
 Environment=HOME=/home/ubuntu
 Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/ubuntu/relaunch.sh
+# relaunch.sh starts the tmux server, so the server and EVERY claude session it holds
+# land in this unit's cgroup. With the default KillMode=control-group, anything that stops
+# this unit — needrestart after a library upgrade, apt, a manual `systemctl restart` —
+# SIGKILLs every session on the box. That happened on 2026-09-02: unattended-upgrades
+# restarted this unit twice and took all 22 sessions down with it, twice.
+# KillMode=process kills only the main process (relaunch.sh, already exited under
+# RemainAfterExit), leaving the tmux server and its sessions alone.
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target
