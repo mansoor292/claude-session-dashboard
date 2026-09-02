@@ -33,6 +33,7 @@ import json, os, re, subprocess, sys, time, html, argparse, glob, fcntl
 BASECAMP = os.environ.get("BASECAMP_BIN", os.path.expanduser("~/.local/bin/basecamp"))
 TMUX     = os.environ.get("TMUX_BIN", "/usr/bin/tmux")
 SOCKET   = os.environ.get("TMUX_SOCKET", "default")
+ADMIN_SOCKET = os.environ.get("TMUX_ADMIN_SOCKET", "admin")
 STORE    = os.path.expanduser(os.environ.get("BC_THREADS_FILE", "~/.claude/bc-threads.json"))
 HISTORY  = os.path.expanduser(os.environ.get("BC_HISTORY_FILE", "~/.claude/bc-history.jsonl"))
 HOOKSNAP = os.path.expanduser(os.environ.get("BC_HOOKS_FILE", "~/.claude/bc-hooks.json"))
@@ -223,8 +224,21 @@ def label_session(t, to_name=None):
     return ("%s (%s)" % (nm, t)) if nm and nm != t else (t or "-")
 
 
+def socket_for(name):
+    """Which tmux socket holds this session.
+
+    The hidden dashboard control session sits on the `admin` socket on purpose (see
+    bin/dashboard-ctl.sh) so the dashboard never lists or restores it. Every tmux call here
+    used one module-wide socket, which made `_dashboard` — the fallback target for any ping
+    not linked to a checkout — unreachable by construction: the delivery gate reported
+    "not on the default tmux socket", held, and no ping was ever delivered. The `_` name
+    prefix is the marker on both sides.
+    """
+    return ADMIN_SOCKET if (name or "").startswith("_") else SOCKET
+
+
 def tmux_has(name):
-    return subprocess.run([TMUX, "-L", SOCKET, "has-session", "-t", "=" + name],
+    return subprocess.run([TMUX, "-L", socket_for(name), "has-session", "-t", "=" + name],
                           capture_output=True).returncode == 0
 
 
@@ -232,9 +246,10 @@ def ensure_bridge(name, wait=30):
     """Without Remote Control the message lands in the pane but is invisible from
     claude.ai or a phone, so turn it on before delivering rather than after."""
     if sessions().get(name, {}).get("bridge"): return True
-    subprocess.run([TMUX, "-L", SOCKET, "send-keys", "-t", name, "-l", "/remote-control"], check=False)
+    sock = socket_for(name)
+    subprocess.run([TMUX, "-L", sock, "send-keys", "-t", name, "-l", "/remote-control"], check=False)
     time.sleep(0.4)
-    subprocess.run([TMUX, "-L", SOCKET, "send-keys", "-t", name, "Enter"], check=False)
+    subprocess.run([TMUX, "-L", sock, "send-keys", "-t", name, "Enter"], check=False)
     for _ in range(wait):
         time.sleep(1)
         if sessions().get(name, {}).get("bridge"): return True
@@ -244,9 +259,10 @@ def ensure_bridge(name, wait=30):
 def deliver(name, text):
     """Type one line, then Enter. A newline would submit early, so flatten."""
     line = " ".join(text.split())
-    subprocess.run([TMUX, "-L", SOCKET, "send-keys", "-t", name, "-l", line], check=True)
+    sock = socket_for(name)
+    subprocess.run([TMUX, "-L", sock, "send-keys", "-t", name, "-l", line], check=True)
     time.sleep(0.4)
-    subprocess.run([TMUX, "-L", SOCKET, "send-keys", "-t", name, "Enter"], check=True)
+    subprocess.run([TMUX, "-L", sock, "send-keys", "-t", name, "Enter"], check=True)
 
 
 BLOCKED_STATUS = ("busy", "waiting")   # a tool call is running, or a dialog has the keyboard
@@ -261,7 +277,7 @@ def pane_blocked(sess):
     Overlays replace the pane, so ask the pane rather than guessing at status names.
     """
     try:
-        pane = subprocess.run([TMUX, "-L", SOCKET, "capture-pane", "-p", "-t", sess],
+        pane = subprocess.run([TMUX, "-L", socket_for(sess), "capture-pane", "-p", "-t", sess],
                               capture_output=True, text=True, timeout=15).stdout
     except Exception:
         return False                        # cannot tell; status checks still apply
@@ -277,7 +293,7 @@ def ready(sess, live, label):
         print("-- %s: session %s is not running \u2014 holding" % (label, sess))
         note("hold", title=label, session=sess, why="session not running"); return False
     if not tmux_has(sess):
-        print("-- %s: %s is not on the %s tmux socket \u2014 holding" % (label, sess, SOCKET))
+        print("-- %s: %s is not on the %s tmux socket \u2014 holding" % (label, sess, socket_for(sess)))
         note("hold", title=label, session=sess, why="not on this tmux socket"); return False
     st = info.get("status") or ""
     if st in BLOCKED_STATUS:
