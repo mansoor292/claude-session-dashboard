@@ -11,6 +11,14 @@ Group=ubuntu
 Environment=HOME=/home/ubuntu
 Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/ubuntu/session-dashboard/bin/dashboard-ctl.sh
+# dashboard-ctl.sh forks the `admin` tmux server, so that server and the _dashboard session
+# it holds live in THIS unit's cgroup. Under the default KillMode=control-group, anything
+# that stops the unit — needrestart after a library upgrade, apt, a manual restart —
+# SIGKILLs the session. That happened three times in 22 seconds on 2026-09-03.
+# KillMode=process kills only the main process (the script, already exited under
+# RemainAfterExit), leaving the tmux server and the session alone; the has-session guard
+# in the script then makes the restart a no-op. Mirrors claude-restore.service.
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target

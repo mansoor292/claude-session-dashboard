@@ -314,6 +314,13 @@ different people.
   who gets past auth has terminal access to your sessions.
 - `claude ... --dangerously-skip-permissions` is used for unattended spawn/restore.
   That is appropriate only on a host you fully control and trust.
+- **Automatic package updates are disabled** (`apt/20auto-upgrades`, plus the `apt-daily`
+  timers masked). A shared-library upgrade makes needrestart cycle whatever links it, and
+  on this box that is always a unit holding live sessions — it destroyed sessions twice in
+  two days. The needrestart overrides and `KillMode=process` are the targeted fixes; this
+  is the blunt one, and the only layer that also covers a unit nobody has added to the
+  override list yet. **The trade-off is real: nothing patches itself now.** Run
+  `sudo apt update && sudo apt upgrade` by hand, at a time when a restart is acceptable.
 
 ---
 
@@ -325,6 +332,8 @@ bin/                          helper scripts installed to /usr/local/bin and ~
 bin/bc-threads, bin/bc-hook   Basecamp bridge: thread↔session routing, webhook receiver
 docs/CLAUDE.md.basecamp.md    guidance to append to ~/.claude/CLAUDE.md
 systemd/                      unit + timer files
+needrestart/                  keeps library upgrades from restarting session units
+apt/20auto-upgrades           turns automatic package upgrades OFF (see Security notes)
 caddy/Caddyfile.example       reverse proxy + wildcard TLS template
 .env.example                  configurable environment variables
 ```

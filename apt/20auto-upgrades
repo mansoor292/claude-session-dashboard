@@ -1,0 +1,25 @@
+// Automatic package updates are OFF on this box, deliberately.
+//
+// This machine's whole job is long-lived Claude sessions: tmux servers and node processes
+// that hold conversation state in memory for days. Unattended-upgrades cannot upgrade a
+// shared library without needrestart wanting to cycle whatever links it, and on this box
+// that is always a session unit. It cost us:
+//
+//   2026-09-02 06:48 + 06:51  libssh/zlib/util-linux -> claude-restore restarted twice,
+//                             all 22 sessions killed, 4 lost for four hours
+//   2026-09-03 06:33          ncurses/libgcrypt/libevent -> claude-dashboard-ctl restarted
+//                             three times in 22 seconds, two-day dashboard conversation
+//                             replaced by an empty session
+//
+// The needrestart overrides in needrestart/80-claude-sessions.conf and KillMode=process on
+// the units are the targeted fixes; this is the blunt one, and it is the only layer that
+// also covers a unit nobody has thought to add to that list yet — which is precisely how
+// the 2026-09-03 outage happened.
+//
+// TRADE-OFF: security updates are no longer installed on their own. Patch by hand:
+//   sudo apt update && sudo apt upgrade
+// Do it at a time when killing a session is acceptable, and expect needrestart to ask.
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Unattended-Upgrade "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::AutocleanInterval "0";
