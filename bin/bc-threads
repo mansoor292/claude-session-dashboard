@@ -1105,10 +1105,26 @@ def cmd_authcheck(a):
     if ok and hours is not None and hours > a.warn_hours:
         if a.verbose: print("basecamp auth ok \u2014 %.0fh left" % hours)
         return
+
+    # Inside the window (or already expired): try the NON-INTERACTIVE refresh before asking a
+    # human. `auth refresh` renews from the stored refresh token and needs no browser — on
+    # 2026-09-03 it took a token with 15h left back to 336h. Warning without trying it made
+    # token survival depend on someone reading the notice in time, and this timer runs daily:
+    # a token under 24h could lapse before the next warning ever fired, silently stopping
+    # every tracked thread. Only a revoked or expired REFRESH token needs a person now.
+    if not a.no_refresh:
+        bc("auth", "refresh", check=False)
+        d2 = bc("auth", "status", check=False) or {}
+        h2 = parse_duration(d2.get("expires_in"))
+        if d2.get("authenticated") and not d2.get("expired") and h2 is not None and h2 > a.warn_hours:
+            print("basecamp auth refreshed \u2014 %.0fh left (was %.0fh)" % (h2, hours or 0))
+            return
+        # fall through: refresh was refused, or did not buy enough time to clear the window
+    tried = "" if a.no_refresh else " Automatic refresh was tried first and did not help, so this needs a person."
     msg = ("Basecamp auth has EXPIRED \u2014 bc-watch cannot poll and replies are not reaching "
-           "sessions. Run: basecamp auth login (then paste the callback URL here).") if not ok else (
+           "sessions. Run: basecamp auth login (then paste the callback URL here).%s" % tried) if not ok else (
           "Basecamp auth expires in about %.0f hours. Re-auth before it lapses or thread replies "
-          "stop routing: basecamp auth login (then paste the callback URL here)." % (hours or 0))
+          "stop routing: basecamp auth login (then paste the callback URL here).%s" % (hours or 0, tried))
     print("!!", msg)
     live = sessions()
     if a.notify and live.get(a.notify, {}).get("alive") and live[a.notify].get("status") != "busy":
@@ -1154,6 +1170,7 @@ sp.set_defaults(fn=cmd_assign)
 sp = sub.add_parser("dismiss"); sp.add_argument("cid"); sp.set_defaults(fn=cmd_dismiss)
 sp = sub.add_parser("hooks"); sp.add_argument("--dry-run", action="store_true"); sp.set_defaults(fn=cmd_hooks)
 sp = sub.add_parser("authcheck"); sp.add_argument("--warn-hours", type=float, default=48.0)
+sp.add_argument("--no-refresh", action="store_true", help="warn only; never attempt auth refresh")
 sp.add_argument("--notify", default="_dashboard"); sp.add_argument("-v", "--verbose", action="store_true")
 sp.set_defaults(fn=cmd_authcheck)
 
