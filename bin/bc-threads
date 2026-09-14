@@ -610,6 +610,38 @@ def transcript_path(tid):
     return os.path.join(TRDIR, "%s.md" % tid)
 
 
+# The standing rules live HERE, at the top of the thread's own file — not in every delivery.
+# Inlined per delivery they were 342 of a median 647 characters: 52% of every message a session
+# received was a block that never changed and already sat in ~/.claude/CLAUDE.md. Repetition is
+# what diluted them. A session reads this once, when it opens the file to orient.
+HEADER = (
+    "# %s\n\nthread %s · project %s%s\n\n"
+    "Each entry is one Basecamp comment, oldest first. Appended by bc-threads — do not edit.\n"
+    "Reply with `bc-threads reply %s \"...\"` (never the bare basecamp CLI — the wrapper is what\n"
+    "keeps our own posts from being read back to us as new).\n\n"
+    "BEFORE YOU ACT ON ANYTHING HERE:\n"
+    "- If the ask is underspecified — scope, which repo or file, what done looks like, an\n"
+    "  unstated assumption — do NOT start work. Ask on the thread: numbered, specific, all of\n"
+    "  them in ONE reply. Do not ask what reading the code or this file would answer.\n"
+    "- A later entry may supersede an earlier one. Read to the end before replying.\n"
+    "- Never write \"fixed\", \"done\" or \"deployed\" until it is proven on prod; `bc-threads\n"
+    "  reply` refuses the claim without --proven. Questions and \"looking at this now\" can go\n"
+    "  out any time.\n"
+    "Full rules: ~/.claude/CLAUDE.md.\n")
+
+
+def brief_hint(tid):
+    """Point at the distilled brief when bc-epoch has one — goal, decisions, open asks.
+
+    A session re-entering a thread after days needs the settled state more than the raw tail:
+    it is what says an ask is already answered, already asked, or already decided. Silent when
+    the thread has never been briefed, so a delivery never names a command that would error.
+    """
+    if os.path.exists(os.path.expanduser("~/.claude/bc-epochs/%s/state.json" % tid)):
+        return " Brief: bc-epoch show %s." % tid
+    return ""
+
+
 def sync_transcript(reg, project, thread_id, title="", url="", write=True):
     """Append whatever is new on a thread to its transcript file.
 
@@ -630,11 +662,8 @@ def sync_transcript(reg, project, thread_id, title="", url="", write=True):
         return path, (str(fresh[0]["id"]) if fresh else ""), len(fresh)
     if not os.path.exists(path):
         with open(path, "w") as f:
-            f.write("# %s\n\nthread %s · project %s%s\n\nEach entry is one Basecamp "
-                    "comment, oldest first. Appended by bc-threads — do not edit; "
-                    "reply with `bc-threads reply %s \"...\"`.\n"
-                    % (title or "Basecamp thread " + tid, tid, project,
-                       (" · " + url) if url else "", tid))
+            f.write(HEADER % (title or "Basecamp thread " + tid, tid, project,
+                              (" · " + url) if url else "", tid))
     if fresh:
         with open(path, "a") as f:
             for c in fresh:
@@ -729,19 +758,20 @@ def cmd_watch(a):
             if not a.dry_run: dirty = True
             who = ", ".join(sorted({(c.get("creator") or {}).get("name") or "someone"
                                     for c, _ in cs}))
-            marker = ("read from the '#### %s' marker onward" % first_new) if first_new \
-                     else "you have read it all before; the mention is the newest entry"
-            parts.append('[%s on "%s", thread %s: read %s — %d new entr%s, %s]'
-                         % (who, title, tid, path, n_new, "y" if n_new == 1 else "ies", marker))
-        msg = clip("Basecamp — @mentioned %d time(s) across %d thread(s) (%s). %s "
-                   "The transcript file is the conversation — read the new entries "
-                   "before doing anything; a later comment may supersede an earlier one. "
-                   "Reply with bc-threads reply <thread id> \"...\" (that also starts "
-                   "tracking). Handle it per the Basecamp rules in your CLAUDE.md — "
-                   "ask if underspecified, and never claim a fix before the prod-tested "
-                   "gate is green."
-                   % (len(items), len(by_thread), "; ".join(whys), "  ".join(parts)),
-                   BATCHMAX)
+            # Say what is new and where it starts — nothing else. The standing rules are in
+            # the file's own header now; restating them here is what made 52% of a delivery
+            # boilerplate. And a delivery with nothing new must NOT say "read the new
+            # entries": 18 of 173 did exactly that, telling a session to read what did not
+            # exist, which is the contradiction that made these read as noise.
+            where = ("%d new entr%s in %s — read from '#### %s' onward."
+                     % (n_new, "y" if n_new == 1 else "ies", path, first_new)) if first_new \
+                    else ("nothing new in %s — this mention IS the newest entry; read its tail."
+                          % path)
+            parts.append('%s on "%s" (thread %s). %s%s Reply: bc-threads reply %s "..."'
+                         % (who, title, tid, where, brief_hint(tid), tid))
+        head = ("Basecamp — @mentioned %d time(s) across %d thread(s). "
+                % (len(items), len(by_thread))) if len(by_thread) > 1 else "Basecamp — "
+        msg = clip(head + "  ".join(parts), BATCHMAX)
         if a.dry_run:
             print("   would deliver %d @mention(s) across %d thread(s) to %s (%s)"
                   % (len(items), len(by_thread), sess, "; ".join(whys)))
