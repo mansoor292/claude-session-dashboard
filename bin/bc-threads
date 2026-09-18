@@ -802,6 +802,13 @@ def cmd_watch(a):
     if not first and newest_m > seen_m:
         reg["mention_last_id"] = newest_m; dirty = True
 
+    # Parking a mention used to tell nobody. Announce anything newly unrouted in the same
+    # sweep that parked it, so "waiting to be assigned" cannot quietly mean "forgotten".
+    try:
+        if orphan_notice(reg, resolve_session(a.notify), 0.0, dry=a.dry_run): dirty = True   # None/0 both falsy: nothing stamped
+    except Exception as e:
+        print("!! orphan notice failed: %s" % str(e)[:120])
+
     if a.dry_run:
         if dirty: print("   (dry run \u2014 watermarks left untouched)")
     elif dirty or len(reg["parents"]) != cached:
@@ -1054,14 +1061,18 @@ def cmd_assign(a):
     register(reg, tid, proj, sess, kind=d.get("type") or o.get("kind") or "",
              title=d.get("title") or d.get("subject") or o.get("title") or "",
              url=d.get("app_url") or o.get("url") or "")
-    reg["orphans"].pop(str(a.cid), None)
     save(reg)
 
+    # The orphan stays queued until it has actually been DELIVERED. Popping it first and
+    # then discovering the session was busy dropped the mention out of both queues at once:
+    # no longer unrouted, never delivered, and the retry this prints could not work because
+    # the entry it needs was already gone. Hit on 2026-09-18 with Christy's second
+    # Herrschners ask. Tracking the thread above is still right either way.
     live = sessions()
     if not ready(sess, live, "assigned @mention"):
-        print("assigned to %s, but it is not deliverable right now \u2014 re-run "
-              "`bc-threads assign %s %s` when it is idle, or let the thread\u2019s next "
-              "mention carry it." % (label_session(sess), a.cid, a.session))
+        print("%s now tracks the thread, but it is not deliverable right now \u2014 the "
+              "mention stays queued. Re-run `bc-threads assign %s %s` when it is idle."
+              % (label_session(sess), a.cid, a.session))
         return
     path, first_new, n_new = sync_transcript(reg, proj, tid,
                                              o.get("title") or "", o.get("url") or "")
@@ -1080,11 +1091,71 @@ def cmd_assign(a):
                   path, marker, tid), BATCHMAX)
     ensure_bridge(sess)
     deliver(sess, msg)
+    reg["orphans"].pop(str(a.cid), None)      # delivered — only now is it no longer waiting
+    save(reg)
     bridge = sessions().get(sess, {}).get("bridge") or ""
     note("mention", project=proj, thread=tid, title=o.get("title") or "", session=sess,
          frm=o.get("frm") or "", cid=str(a.cid), url=o.get("url") or "", bridge=bridge,
          why="assigned by hand", text=clip(o.get("text"), HISTLEN))
     print("assigned %s \u2014 %s now tracks %r" % (a.cid, label_session(sess), (o.get("title") or "")[:40]))
+
+
+def orphan_notice(reg, notify, warn_hours=0.0, dry=False):
+    """Tell a human that @mentions are waiting, and keep telling them.
+
+    An unrouted mention is parked rather than guessed at — that part is right. What was
+    missing is that parking it told NOBODY: the entry went to the registry and the dashboard
+    page and nothing else, so on 2026-09-18 five were found waiting, the oldest ten days,
+    with two of them people asking twice. Routing is not allowed to guess; noticing is not
+    allowed to stay silent.
+
+    Each orphan carries `notified`. A notice goes out when it has never been announced, or
+    when warn_hours have passed since the last one — so a new arrival is immediate and a
+    stale one nags, without re-announcing every two-minute sweep.
+    """
+    orph = reg.get("orphans") or {}
+    if not orph: return 0
+    now = time.time()
+    due = [(cid, o) for cid, o in orph.items()
+           if not o.get("notified") or (warn_hours and now - o["notified"] >= warn_hours * 3600)]
+    if not due: return 0
+    live = sessions()
+    # None means "could not say it", which is NOT the same as "nothing to say" — reporting
+    # a hold as "none due" would have the log contradict the line above it.
+    if not ready(notify, live, "orphan notice"): return None
+    lines = []
+    for cid, o in sorted(due, key=lambda x: int(x[1].get("ts") or 0)):
+        age = (now - (o.get("ts") or now)) / 86400.0
+        lines.append('%s @mentioned the agent on "%s" (%s, project %s) %s ago, unrouted — %s. '
+                     'Assign with: bc-threads assign %s <session>'
+                     % (o.get("frm") or "someone", (o.get("title") or "?")[:50],
+                        o.get("kind") or "thread", o.get("project") or "?",
+                        ("%.0fd" % age) if age >= 1 else ("%.0fh" % (age * 24)),
+                        ("suggested owner " + o["suggest"]) if o.get("suggest") else "no suggestion",
+                        cid))
+    msg = clip("Basecamp — %d @mention(s) are waiting with no owner and nothing will happen "
+               "until someone assigns them. %s  Full list: bc-threads orphans"
+               % (len(due), "  ".join(lines)), BATCHMAX)
+    if dry:
+        print("   would notify %s:\n%s" % (notify, msg)); return len(due)
+    ensure_bridge(notify)
+    deliver(notify, msg)
+    for cid, o in due: o["notified"] = now
+    return len(due)
+
+
+def cmd_orphancheck(a):
+    reg = load()
+    n = orphan_notice(reg, resolve_session(a.notify), a.warn_hours, dry=a.dry_run)
+    if not a.dry_run: save(reg)
+    orph = reg.get("orphans") or {}
+    if n is None:
+        print("%d unrouted @mention(s) queued — could not reach %s this run, will retry"
+              % (len(orph), a.notify))
+    elif n: print("%s %s about %d unrouted @mention(s)"
+                  % ("would notify" if a.dry_run else "notified", a.notify, n))
+    elif orph: print("%d unrouted @mention(s) queued, none due for a notice yet" % len(orph))
+    elif a.verbose: print("no unrouted @mentions")
 
 
 def cmd_dismiss(a):
@@ -1174,6 +1245,7 @@ sp = sub.add_parser("places"); sp.set_defaults(fn=cmd_places)
 sp = sub.add_parser("watch"); sp.add_argument("--dry-run", action="store_true")
 sp.add_argument("--no-pings", action="store_true"); sp.add_argument("--no-mentions", action="store_true")
 sp.add_argument("--limit", type=int, default=SWEEP)
+sp.add_argument("--notify", default="_dashboard")   # where "nobody owns this" is announced
 sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_watch)
 sp = sub.add_parser("reply"); sp.add_argument("recording"); sp.add_argument("text")
 sp.add_argument("-p", "--project"); sp.add_argument("-s", "--session")
@@ -1195,6 +1267,11 @@ sp.set_defaults(fn=cmd_ping_link)
 sp = sub.add_parser("sync"); sp.add_argument("recording", nargs="?")
 sp.add_argument("-p", "--project"); sp.set_defaults(fn=cmd_sync)
 sp = sub.add_parser("orphans"); sp.set_defaults(fn=cmd_orphans)
+sp = sub.add_parser("orphancheck")
+sp.add_argument("--warn-hours", type=float, default=4.0)
+sp.add_argument("--notify", default="_dashboard")
+sp.add_argument("--dry-run", action="store_true"); sp.add_argument("-v", "--verbose", action="store_true")
+sp.set_defaults(fn=cmd_orphancheck)
 sp = sub.add_parser("assign"); sp.add_argument("cid"); sp.add_argument("session")
 sp.set_defaults(fn=cmd_assign)
 sp = sub.add_parser("dismiss"); sp.add_argument("cid"); sp.set_defaults(fn=cmd_dismiss)

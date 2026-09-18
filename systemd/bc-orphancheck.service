@@ -1,0 +1,13 @@
+[Unit]
+Description=Re-announce Basecamp @mentions that nobody owns
+
+[Service]
+Type=oneshot
+User=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+# bc-watch announces a mention the moment it parks it. This is the second layer: an orphan
+# nobody assigned keeps saying so, every few hours, until someone acts. Without it a parked
+# mention is indistinguishable from a forgotten one — five were found waiting on 2026-09-18,
+# the oldest ten days, two of them from people who had asked twice.
+ExecStart=/usr/local/bin/bc-threads orphancheck --warn-hours 4 --notify _dashboard
