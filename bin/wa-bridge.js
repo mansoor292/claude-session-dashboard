@@ -37,8 +37,9 @@ const RING  = 300;                       // untracked chats: memory only, newest
 mkdirSync(STORE, { recursive: true });
 const log = pino({ level: process.env.WA_LOG || 'warn' });
 
-let sock = null, qr = null, me = null, connected = false, lastErr = null;
+let sock = null, qr = null, qrAscii = null, me = null, connected = false, lastErr = null;
 const recent = [];                       // {jid,name,ts,fromMe,text} — for `chats`, not persisted
+const seenTypes = process.env.WA_TRACE === '1';   // log every upsert while diagnosing
 
 const tracked = () => {
   try { return JSON.parse(readFileSync(REG, 'utf8')).chats || {}; } catch { return {}; }
@@ -61,10 +62,20 @@ function record(m) {
     ts: Number(m.messageTimestamp) || Math.floor(Date.now() / 1000),
     text: textOf(m),
   };
-  if (!row.text) return;                                   // reactions, receipts, protocol noise
+  if (!row.text) {
+    if (seenTypes) console.log('dropped (no text) from %s keys=%s', jid,
+                               Object.keys(m.message || {}).join(','));
+    return;                                                // reactions, receipts, protocol noise
+  }
+  if (seenTypes) console.log('recorded %s from %s (%d chars)', row.id, row.jid, row.text.length);
   recent.unshift(row); if (recent.length > RING) recent.pop();
   // Disk is for tracked chats only — see PRIVACY above.
-  if (tracked()[jid]) appendFileSync(join(STORE, safeJid(jid) + '.ndjson'), JSON.stringify(row) + '\n');
+  if (tracked()[jid]) {
+    const f = join(STORE, safeJid(jid) + '.ndjson');
+    const isNew = !existsSync(f);
+    appendFileSync(f, JSON.stringify(row) + '\n');
+    if (isNew) chmodSync(f, 0o600);      // conversation content: owner-only, not just dir-protected
+  }
 }
 
 async function start() {
@@ -74,9 +85,15 @@ async function start() {
                         markOnlineOnConnect: false });   // stay invisible; do not steal presence
   sock.ev.on('creds.update', saveCreds);
   sock.ev.on('connection.update', (u) => {
-    if (u.qr) { qr = u.qr; qrcode.generate(u.qr, { small: true }); }
+    if (u.qr) {
+      qr = u.qr;
+      // Render once and keep the art, so `wa-threads link` can print it at the prompt where
+      // the person actually is. Sending them to journalctl for a code that rotates every
+      // ~20s is a bad way to ask someone to scan something.
+      qrcode.generate(u.qr, { small: true }, (art) => { qrAscii = art; console.log(art); });
+    }
     if (u.connection === 'open') {
-      connected = true; qr = null; lastErr = null;
+      connected = true; qr = null; qrAscii = null; lastErr = null;
       me = jidNormalizedUser(sock.user?.id || '');
       console.log('connected as', me);
     }
@@ -89,9 +106,16 @@ async function start() {
       setTimeout(start, 3000);
     }
   });
+  // 'notify' is someone messaging you; 'append' is your OWN message arriving from another
+  // device (your phone). Taking only 'notify' made the bridge look dead when the obvious way
+  // to test it — send yourself something — produced nothing at all. 'set' is the history
+  // replay on connect and stays excluded: linking should not dump the whole backlog.
   sock.ev.on('messages.upsert', ({ messages, type }) => {
-    if (type !== 'notify') return;                         // skip history replays on reconnect
-    for (const m of messages) { try { record(m); } catch (e) { log.warn(e); } }
+    if (seenTypes) console.log('upsert type=%s count=%d', type, messages.length);
+    if (type !== 'notify' && type !== 'append') return;
+    for (const m of messages) {
+      try { record(m); } catch (e) { console.error('record failed:', e.message); }
+    }
   });
 }
 
@@ -105,7 +129,7 @@ const server = createServer(async (req, res) => {
   try {
     if (u.pathname === '/status')
       return json(res, 200, { connected, me, qr: qr ? true : false, lastErr, sock: SOCK });
-    if (u.pathname === '/qr')  return json(res, 200, { qr });
+    if (u.pathname === '/qr')  return json(res, 200, { qr, ascii: qrAscii, connected });
     if (u.pathname === '/chats') {
       const seen = new Map();
       for (const r of recent) if (!seen.has(r.jid)) seen.set(r.jid, r);

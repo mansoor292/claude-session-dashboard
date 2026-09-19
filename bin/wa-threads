@@ -128,13 +128,24 @@ def sync_one(reg, jid):
 
 
 # ---- tmux delivery (same discipline as bc-threads: hold rather than type into a busy pane)
+def socket_for(sess):
+    """Which tmux socket holds this session.
+
+    A bare `tmux` inherits $TMUX, so a command run from INSIDE a session on the admin socket
+    looks for every other session there and finds none — `wa-threads track whatsapp` reported
+    "no such tmux session" for a session that was plainly running. bc-threads learned this the
+    same way; the `_` prefix is the box's marker for the hidden admin-socket sessions.
+    """
+    return "admin" if str(sess or "").startswith("_") else "default"
+
+
 def tmux_has(sess):
-    return subprocess.run([TMUX, "has-session", "-t", sess],
+    return subprocess.run([TMUX, "-L", socket_for(sess), "has-session", "-t", sess],
                           capture_output=True).returncode == 0
 
 
 def pane_busy(sess):
-    p = subprocess.run([TMUX, "capture-pane", "-p", "-t", sess, "-S", "-8"],
+    p = subprocess.run([TMUX, "-L", socket_for(sess), "capture-pane", "-p", "-t", sess, "-S", "-8"],
                        capture_output=True, text=True).stdout
     return bool(re.search(r"esc to interrupt|Compacting conversation|Paste code here|"
                           r"Yes, I accept|trust this folder", p, re.I))
@@ -142,9 +153,10 @@ def pane_busy(sess):
 
 def deliver(sess, text):
     line = " ".join(text.split())
-    subprocess.run([TMUX, "send-keys", "-t", sess, "-l", line], check=True)
+    sock = socket_for(sess)
+    subprocess.run([TMUX, "-L", sock, "send-keys", "-t", sess, "-l", line], check=True)
     time.sleep(0.4)
-    subprocess.run([TMUX, "send-keys", "-t", sess, "Enter"], check=True)
+    subprocess.run([TMUX, "-L", sock, "send-keys", "-t", sess, "Enter"], check=True)
 
 
 def cmd_status(a):
@@ -157,16 +169,21 @@ def cmd_status(a):
 
 
 def cmd_link(a):
-    s = api("/status")
-    if s.get("connected"):
-        print("already linked as %s — nothing to do" % s.get("me")); return
-    print("Scan this from WhatsApp on your phone: Settings -> Linked devices -> Link a device.")
-    print("The QR is printed in the bridge log: journalctl -u wa-bridge -f")
+    """Print the pairing QR right here, and keep printing as it rotates."""
+    if api("/status").get("connected"):
+        print("already linked as %s — nothing to do" % api("/status").get("me")); return
+    print("WhatsApp on your phone: Settings -> Linked devices -> Link a device, then scan:\n")
+    seen = None
     for _ in range(a.wait):
+        q = api("/qr")
+        if q.get("connected") or api("/status").get("connected"):
+            print("\nlinked as %s" % api("/status").get("me")); return
+        if q.get("ascii") and q["ascii"] != seen:
+            seen = q["ascii"]
+            print(q["ascii"])
+            print("(this code rotates every ~20s — a fresh one will print below if it expires)\n")
         time.sleep(3)
-        if api("/status").get("connected"):
-            print("linked as %s" % api("/status").get("me")); return
-    print("still not linked — the QR rotates, so re-run this if it expired")
+    print("not linked yet. The bridge is still running; re-run `wa-threads link` to try again.")
 
 
 def cmd_chats(a):
