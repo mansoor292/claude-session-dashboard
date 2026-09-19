@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll for new WhatsApp messages in tracked chats
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

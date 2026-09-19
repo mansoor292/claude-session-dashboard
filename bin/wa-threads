@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""wa-threads — route WhatsApp chats to ONE Claude session.
+
+The Basecamp shape, kept deliberately: the bridge owns the connection, this owns routing,
+transcripts and delivery. Silence is the default — a chat reaches a session only after it is
+explicitly tracked, so linking a personal account does not dump family chat into a worktree.
+
+  wa-threads link                 show the QR to pair this box with your phone
+  wa-threads status               bridge + account state
+  wa-threads chats                recent chats seen, so you can pick ones to track
+  wa-threads track <jid> [sess]   bind a chat to a session (default: the whatsapp session)
+  wa-threads untrack <jid>        stop tracking it
+  wa-threads places               what is tracked, and where it routes
+  wa-threads sync [jid]           pull new messages into ~/.claude/wa-transcripts/<jid>.md
+  wa-threads watch                deliver anything new into the bound session
+  wa-threads reply <jid> "text"   send (our own sends are never read back to us)
+"""
+import argparse, http.client, json, os, re, socket, subprocess, sys, time
+
+HOME  = os.path.expanduser("~")
+REG   = os.path.join(HOME, ".claude", "wa-threads.json")
+STORE = os.path.join(HOME, ".claude", "wa-store")
+TRDIR = os.path.join(HOME, ".claude", "wa-transcripts")
+SOCK  = os.environ.get("WA_SOCK", os.path.join(HOME, ".claude", "wa-bridge.sock"))
+TMUX  = "/usr/bin/tmux"
+DEFAULT_SESSION = os.environ.get("WA_SESSION", "whatsapp")
+
+
+class _UnixHTTP(http.client.HTTPConnection):
+    """The bridge speaks HTTP over a unix socket — no TCP port for Caddy to publish.
+
+    Binding 127.0.0.1 looked safe and was not: this box proxies every local port to
+    https://p<port>.dev.catalogshub.com with no auth, and the first cut of the bridge
+    answered there from the open internet.
+    """
+    def __init__(self, path, timeout=20):
+        super().__init__("localhost", timeout=timeout); self.path_ = path
+    def connect(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(self.timeout); s.connect(self.path_); self.sock = s
+
+
+def api(path, payload=None, timeout=20):
+    body = json.dumps(payload) if payload is not None else None
+    try:
+        c = _UnixHTTP(SOCK, timeout)
+        c.request("POST" if body else "GET", path, body=body,
+                  headers={"Content-Type": "application/json"} if body else {})
+        r = c.getresponse(); data = r.read().decode() or "{}"
+        c.close()
+        return json.loads(data)
+    except (FileNotFoundError, ConnectionRefusedError):
+        sys.exit("wa-bridge is not running (no socket at %s) \u2014 systemctl status wa-bridge" % SOCK)
+    except Exception as e:
+        sys.exit("wa-bridge error: %s" % str(e)[:160])
+
+
+def load():
+    try:
+        with open(REG) as f: reg = json.load(f)
+    except Exception:
+        reg = {}
+    reg.setdefault("chats", {})        # jid -> {session, name, last_id, added}
+    return reg
+
+
+def save(reg):
+    os.makedirs(os.path.dirname(REG), exist_ok=True)
+    tmp = REG + ".tmp"
+    with open(tmp, "w") as f: json.dump(reg, f, indent=1)
+    os.replace(tmp, REG)
+    os.chmod(REG, 0o600)               # it names who you talk to; keep it to this user
+
+
+def safe(jid): return re.sub(r"[^A-Za-z0-9._@-]", "_", str(jid or ""))
+def tpath(jid): return os.path.join(TRDIR, safe(jid) + ".md")
+def spath(jid): return os.path.join(STORE, safe(jid) + ".ndjson")
+
+
+def rows(jid):
+    """Everything the bridge has written for this chat, oldest first."""
+    p = spath(jid)
+    if not os.path.exists(p): return []
+    out = []
+    for line in open(p, encoding="utf-8", errors="replace"):
+        try: out.append(json.loads(line))
+        except Exception: continue
+    return out
+
+
+HEADER = (
+    "# WhatsApp — %s\n\n%s\n\n"
+    "Each entry is one message, oldest first. Appended by wa-threads — do not edit.\n"
+    "Reply with `wa-threads reply %s \"...\"` (never send by any other route: the wrapper is\n"
+    "what keeps our own messages from being read back to us as new).\n\n"
+    "BEFORE YOU ACT ON ANYTHING HERE:\n"
+    "- This is a person's real WhatsApp. Messages are informal, often incomplete, and may\n"
+    "  arrive in pieces. Read to the end before replying; a later line may change the ask.\n"
+    "- If the ask is underspecified, ask back rather than guessing.\n"
+    "- Never claim something is done until it is actually done and verified.\n"
+    "Full rules: ~/.claude/CLAUDE.md.\n")
+
+
+def sync_one(reg, jid):
+    """Append anything new to the transcript. Returns (path, first_new_id, n_new)."""
+    rec = reg["chats"].get(jid) or {}
+    last = rec.get("last_id") or ""
+    all_rows = rows(jid)
+    idx = 0
+    if last:
+        for i, r in enumerate(all_rows):
+            if r.get("id") == last: idx = i + 1; break
+    fresh = all_rows[idx:]
+    os.makedirs(TRDIR, exist_ok=True)
+    p = tpath(jid)
+    if not os.path.exists(p):
+        with open(p, "w") as f:
+            f.write(HEADER % (rec.get("name") or jid, jid, jid))
+    if fresh:
+        with open(p, "a") as f:
+            for r in fresh:
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r.get("ts") or 0))
+                who = "us" if r.get("fromMe") else (r.get("from") or "them")
+                f.write("\n#### %s · %s · %s\n\n%s\n" % (r.get("id"), who, when, r.get("text") or ""))
+        rec["last_id"] = fresh[-1]["id"]
+        reg["chats"][jid] = rec
+    return p, (fresh[0]["id"] if fresh else ""), len(fresh)
+
+
+# ---- tmux delivery (same discipline as bc-threads: hold rather than type into a busy pane)
+def tmux_has(sess):
+    return subprocess.run([TMUX, "has-session", "-t", sess],
+                          capture_output=True).returncode == 0
+
+
+def pane_busy(sess):
+    p = subprocess.run([TMUX, "capture-pane", "-p", "-t", sess, "-S", "-8"],
+                       capture_output=True, text=True).stdout
+    return bool(re.search(r"esc to interrupt|Compacting conversation|Paste code here|"
+                          r"Yes, I accept|trust this folder", p, re.I))
+
+
+def deliver(sess, text):
+    line = " ".join(text.split())
+    subprocess.run([TMUX, "send-keys", "-t", sess, "-l", line], check=True)
+    time.sleep(0.4)
+    subprocess.run([TMUX, "send-keys", "-t", sess, "Enter"], check=True)
+
+
+def cmd_status(a):
+    s = api("/status")
+    print("  bridge   : %s (socket %s)" % ("connected" if s.get("connected") else "NOT connected", SOCK))
+    print("  account  : %s" % (s.get("me") or "(not linked)"))
+    if s.get("qr"): print("  a QR is waiting — run `wa-threads link`")
+    if s.get("lastErr"): print("  last error: %s" % s["lastErr"])
+    reg = load(); print("  tracked  : %d chat(s)" % len(reg["chats"]))
+
+
+def cmd_link(a):
+    s = api("/status")
+    if s.get("connected"):
+        print("already linked as %s — nothing to do" % s.get("me")); return
+    print("Scan this from WhatsApp on your phone: Settings -> Linked devices -> Link a device.")
+    print("The QR is printed in the bridge log: journalctl -u wa-bridge -f")
+    for _ in range(a.wait):
+        time.sleep(3)
+        if api("/status").get("connected"):
+            print("linked as %s" % api("/status").get("me")); return
+    print("still not linked — the QR rotates, so re-run this if it expired")
+
+
+def cmd_chats(a):
+    for c in api("/chats"):
+        when = time.strftime("%m-%d %H:%M", time.localtime(c.get("ts") or 0))
+        print("%-34s %-16s %s  %s" % (c.get("jid"), (c.get("from") or "")[:16], when,
+                                      (c.get("text") or "")[:60]))
+
+
+def cmd_track(a):
+    reg = load()
+    sess = a.session or DEFAULT_SESSION
+    if not tmux_has(sess): sys.exit("no such tmux session: %s" % sess)
+    rec = reg["chats"].setdefault(a.jid, {})
+    rec.update(session=sess, name=a.name or rec.get("name") or a.jid,
+               added=rec.get("added") or int(time.time()))
+    save(reg)
+    print("tracking %s -> %s" % (a.jid, sess))
+
+
+def cmd_untrack(a):
+    reg = load()
+    if reg["chats"].pop(a.jid, None) is None: sys.exit("not tracked: %s" % a.jid)
+    save(reg); print("untracked %s (transcript kept)" % a.jid)
+
+
+def cmd_places(a):
+    reg = load()
+    if not reg["chats"]: print("nothing tracked"); return
+    for jid, r in sorted(reg["chats"].items()):
+        alive = "alive" if tmux_has(r.get("session") or "") else "MISSING"
+        print("%-34s -> %-16s [%s]  %s" % (jid, r.get("session"), alive, r.get("name") or ""))
+
+
+def cmd_sync(a):
+    reg = load()
+    targets = [a.jid] if a.jid else list(reg["chats"])
+    for jid in targets:
+        p, first, n = sync_one(reg, jid)
+        print("%-34s %s" % (jid, ("+%d new — read %s from '#### %s'" % (n, p, first)) if n
+                            else "up to date — %s" % p))
+    save(reg)
+
+
+def cmd_watch(a):
+    reg = load()
+    by_sess = {}
+    for jid, r in reg["chats"].items():
+        p, first, n = sync_one(reg, jid)
+        if not n: continue
+        # Our own outbound messages come back through the socket; they are not news.
+        if not any(not x.get("fromMe") for x in rows(jid)[-n:]): continue
+        by_sess.setdefault(r.get("session"), []).append((jid, r, p, first, n))
+    save(reg)
+    for sess, items in by_sess.items():
+        if not sess or not tmux_has(sess):
+            print("-- %s: session missing — holding" % sess); continue
+        if pane_busy(sess):
+            print("-- %s: busy — holding" % sess); continue
+        parts = ["%s (%s): %d new message(s) in %s — read from '#### %s' onward. Reply: "
+                 "wa-threads reply %s \"...\"" % (r.get("name") or jid, jid, n, p, first, jid)
+                 for jid, r, p, first, n in items]
+        if a.dry_run:
+            print("   would deliver to %s: %s" % (sess, "  ".join(parts))); continue
+        deliver(sess, "WhatsApp — " + "  ".join(parts))
+        print("-> %s: delivered %d chat(s)" % (sess, len(items)))
+
+
+def cmd_reply(a):
+    r = api("/send", {"chat": a.jid, "text": a.text})
+    if not r.get("ok"): sys.exit("send failed: %s" % r.get("err"))
+    print("sent to %s (id %s)" % (a.jid, r.get("id")))
+
+
+p = argparse.ArgumentParser(prog="wa-threads", description=__doc__,
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
+sub = p.add_subparsers(dest="cmd", required=True)
+sp = sub.add_parser("status"); sp.set_defaults(fn=cmd_status)
+sp = sub.add_parser("link"); sp.add_argument("--wait", type=int, default=40); sp.set_defaults(fn=cmd_link)
+sp = sub.add_parser("chats"); sp.set_defaults(fn=cmd_chats)
+sp = sub.add_parser("track"); sp.add_argument("jid"); sp.add_argument("session", nargs="?")
+sp.add_argument("--name"); sp.set_defaults(fn=cmd_track)
+sp = sub.add_parser("untrack"); sp.add_argument("jid"); sp.set_defaults(fn=cmd_untrack)
+sp = sub.add_parser("places"); sp.set_defaults(fn=cmd_places)
+sp = sub.add_parser("sync"); sp.add_argument("jid", nargs="?"); sp.set_defaults(fn=cmd_sync)
+sp = sub.add_parser("watch"); sp.add_argument("--dry-run", action="store_true"); sp.set_defaults(fn=cmd_watch)
+sp = sub.add_parser("reply"); sp.add_argument("jid"); sp.add_argument("text"); sp.set_defaults(fn=cmd_reply)
+
+a = p.parse_args()
+a.fn(a)

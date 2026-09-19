@@ -1,0 +1,9 @@
+[Unit]
+Description=Deliver new WhatsApp messages into the session that owns the chat
+
+[Service]
+Type=oneshot
+User=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/wa-threads watch

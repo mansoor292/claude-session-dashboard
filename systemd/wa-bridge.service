@@ -1,0 +1,26 @@
+[Unit]
+Description=WhatsApp bridge for one Claude session (local only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/home/ubuntu/.claude/wa-bridge
+ExecStart=/usr/bin/node /home/ubuntu/.claude/wa-bridge/wa-bridge.js
+Restart=on-failure
+RestartSec=5
+# No IPAddress* filtering here: the bridge must reach WhatsApp's servers, and denying
+# non-local egress simply broke the connection ("WebSocket Error ()"). Exposure is handled
+# the right way instead — it listens on a unix socket, so there is no port for this box's
+# wildcard proxy to publish.
+# Credentials are a live WhatsApp session: anything that can read wa-auth can be you.
+ReadWritePaths=/home/ubuntu/.claude/wa-auth /home/ubuntu/.claude/wa-store
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
