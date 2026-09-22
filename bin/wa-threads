@@ -72,6 +72,20 @@ def save(reg):
     os.chmod(REG, 0o600)               # it names who you talk to; keep it to this user
 
 
+def norm_jid(v):
+    """Accept a bare phone number as well as a full jid.
+
+    The 1:1 chat list only arrives during pairing, so listing every conversation is not
+    always possible — but you already know the number you want. `track 12025550123` and
+    `track +1 202 555 0123` both resolve to 12025550123@s.whatsapp.net.
+    """
+    v = str(v or "").strip()
+    if "@" in v: return v
+    digits = re.sub(r"[^0-9]", "", v)
+    if not digits: sys.exit("not a phone number or jid: %r" % v)
+    return digits + "@s.whatsapp.net"
+
+
 def safe(jid): return re.sub(r"[^A-Za-z0-9._@-]", "_", str(jid or ""))
 def tpath(jid): return os.path.join(TRDIR, safe(jid) + ".md")
 def spath(jid): return os.path.join(STORE, safe(jid) + ".ndjson")
@@ -187,13 +201,30 @@ def cmd_link(a):
 
 
 def cmd_chats(a):
-    for c in api("/chats"):
-        when = time.strftime("%m-%d %H:%M", time.localtime(c.get("ts") or 0))
-        print("%-34s %-16s %s  %s" % (c.get("jid"), (c.get("from") or "")[:16], when,
-                                      (c.get("text") or "")[:60]))
+    """Your actual WhatsApp chat list, newest first — what you pick from to track."""
+    chats = api("/groups" if a.groups else "/chats?groups=1")
+    if not chats:
+        print("nothing listable yet. Groups fetch on demand; 1:1 chats only arrive during the\n"
+              "app-state sync at pairing, so if none show, track by number instead:\n"
+              "  wa-threads track 12025550123")
+        return
+    reg = load()
+    n = 0
+    for c in chats:
+        if a.all is False and n >= a.limit: break
+        jid = c.get("jid") or ""
+        when = time.strftime("%m-%d %H:%M", time.localtime(c["ts"])) if c.get("ts") else "  -  "
+        mark = "*" if jid in reg["chats"] else " "
+        unread = ("%d" % c["unread"]) if c.get("unread") else ""
+        print("%s %-36s %-22s %s %3s  %s" % (mark, jid, (c.get("name") or "")[:22], when,
+                                             unread, (c.get("text") or "")[:44]))
+        n += 1
+    print("\n  * = already tracked · %d chat(s)%s" %
+          (len(chats), "" if a.all else " (showing %d, --all for the rest)" % n))
 
 
 def cmd_track(a):
+    a.jid = norm_jid(a.jid)
     reg = load()
     sess = a.session or DEFAULT_SESSION
     if not tmux_has(sess): sys.exit("no such tmux session: %s" % sess)
@@ -205,6 +236,7 @@ def cmd_track(a):
 
 
 def cmd_untrack(a):
+    a.jid = norm_jid(a.jid)
     reg = load()
     if reg["chats"].pop(a.jid, None) is None: sys.exit("not tracked: %s" % a.jid)
     save(reg); print("untracked %s (transcript kept)" % a.jid)
@@ -252,7 +284,23 @@ def cmd_watch(a):
         print("-> %s: delivered %d chat(s)" % (sess, len(items)))
 
 
+def cmd_history(a):
+    """Ask the phone for older messages in one chat.
+
+    Only works from an anchor we already hold, and only while the phone is online — it is the
+    phone that answers, not WhatsApp's servers. A chat we have never seen a message in cannot
+    be back-filled until someone posts.
+    """
+    a.jid = norm_jid(a.jid)
+    r = api("/history", {"chat": a.jid, "count": a.count})
+    if not r.get("ok"): sys.exit("history request failed: %s" % r.get("err"))
+    print("requested %d older message(s) for %s (anchor %s)" % (a.count, a.jid, r.get("anchor")))
+    print("  %s" % r.get("note", ""))
+    print("  then: wa-threads sync %s" % a.jid)
+
+
 def cmd_reply(a):
+    a.jid = norm_jid(a.jid)
     r = api("/send", {"chat": a.jid, "text": a.text})
     if not r.get("ok"): sys.exit("send failed: %s" % r.get("err"))
     print("sent to %s (id %s)" % (a.jid, r.get("id")))
@@ -263,13 +311,17 @@ p = argparse.ArgumentParser(prog="wa-threads", description=__doc__,
 sub = p.add_subparsers(dest="cmd", required=True)
 sp = sub.add_parser("status"); sp.set_defaults(fn=cmd_status)
 sp = sub.add_parser("link"); sp.add_argument("--wait", type=int, default=40); sp.set_defaults(fn=cmd_link)
-sp = sub.add_parser("chats"); sp.set_defaults(fn=cmd_chats)
+sp = sub.add_parser("chats"); sp.add_argument("--all", action="store_true")
+sp.add_argument("--groups", action="store_true", help="groups only")
+sp.add_argument("-n", "--limit", type=int, default=40); sp.set_defaults(fn=cmd_chats)
 sp = sub.add_parser("track"); sp.add_argument("jid"); sp.add_argument("session", nargs="?")
 sp.add_argument("--name"); sp.set_defaults(fn=cmd_track)
 sp = sub.add_parser("untrack"); sp.add_argument("jid"); sp.set_defaults(fn=cmd_untrack)
 sp = sub.add_parser("places"); sp.set_defaults(fn=cmd_places)
 sp = sub.add_parser("sync"); sp.add_argument("jid", nargs="?"); sp.set_defaults(fn=cmd_sync)
 sp = sub.add_parser("watch"); sp.add_argument("--dry-run", action="store_true"); sp.set_defaults(fn=cmd_watch)
+sp = sub.add_parser("history"); sp.add_argument("jid")
+sp.add_argument("-n", "--count", type=int, default=50); sp.set_defaults(fn=cmd_history)
 sp = sub.add_parser("reply"); sp.add_argument("jid"); sp.add_argument("text"); sp.set_defaults(fn=cmd_reply)
 
 a = p.parse_args()

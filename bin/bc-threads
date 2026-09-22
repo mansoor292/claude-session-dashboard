@@ -406,6 +406,18 @@ def place_for(reg, comment):
     return None, None
 
 
+def superseded_by(thread_id):
+    """The thread this one was cut into, per bc-epoch's lineage — or "" if it stands alone.
+
+    Read-only and best-effort: bc-threads must keep working with no bc-epoch state on disk.
+    """
+    p = os.path.expanduser("~/.claude/bc-epochs/%s/state.json" % str(thread_id))
+    try:
+        with open(p) as f: return str(json.load(f).get("supersededBy") or "")
+    except Exception:
+        return ""
+
+
 def nearest_session(reg, project, thread_id):
     """The session closest to where we were mentioned, walking outward.
 
@@ -421,6 +433,15 @@ def nearest_session(reg, project, thread_id):
         rec = reg["places"].get(gid)
         if rec and rec.get("session"):
             return rec["session"], "it tracks the board this thread is on", True
+    # An epoch cut untracks the old thread — but people keep replying on it. Pamela commented
+    # on "plan builder v2" a fortnight after it was superseded by v3, and with the old thread
+    # untracked the fallback guessed vto-builder, the COACHING session: not a near miss, a
+    # different product. Lineage is recorded, so follow it instead of guessing.
+    succ = superseded_by(thread_id)
+    if succ:
+        rec = reg["places"].get(str(succ))
+        if rec and rec.get("session"):
+            return rec["session"], "this thread was superseded by %s, which it owns" % succ, True
     # Past this point nobody owns it and every answer is a guess. Guessing put one client's
     # thread into another client's session twice. An unowned mention is queued for a human
     # to assign instead \u2014 see `bc-threads orphans` and the Basecamp page.

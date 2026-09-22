@@ -38,7 +38,9 @@ mkdirSync(STORE, { recursive: true });
 const log = pino({ level: process.env.WA_LOG || 'warn' });
 
 let sock = null, qr = null, qrAscii = null, me = null, connected = false, lastErr = null;
-const recent = [];                       // {jid,name,ts,fromMe,text} — for `chats`, not persisted
+const recent = [];                       // {jid,name,ts,fromMe,text} — newest message per chat
+const chatList = new Map();              // jid -> {jid,name,ts,unread}  the REAL chat list
+const contacts = new Map();              // jid -> best known display name
 const seenTypes = process.env.WA_TRACE === '1';   // log every upsert while diagnosing
 
 const tracked = () => {
@@ -78,12 +80,68 @@ function record(m) {
   }
 }
 
+const nameFor = (jid) => contacts.get(jid)
+  || chatList.get(jid)?.name
+  || String(jid || '').split('@')[0];
+
+function mergeChats(list = [], why = '') {
+  for (const c of list) {
+    const jid = jidNormalizedUser(c.id || c.jid || '');
+    if (!jid) continue;
+    const prev = chatList.get(jid) || {};
+    chatList.set(jid, {
+      jid,
+      name: c.name || c.subject || prev.name || contacts.get(jid) || '',
+      ts: Number(c.conversationTimestamp || c.t || prev.ts || 0),
+      unread: Number(c.unreadCount ?? prev.unread ?? 0),
+    });
+  }
+  if (list.length) console.log('chat list %s: +%d (total %d)', why, list.length, chatList.size);
+}
+
+function mergeContacts(list = []) {
+  for (const c of list) {
+    const jid = jidNormalizedUser(c.id || c.jid || '');
+    const n = c.name || c.notify || c.verifiedName;
+    if (jid && n) contacts.set(jid, n);
+  }
+}
+
+
+function oldestKnown(jid) {
+  const f = join(STORE, safeJid(jid) + '.ndjson');
+  if (!existsSync(f)) return null;
+  const lines = readFileSync(f, 'utf8').trim().split('\n').filter(Boolean);
+  if (!lines.length) return null;
+  try { return JSON.parse(lines[0]); } catch { return null; }
+}
+
+
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH);
   const { version } = await fetchLatestBaileysVersion();
   sock = makeWASocket({ version, auth: state, logger: log, printQRInTerminal: false,
-                        markOnlineOnConnect: false });   // stay invisible; do not steal presence
+                        markOnlineOnConnect: false,     // stay invisible; do not steal presence
+                        syncFullHistory: true });       // capture the chat list at the NEXT pairing
   sock.ev.on('creds.update', saveCreds);
+  // The chat LIST is what a person needs to choose what to track, and it only arrives via
+  // app-state sync — not from watching live messages. Building `chats` out of the message
+  // ring meant it showed only whoever happened to text you since the bridge booted, which is
+  // useless for picking a chat. This is metadata (jid, name, last-activity) and stays in
+  // memory; message CONTENT is still only ever written for chats explicitly tracked.
+  sock.ev.on('messaging-history.set', ({ chats, contacts: cts, messages, isLatest, syncType }) => {
+    mergeContacts(cts || []);
+    mergeChats(chats || [], isLatest ? 'history(final)' : 'history');
+    // An on-demand history request (below) returns its messages HERE, not via messages.upsert.
+    // Without this the fetch would appear to succeed and produce nothing.
+    let n = 0;
+    for (const m of (messages || [])) { try { record(m); n++; } catch {} }
+    if (n) console.log('history batch: %d message(s) syncType=%s', n, syncType);
+  });
+  sock.ev.on('chats.upsert', (c) => mergeChats(c, 'upsert'));
+  sock.ev.on('chats.update', (c) => mergeChats(c, 'update'));
+  sock.ev.on('contacts.upsert', (c) => mergeContacts(c));
+  sock.ev.on('contacts.update', (c) => mergeContacts(c));
   sock.ev.on('connection.update', (u) => {
     if (u.qr) {
       qr = u.qr;
@@ -130,10 +188,51 @@ const server = createServer(async (req, res) => {
     if (u.pathname === '/status')
       return json(res, 200, { connected, me, qr: qr ? true : false, lastErr, sock: SOCK });
     if (u.pathname === '/qr')  return json(res, 200, { qr, ascii: qrAscii, connected });
+    if (u.pathname === '/groups' || (u.pathname === '/chats' && u.searchParams.get('groups') === '1')) {
+      // groupFetchAllParticipating is a live query and always works, unlike the 1:1 chat list
+      // which WhatsApp only pushes during app-state sync at pairing. 247 groups came back the
+      // first time this was tried, so "there is no list" was never the whole truth.
+      if (!connected) return json(res, 503, []);
+      const g = await sock.groupFetchAllParticipating();
+      const out = Object.entries(g || {}).map(([jid, m]) => ({
+        jid, name: m.subject || jid, ts: Number(m.creation || 0),
+        unread: 0, text: `group · ${(m.participants || []).length} participants`,
+      }));
+      if (u.pathname === '/groups') return json(res, 200, out.sort((a, b) => a.name.localeCompare(b.name)));
+      for (const c of out) if (!chatList.has(c.jid)) chatList.set(c.jid, c);
+    }
     if (u.pathname === '/chats') {
-      const seen = new Map();
-      for (const r of recent) if (!seen.has(r.jid)) seen.set(r.jid, r);
-      return json(res, 200, [...seen.values()].sort((a, b) => b.ts - a.ts));
+      const out = new Map();
+      for (const c of chatList.values())
+        out.set(c.jid, { jid: c.jid, name: nameFor(c.jid), ts: c.ts, unread: c.unread, text: '' });
+      // anything seen live but not yet in the synced list still deserves to be listed
+      for (const r of recent) if (!out.has(r.jid))
+        out.set(r.jid, { jid: r.jid, name: nameFor(r.jid) || r.from, ts: r.ts, unread: 0, text: r.text });
+      for (const r of recent) { const e = out.get(r.jid); if (e && !e.text) e.text = r.text; }
+      return json(res, 200, [...out.values()].sort((a, b) => (b.ts || 0) - (a.ts || 0)));
+    }
+    if (u.pathname === '/history' && req.method === 'POST') {
+      // WhatsApp lets a linked device ask the PHONE for older messages in one chat, but only
+      // relative to a message it already has: the request pages backwards from an anchor key.
+      // With no anchor there is nothing to page from, so a chat we have never seen a message
+      // in cannot be back-filled — someone has to post first. The phone must also be online;
+      // it is the peer that answers, not WhatsApp's servers.
+      let body = ''; for await (const c of req) body += c;
+      const { chat, count = 50, anchor } = JSON.parse(body || '{}');
+      if (!connected) return json(res, 503, { ok: false, err: 'not connected' });
+      if (!chat) return json(res, 400, { ok: false, err: 'chat required' });
+      const a = anchor || oldestKnown(chat);
+      if (!a) return json(res, 409, { ok: false, err: 'no anchor message for this chat yet — '
+        + 'the phone can only page back from a message we already hold. Wait for one post here, '
+        + 'then retry.' });
+      if (typeof sock.fetchMessageHistory !== 'function')
+        return json(res, 501, { ok: false, err: 'this baileys build has no fetchMessageHistory' });
+      // oldestMsgTimestampMs — MILLISECONDS. We store unix seconds, and passing those asked
+      // the phone for messages older than 1970, which it answered by sending nothing at all.
+      const rid = await sock.fetchMessageHistory(Number(count),
+        { id: a.id, remoteJid: chat, fromMe: !!a.fromMe }, a.ts * 1000);
+      return json(res, 200, { ok: true, requestId: rid, anchor: a.id, note:
+        'requested — results arrive asynchronously and only while your phone is online' });
     }
     if (u.pathname === '/send' && req.method === 'POST') {
       let body = ''; for await (const c of req) body += c;
