@@ -118,8 +118,76 @@ function autoAnswer(name, mode){
     else if(/Bypass Permissions mode/.test(pane) && /Yes, I accept/.test(pane)) tmux(['send-keys','-t',name,'2','Enter']);   // one-time per new config dir
     else if(/Teleport to Repo|Resume full session|Enter to confirm/.test(pane)) tmux(['send-keys','-t',name,'Enter']);
     else if(mode==='teleport' && !rcState.sent && !/remote-control is active/.test(pane) && /(Session resumed|bypass permissions on)/i.test(pane)){ tmux(['send-keys','-t',name,'/remote-control','Enter']); rcState.sent=true; } }catch{} };
-  const sched = (mode==='teleport') ? [4000,7000,10000,13000,16000,19000,22000,25000,28000,32000,36000,40000,45000,50000,55000] : [4000,7000,10000];
+  // 'resume' loads a whole transcript first, so its prompts arrive late; keep answering.
+  const sched = (mode==='teleport'||mode==='resume') ? [4000,7000,10000,13000,16000,19000,22000,25000,28000,32000,36000,40000,45000,50000,55000] : [4000,7000,10000];
   sched.forEach(t=>setTimeout(answer,t));
+}
+// ---- Sleep: kill the process, keep the seat --------------------------------------
+// The box holds ~15 GB and a Claude process costs 0.2-0.5 GB, so one session per task
+// only works if idle sessions can be put down and picked up again. A sleeping session
+// is a resume record without a process. It is NOT a manifest row: manifest-sync writes
+// only LIVE sessions, so a killed one is pruned within minutes and would be lost on the
+// next boot (how four sessions died on 2026-09-02). This file is the seat, written
+// before the process dies. bc-threads wakes a sleeping session before delivering to it.
+const SLEEP_FILE = HOMEDIR+'/.claude/sleeping.json';
+function readSleeping(){ try{ return JSON.parse(fs.readFileSync(SLEEP_FILE,'utf8'))||{}; }catch{ return {}; } }
+function writeSleeping(o){ const tmp=SLEEP_FILE+'.tmp'; fs.writeFileSync(tmp, JSON.stringify(o,null,1)); fs.renameSync(tmp, SLEEP_FILE); }
+const shq = v => "'"+String(v).replace(/'/g,"'\\''")+"'";
+function sleepSession(name, why, force){
+  if(!name || name.startsWith('_')) return {ok:false,err:'not a sleepable session'};
+  if(!hasSession(name)) return readSleeping()[name] ? {ok:true,already:true} : {ok:false,err:'no such session: '+name};
+  const ps=claudeSession(name);
+  if(!ps||!ps.sid||!ps.cwd) return {ok:false,err:'no Claude conversation in '+name+' — nothing to resume later, so nothing to sleep'};
+  if(ps.status==='busy' && !force) return {ok:false,err:name+' is busy'};
+  const tx=ps.dir+'/projects/'+projDir(ps.cwd)+'/'+ps.sid+'.jsonl';
+  if(!fs.existsSync(tx)) return {ok:false,err:'transcript missing: '+tx};
+  const s=readSleeping();
+  s[name]={sid:ps.sid,cwd:ps.cwd,dir:ps.dir,account:ps.account,sleptAt:Math.floor(Date.now()/1000),
+           why:why||'',lastUsed:transcriptMtime(ps.dir,ps.sid,ps.cwd)};
+  writeSleeping(s);                                   // the seat exists before the process dies
+  tmux(['kill-session','-t','='+name]);
+  bcNote({kind:'sleep',session:name,text:why||''});
+  return {ok:true,name,sid:ps.sid};
+}
+function wakeSession(name){
+  const s=readSleeping(); const r=s[name];
+  if(hasSession(name)){ if(r){ delete s[name]; writeSleeping(s); } return {ok:true,already:true}; }
+  if(!r) return {ok:false,err:'not asleep: '+name};
+  const tx=r.dir+'/projects/'+projDir(r.cwd)+'/'+r.sid+'.jsonl';
+  if(!fs.existsSync(tx)) return {ok:false,err:'transcript missing: '+tx};
+  if(!fs.existsSync(r.cwd)) return {ok:false,err:'cwd gone: '+r.cwd};
+  const envArgs=((r.account&&r.account!=='primary')?['-e','CLAUDE_CONFIG_DIR='+r.dir]:[]).concat(secretEnvArgs());
+  const cmd = CLAUDE_BIN+' --resume '+shq(r.sid)+' --remote-control '+shq(name)+' --dangerously-skip-permissions';
+  tmux(['new-session','-d','-s',name,'-c',r.cwd].concat(envArgs).concat([cmd]));
+  autoAnswer(name,'resume');
+  delete s[name]; writeSleeping(s);
+  bcNote({kind:'wake',session:name,text:'slept '+Math.round((Date.now()/1000-(r.sleptAt||0))/3600)+'h'});
+  return {ok:true,name,sid:r.sid,cwd:r.cwd};
+}
+// ---- Fork: a child that starts knowing what the parent knew ----------------------
+// Same cwd, no worktree (that is /api/branch). The child carries the whole transcript;
+// the caller usually sends `/compact <what to keep>` as its first message so it sheds
+// the parent's other threads before it takes on its own. Refused while the parent is
+// mid-turn: a fork of a half-written transcript is a child with a torn memory.
+function forkSession(parent, name, opts){
+  opts=opts||{};
+  if(!name) return {ok:false,err:'a name for the child is required'};
+  const ps=claudeSession(parent);
+  if(!ps||!ps.sid||!ps.cwd) return {ok:false,err:'no Claude conversation in '+parent+' — nothing to fork'};
+  if(!ps.alive) return {ok:false,err:parent+' is not running'};
+  if(ps.status==='busy' && !opts.force) return {ok:false,err:parent+' is busy — forking mid-turn copies a half-written transcript',busy:true};
+  if(hasSession(name)) return {ok:false,err:'session “'+name+'” already exists'};
+  const cwd=opts.cwd||ps.cwd;
+  if(!fs.existsSync(cwd)) return {ok:false,err:'cwd does not exist: '+cwd};
+  const tx=ps.dir+'/projects/'+projDir(ps.cwd)+'/'+ps.sid+'.jsonl';
+  if(!fs.existsSync(tx)) return {ok:false,err:'could not read the parent’s transcript — nothing to fork'};
+  const envArgs=((ps.account!=='primary')?['-e','CLAUDE_CONFIG_DIR='+ps.dir]:[]).concat(secretEnvArgs());
+  const cmd = CLAUDE_BIN+' --resume '+shq(ps.sid)+' --fork-session --remote-control '+shq(name)+' --dangerously-skip-permissions';
+  tmux(['new-session','-d','-s',name,'-c',cwd].concat(envArgs).concat([cmd]));
+  autoAnswer(name,'resume');
+  if(opts.first) sendWhenReady(name, opts.first, 48);
+  bcNote({kind:'fork',session:name,text:'from '+parent});
+  return {ok:true,name,parent,cwd,from:ps.sid};
 }
 function removeWorktree(w){
   if(!w || w.indexOf(CODE_ROOT+'/.worktrees/')!==0 || w.indexOf('..')>=0) return {ok:false,err:'not a managed worktree'};
@@ -254,7 +322,17 @@ function sessions(){
     s.canSplit  = !!(m && m.sid);                      // a split needs a conversation to distil, nothing more
   });
   rc.forEach(s=>{ s.mem = 0; s.cpu = 0; });
-  return tsess.concat(rc).sort((a,b)=>a.name.localeCompare(b.name));
+  // Asleep: no process, no pane, but a seat. Shown so it can be woken; never listed as
+  // live. A name that is both asleep and in tmux is a record that outlived a wake
+  // (a boot restore, say) — the live one wins and the record is dropped.
+  const asleep=[]; const sl=readSleeping(); let stale=false;
+  for(const nm in sl){ if(tnames.has(nm)){ delete sl[nm]; stale=true; continue; } const r=sl[nm];
+    asleep.push({name:nm, sleeping:true, account:r.account||'primary', bridge:null, cwd:r.cwd||'', cname:'', title:'',
+      cmd:'asleep', status:'sleeping', wins:0, attached:false, running:false, mem:0, cpu:0,
+      preview:'asleep since '+new Date((r.sleptAt||0)*1000).toISOString().slice(0,16).replace('T',' ')+(r.why?' · '+r.why:''),
+      created:r.sleptAt||0, activity:r.lastUsed||r.sleptAt||0, canBranch:false, canSplit:false}); }
+  if(stale){ try{ writeSleeping(sl); }catch{} }
+  return tsess.concat(rc).concat(asleep).sort((a,b)=>a.name.localeCompare(b.name));
 }
 // Walk up to CODE_ROOT looking for .git (a file in a worktree, a dir in a checkout).
 function inGitRepo(cwd){
@@ -562,6 +640,17 @@ http.createServer((req,res)=>{
     });
     return;
   }
+  if(req.method==='POST'&&u.pathname==='/api/sleep'){ const r=sleepSession(clean(u.searchParams.get('name')), (u.searchParams.get('why')||'').slice(0,120), u.searchParams.get('force')==='1'); res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(r)); }
+  if(req.method==='POST'&&u.pathname==='/api/wake'){ const r=wakeSession(clean(u.searchParams.get('name'))); res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(r)); }
+  if(u.pathname==='/api/sleeping'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(readSleeping())); }
+  // Fork: parent + child name; an optional body is typed into the child as its first message.
+  if(req.method==='POST'&&u.pathname==='/api/fork'){
+    let body=''; req.on('data',c=>{ body+=c; if(body.length>40000){ body=''; req.destroy(); } });
+    req.on('end',()=>{ const r=forkSession(clean(u.searchParams.get('name')), clean(u.searchParams.get('as')||''),
+        {cwd:u.searchParams.get('cwd')||'', first:body.trim(), force:u.searchParams.get('force')==='1'});
+      res.writeHead(200,{'Content-Type':'application/json'}); res.end(JSON.stringify(r)); });
+    return;
+  }
   if(req.method==='POST'&&u.pathname==='/api/kill'){ const n=clean(u.searchParams.get('name')); const rmwt=u.searchParams.get('worktree')==='1'; const cwd=u.searchParams.get('cwd')||''; if(n) tmux(['kill-session','-t',n]); let wt=null; if(rmwt) wt=removeWorktree(cwd); res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({ok:true,wt})); }
   if(u.pathname==='/api/sessions'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(sessions())); }
   if(u.pathname==='/api/stats'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(stats())); }
@@ -746,7 +835,8 @@ render(INIT);tick();setInterval(tick,2000);
   const multiAcct = accounts().length>1;
   const acctBadge = x => (multiAcct && x.account) ? `<span class="pill acct">${esc(x.account)}</span>` : '';
   const rccard=x=>`<div class="card rc" data-name="${esc(x.name)}"><div class=body onclick="window.open('https://claude.ai/code/${esc(x.bridge)}','_blank')"><div class=row><span class=name>${esc(x.title||x.name)}</span>${acctBadge(x)}<span class="pill rc">RC</span></div><div class=cid>${esc(x.name)}</div><div class=cmd>▶ ${esc(x.cmd)}${x.status?' · '+esc(x.status):''}</div><pre class=preview><span class=e>rc-hosted · not in tmux · opens in claude.ai</span></pre><div class=meta>claude.ai ↗ <a class=vscode href="${CODE}/?folder=${encodeURIComponent(x.cwd||HOMEDIR)}" target=_blank rel=noopener onclick="event.stopPropagation()">‹/› VS Code</a></div></div></div>`;
-  const card=x=> x.rc ? rccard(x) : `<div class="card ${x.attached?'on':''}" data-name="${esc(x.name)}" data-cwd="${esc(x.cwd||'')}">${x.canBranch?`<button class=branch title="branch into a worktree" onclick="branchSession('${esc(x.name)}',event)">⑂</button>`:''}${x.canSplit?`<button class=split title="split a slice of context into a fresh session" onclick="splitSession('${esc(x.name)}',event)">✂</button>`:''}<button class=kill title="kill session" onclick="killSession('${esc(x.name)}',event)">✕</button><div class=body onclick="open_('${encodeURIComponent(x.name)}')"><div class=row><span class=name>${esc(x.title||x.name)}</span>${acctBadge(x)}<span class="pill ${x.attached?'live':'idle'}">${x.attached?'LIVE':'idle'}</span></div><div class=cid>${esc(x.name)}</div><div class=cmd>${x.running?'▶':'○'} ${esc(x.cmd||'shell')}</div><pre class=preview>${esc(x.preview)||'<span class=e>— no output yet —</span>'}</pre><div class=meta>${x.wins} win · open ↗ <a class=vscode href="${CODE}/?folder=${encodeURIComponent(x.cwd||HOMEDIR)}" target=_blank rel=noopener onclick="event.stopPropagation()">‹/› VS Code</a>${x.bridge?` · <a class=vscode href="https://claude.ai/code/${esc(x.bridge)}" target=_blank rel=noopener onclick="event.stopPropagation()">claude.ai ↗</a>`:''}</div></div></div>`;
+  const zzcard=x=>`<div class="card zz" data-name="${esc(x.name)}" data-cwd="${esc(x.cwd||'')}"><button class=wake title="wake (resume the conversation)" onclick="wakeSession('${esc(x.name)}',event)">⏰</button><div class=body onclick="wakeSession('${esc(x.name)}',event)"><div class=row><span class=name>${esc(x.name)}</span>${acctBadge(x)}<span class="pill zz">ASLEEP</span></div><div class=cid>${esc(x.name)}</div><div class=cmd>○ ${esc(x.cmd)}</div><pre class=preview><span class=e>${esc(x.preview)}</span></pre><div class=meta>click to wake · <a class=vscode href="${CODE}/?folder=${encodeURIComponent(x.cwd||HOMEDIR)}" target=_blank rel=noopener onclick="event.stopPropagation()">‹/› VS Code</a></div></div></div>`;
+  const card=x=> x.sleeping ? zzcard(x) : x.rc ? rccard(x) : `<div class="card ${x.attached?'on':''}" data-name="${esc(x.name)}" data-cwd="${esc(x.cwd||'')}">${x.canBranch?`<button class=branch title="branch into a worktree" onclick="branchSession('${esc(x.name)}',event)">⑂</button>`:''}${x.canSplit?`<button class=split title="split a slice of context into a fresh session" onclick="splitSession('${esc(x.name)}',event)">✂</button><button class=zzz title="sleep: stop the process, keep the conversation to resume later" onclick="sleepSession('${esc(x.name)}',event)">💤</button>`:''}<button class=kill title="kill session" onclick="killSession('${esc(x.name)}',event)">✕</button><div class=body onclick="open_('${encodeURIComponent(x.name)}')"><div class=row><span class=name>${esc(x.title||x.name)}</span>${acctBadge(x)}<span class="pill ${x.attached?'live':'idle'}">${x.attached?'LIVE':'idle'}</span></div><div class=cid>${esc(x.name)}</div><div class=cmd>${x.running?'▶':'○'} ${esc(x.cmd||'shell')}</div><pre class=preview>${esc(x.preview)||'<span class=e>— no output yet —</span>'}</pre><div class=meta>${x.wins} win · open ↗ <a class=vscode href="${CODE}/?folder=${encodeURIComponent(x.cwd||HOMEDIR)}" target=_blank rel=noopener onclick="event.stopPropagation()">‹/› VS Code</a>${x.bridge?` · <a class=vscode href="https://claude.ai/code/${esc(x.bridge)}" target=_blank rel=noopener onclick="event.stopPropagation()">claude.ai ↗</a>`:''}</div></div></div>`;
   res.writeHead(200,{'Content-Type':'text/html'});
   res.end(`<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Claude Sessions</title>
 <style>${CSS}
@@ -765,6 +855,10 @@ render(INIT);tick();setInterval(tick,2000);
 .pill{font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:3px 9px;border-radius:999px}
 .pill.live{color:#22c55e;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4)}
 .pill.idle{color:#64748b;background:rgba(100,116,139,.12);border:1px solid rgba(100,116,139,.3)}
+.pill.zz{color:#a78bfa;background:rgba(167,139,250,.12);border:1px solid rgba(167,139,250,.35)}
+.card.zz{opacity:.75}
+.card .zzz,.card .wake,.lact .lzzz,.lact .lwake{width:24px;height:24px;border-radius:7px;border:1px solid rgba(167,139,250,.35);background:rgba(167,139,250,.12);color:#a78bfa;font-size:12px;cursor:pointer;padding:0;line-height:1}
+.card .zzz:hover,.card .wake:hover,.lact .lzzz:hover,.lact .lwake:hover{background:#7c3aed;color:#fff;border-color:#7c3aed}
  .pill.rc{color:#a78bfa;background:rgba(167,139,250,.14);border:1px solid rgba(167,139,250,.45)}
  .pill.acct{color:#fbbf24;background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.4);margin-left:6px}
  .lname .pill.acct{margin-left:8px;vertical-align:middle}
@@ -848,7 +942,7 @@ function fmtMem(mb){if(!mb)return '—';return mb>=1024?(mb/1024).toFixed(1)+' G
 function fmtCpu(x){if(x.rc)return '—';var p=x.cpu||0;var cls=p>=80?'hi':(p>=25?'mid':'');return '<span class="cpuval '+cls+'">'+p+'%</span>';}
 function esc2(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function sortData(a){var k=SORT,dir=DIR==='asc'?1:-1;return a.slice().sort(function(p,q){var x,y;if(k==='name'){x=(p.title||p.name||'').toLowerCase();y=(q.title||q.name||'').toLowerCase();}else if(k==='repo'){x=repoOf(p).toLowerCase();y=repoOf(q).toLowerCase();}else if(k==='launch'){x=p.created||0;y=q.created||0;}else if(k==='cpu'){x=p.cpu||0;y=q.cpu||0;}else if(k==='mem'){x=p.mem||0;y=q.mem||0;}else{x=p.activity||0;y=q.activity||0;}return x<y?-1*dir:(x>y?1*dir:0);});}
-function renderList(){var tb=document.getElementById('ltbody');if(!tb)return;var arr=sortData(DATA);tb.innerHTML=arr.map(function(x){var st=x.rc?'RC':(x.attached?'LIVE':'idle');var pc='pill '+(x.rc?'rc':(x.attached?'live':'idle'));return '<tr data-name="'+esc2(x.name)+'" data-cwd="'+esc2(x.cwd||'')+'" data-rc="'+(x.rc?'1':'')+'" data-bridge="'+esc2(x.bridge||'')+'"><td class=lname><span class=lopen>'+esc2(x.title||x.name)+'</span>'+((MULTIACCT&&x.account)?' <span class="pill acct">'+esc2(x.account)+'</span>':'')+'<span class=lsub>'+esc2(x.name)+'</span></td><td class=lrepo>'+esc2(repoOf(x)||'—')+'</td><td class=num title="'+esc2(fmtWhen(x.created))+'">'+fmtAgo(x.created)+'</td><td class=num title="'+esc2(fmtWhen(x.activity))+'">'+fmtAgo(x.activity)+'</td><td class="num cpu">'+fmtCpu(x)+'</td><td class=num>'+fmtMem(x.mem)+'</td><td><span class="'+pc+'">'+st+'</span></td><td class=lact>'+(x.bridge?'<a class=vs href="https://claude.ai/code/'+esc2(x.bridge)+'" target=_blank rel=noopener title="claude.ai">◎</a>':'')+'<a class=vs href="'+CODEBASE+'/?folder='+encodeURIComponent(x.cwd||HOMEBASE)+'" target=_blank rel=noopener title="VS Code">‹/›</a>'+(x.rc?'':((x.canBranch?'<button class=lbranch title="branch into a worktree">⑂</button>':'')+(x.canSplit?'<button class=lsplit title="split context into a fresh session">✂</button>':'')+'<button class=lkill title="kill">✕</button>'))+'</td></tr>';}).join('');document.querySelectorAll('th.sortable').forEach(function(th){var k=th.dataset.k;th.classList.remove('asc','desc');if(SORT===k)th.classList.add(DIR);});}
+function renderList(){var tb=document.getElementById('ltbody');if(!tb)return;var arr=sortData(DATA);tb.innerHTML=arr.map(function(x){var st=x.sleeping?'ASLEEP':(x.rc?'RC':(x.attached?'LIVE':'idle'));var pc='pill '+(x.sleeping?'zz':(x.rc?'rc':(x.attached?'live':'idle')));return '<tr data-name="'+esc2(x.name)+'" data-cwd="'+esc2(x.cwd||'')+'" data-rc="'+(x.rc?'1':'')+'" data-bridge="'+esc2(x.bridge||'')+'"><td class=lname><span class=lopen>'+esc2(x.title||x.name)+'</span>'+((MULTIACCT&&x.account)?' <span class="pill acct">'+esc2(x.account)+'</span>':'')+'<span class=lsub>'+esc2(x.name)+'</span></td><td class=lrepo>'+esc2(repoOf(x)||'—')+'</td><td class=num title="'+esc2(fmtWhen(x.created))+'">'+fmtAgo(x.created)+'</td><td class=num title="'+esc2(fmtWhen(x.activity))+'">'+fmtAgo(x.activity)+'</td><td class="num cpu">'+fmtCpu(x)+'</td><td class=num>'+fmtMem(x.mem)+'</td><td><span class="'+pc+'">'+st+'</span></td><td class=lact>'+(x.bridge?'<a class=vs href="https://claude.ai/code/'+esc2(x.bridge)+'" target=_blank rel=noopener title="claude.ai">◎</a>':'')+'<a class=vs href="'+CODEBASE+'/?folder='+encodeURIComponent(x.cwd||HOMEBASE)+'" target=_blank rel=noopener title="VS Code">‹/›</a>'+(x.sleeping?'<button class=lwake title="wake">⏰</button>':(x.rc?'':((x.canBranch?'<button class=lbranch title="branch into a worktree">⑂</button>':'')+(x.canSplit?'<button class=lsplit title="split context into a fresh session">✂</button><button class=lzzz title="sleep">💤</button>':'')+'<button class=lkill title="kill">✕</button>')))+'</td></tr>';}).join('');document.querySelectorAll('th.sortable').forEach(function(th){var k=th.dataset.k;th.classList.remove('asc','desc');if(SORT===k)th.classList.add(DIR);});}
 function setView(v){VIEW=v;localStorage.setItem('view',v);var g=document.getElementById('g'),l=document.getElementById('listwrap');if(g)g.style.display=(v==='grid')?'':'none';if(l)l.style.display=(v==='list')?'':'none';document.querySelectorAll('.viewbtn').forEach(function(b){b.classList.toggle('on',b.dataset.v===v);});if(v==='list')renderList();}
 function setSort(k){if(SORT===k){DIR=(DIR==='asc')?'desc':'asc';}else{SORT=k;DIR=(k==='name'||k==='repo')?'asc':'desc';}localStorage.setItem('sortk',SORT);localStorage.setItem('sortd',DIR);renderList();}
 function killByName(name,cwd,ev,disp){if(ev)ev.stopPropagation();var isWt=(cwd||'').indexOf('/.worktrees/')>=0;if(!confirm('Kill session "'+(disp||name)+'"?'))return;var wt=0;if(isWt){wt=confirm('This session runs in a git worktree:\\n'+cwd+'\\n\\nAlso remove the worktree and its branch?\\nUncommitted changes there will be lost.')?1:0;}var url='/api/kill?name='+encodeURIComponent(name);if(wt)url+='&worktree=1&cwd='+encodeURIComponent(cwd);fetch(url,{method:'POST'});DATA=DATA.filter(function(z){return z.name!==name;});var c=document.querySelector('.card[data-name="'+CSS.escape(name)+'"]');if(c)c.remove();renderList();}
@@ -918,6 +1012,8 @@ async function doSplit(){var as=(document.getElementById('s_name').value||'').tr
  document.getElementById('s_brief').value='';
  closeSModal();
  setTimeout(function(){location.reload();},1200);}
+async function sleepSession(n,e){if(e)e.stopPropagation();if(!confirm('Put "'+n+'" to sleep?\nThe process stops; the conversation is kept and resumes on wake or on the next Basecamp mention.'))return;var r=await(await fetch('/api/sleep?name='+encodeURIComponent(n)+'&why=by+hand',{method:'POST'})).json();if(!r.ok)alert('Could not sleep: '+(r.err||''));setTimeout(tick,800);}
+async function wakeSession(n,e){if(e)e.stopPropagation();var r=await(await fetch('/api/wake?name='+encodeURIComponent(n),{method:'POST'})).json();if(!r.ok)alert('Could not wake: '+(r.err||''));setTimeout(tick,1500);}
 async function killSession(n,e){e.stopPropagation();const c=document.querySelector('.card[data-name="'+CSS.escape(n)+'"]');const cwd=c?(c.dataset.cwd||''):'';const disp=(c&&c.querySelector('.name'))?c.querySelector('.name').textContent.trim():n;const isWt=cwd.indexOf('/.worktrees/')>=0;if(!confirm('Kill session "'+disp+'"?'))return;let wt=0;if(isWt){wt=confirm('This session runs in a git worktree:\\n'+cwd+'\\n\\nAlso remove the worktree and its branch?\\nUncommitted changes there will be lost.')?1:0;}let url='/api/kill?name='+encodeURIComponent(n);if(wt)url+='&worktree=1&cwd='+encodeURIComponent(cwd);await fetch(url,{method:'POST'});if(c)c.remove();}
 async function tick(){try{const d=await(await fetch('/api/sessions')).json();DATA=d;
  if(VIEW==='list'){renderList();return;}
@@ -925,6 +1021,6 @@ async function tick(){try{const d=await(await fetch('/api/sessions')).json();DAT
  d.forEach(x=>{const c=document.querySelector('.card[data-name="'+CSS.escape(x.name)+'"]');if(!c||x.rc)return;const p=c.querySelector('.pill');p.className='pill '+(x.attached?'live':'idle');p.textContent=x.attached?'LIVE':'idle';c.classList.toggle('on',x.attached);c.querySelector('.name').textContent=x.title||x.name;c.querySelector('.cmd').textContent=(x.running?'▶ ':'○ ')+(x.cmd||'shell');c.querySelector('.preview').textContent=x.preview||'— no output yet —';});
 }catch(e){}}
 setInterval(tick,4000);
-(function(){var tb=document.getElementById('ltbody');if(tb){tb.addEventListener('click',function(e){var tr=e.target.closest('tr');if(!tr)return;var name=tr.dataset.name;if(e.target.closest('.lkill')){killByName(name,tr.dataset.cwd,e,((tr.querySelector('.lopen')||{}).textContent||name).trim());return;}if(e.target.closest('.lbranch')){branchSession(name,e);return;}if(e.target.closest('.lsplit')){splitSession(name,e);return;}if(e.target.closest('.vs'))return;if(tr.dataset.rc){window.open('https://claude.ai/code/'+tr.dataset.bridge,'_blank');}else{open_(encodeURIComponent(name));}});}setView(VIEW);})();
+(function(){var tb=document.getElementById('ltbody');if(tb){tb.addEventListener('click',function(e){var tr=e.target.closest('tr');if(!tr)return;var name=tr.dataset.name;if(e.target.closest('.lkill')){killByName(name,tr.dataset.cwd,e,((tr.querySelector('.lopen')||{}).textContent||name).trim());return;}if(e.target.closest('.lbranch')){branchSession(name,e);return;}if(e.target.closest('.lsplit')){splitSession(name,e);return;}if(e.target.closest('.lzzz')){sleepSession(name,e);return;}if(e.target.closest('.lwake')||tr.querySelector('.pill.zz')){wakeSession(name,e);return;}if(e.target.closest('.vs'))return;if(tr.dataset.rc){window.open('https://claude.ai/code/'+tr.dataset.bridge,'_blank');}else{open_(encodeURIComponent(name));}});}setView(VIEW);})();
 </script></body></html>`);
 }).listen(PORT,'127.0.0.1',()=>console.log('dashboard on '+PORT));

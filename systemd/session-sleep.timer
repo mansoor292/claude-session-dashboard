@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly: sleep idle Claude sessions
+
+[Timer]
+OnBootSec=30min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

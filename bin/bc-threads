@@ -242,6 +242,45 @@ def tmux_has(name):
                           capture_output=True).returncode == 0
 
 
+DASHBOARD = os.environ.get("DASHBOARD_URL", "http://127.0.0.1:5000")
+SLEEPING  = os.path.expanduser("~/.claude/sleeping.json")
+
+
+def dashboard(path, body=None):
+    """One call into the session dashboard, which is the only launcher on the box."""
+    import urllib.request
+    req = urllib.request.Request(DASHBOARD + path, data=(body or "").encode() if body is not None else None,
+                                 method="POST")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.load(r)
+
+
+def asleep(name):
+    try:
+        with open(SLEEPING) as f: return name in json.load(f)
+    except Exception:
+        return False
+
+
+def wake(name, wait=120):
+    """A sleeping session keeps its places; deliver by waking it, not by holding forever.
+
+    Resuming a long transcript takes a while and the first prompt can take longer still,
+    so wait for the registry to show it alive AND idle, not just for the pane to exist.
+    """
+    try:
+        r = dashboard("/api/wake?name=%s" % name)
+    except Exception as e:
+        print("!! wake %s: %s" % (name, str(e)[:120])); return False
+    if not r.get("ok"):
+        print("!! wake %s: %s" % (name, r.get("err"))); return False
+    for _ in range(wait):
+        time.sleep(1)
+        info = sessions().get(name, {})
+        if info.get("alive") and (info.get("status") or "") not in BLOCKED_STATUS: return True
+    return False
+
+
 def ensure_bridge(name, wait=30):
     """Without Remote Control the message lands in the pane but is invisible from
     claude.ai or a phone, so turn it on before delivering rather than after."""
@@ -289,6 +328,11 @@ def ready(sess, live, label):
     info = live.get(sess, {})
     if not sess:
         print("-- %s: no session tracking this \u2014 holding" % label); return False
+    if not info.get("alive") and asleep(sess):
+        print("-- %s: %s is asleep \u2014 waking it" % (label, sess))
+        note("wake", title=label, session=sess)
+        if wake(sess):
+            live.update(sessions()); info = live.get(sess, {})
     if not info.get("alive"):
         print("-- %s: session %s is not running \u2014 holding" % (label, sess))
         note("hold", title=label, session=sess, why="session not running"); return False
@@ -427,12 +471,20 @@ def nearest_session(reg, project, thread_id):
     project, thread_id = str(project), str(thread_id)
     rec = reg["places"].get(thread_id)
     if rec and rec.get("session"):
-        return rec["session"], "it already tracks this thread", True
+        return rec["session"], "it already tracks this thread", True, ""
     gid = parent_id(reg, project, thread_id)
     if gid:
         rec = reg["places"].get(gid)
         if rec and rec.get("session"):
-            return rec["session"], "it tracks the board this thread is on", True
+            # One session per thread. Tracking a board or a to-do list used to make its
+            # session the owner of every thread inside it, which is how thirteen places
+            # funnelled into one Herrschners session and it triaged by tractability. The
+            # container's session is now the PARENT: a new thread gets its own child,
+            # forked from it, and the parent is never delivered a leaf again. Flip
+            # spawn_per_task to false in the registry to go back to delivering in place.
+            if reg.get("spawn_per_task", True):
+                return rec["session"], "it tracks the board this thread is on; a child is forked from it", True, rec["session"]
+            return rec["session"], "it tracks the board this thread is on", True, ""
     # An epoch cut untracks the old thread — but people keep replying on it. Pamela commented
     # on "plan builder v2" a fortnight after it was superseded by v3, and with the old thread
     # untracked the fallback guessed vto-builder, the COACHING session: not a near miss, a
@@ -441,15 +493,55 @@ def nearest_session(reg, project, thread_id):
     if succ:
         rec = reg["places"].get(str(succ))
         if rec and rec.get("session"):
-            return rec["session"], "this thread was superseded by %s, which it owns" % succ, True
+            return rec["session"], "this thread was superseded by %s, which it owns" % succ, True, ""
     # Past this point nobody owns it and every answer is a guess. Guessing put one client's
     # thread into another client's session twice. An unowned mention is queued for a human
     # to assign instead \u2014 see `bc-threads orphans` and the Basecamp page.
     here = [(r.get("connected") or 0, r.get("session")) for r in reg["places"].values()
             if r.get("project") == project and r.get("session")]
     if here:
-        return max(here)[1], "nobody owns this thread; this session works elsewhere in the project", False
-    return "", "nothing in this project is tracked at all", False
+        return max(here)[1], "nobody owns this thread; this session works elsewhere in the project", False, ""
+    return "", "nothing in this project is tracked at all", False, ""
+
+
+COMPACT_MSG = (
+    "/compact You are a child forked from this session to own ONE Basecamp thread: \"%s\" "
+    "(thread %s). KEEP: the repo, its layout and conventions; the client and product context; "
+    "tooling and how credentials are used; the standing rules in CLAUDE.md. DROP: every other "
+    "Basecamp thread's asks, state and history \u2014 they stay with the parent session, not you; "
+    "and any task you were mid-way through, which stays with the parent too. Mark each artifact "
+    "you keep as generated / applied / verified, and each fact as said-by-a-person / inferred. "
+    "Then wait: the thread will be delivered to you.")
+
+
+def child_name(parent, title):
+    """<parent>__<slug of the thread title>, unique among live and sleeping sessions."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (title or "thread").lower()).strip("-")[:28].rstrip("-") or "thread"
+    base = "%s__%s" % (parent, slug)
+    name, k = base, 2
+    while tmux_has(name) or asleep(name):
+        name = "%s-%d" % (base, k); k += 1
+    return name
+
+
+def spawn_child(reg, parent, project, tid, title, url, kind):
+    """Fork a child from `parent` to own thread `tid`. Registers the leaf to the child.
+
+    Returns the child's name, or "" when the parent is mid-turn (a fork of a half-written
+    transcript is a child with a torn memory) \u2014 the caller holds and retries next sweep.
+    The child compacts itself first; delivery happens on a later sweep once it is idle.
+    """
+    name = child_name(parent, title)
+    try:
+        r = dashboard("/api/fork?name=%s&as=%s" % (parent, name), COMPACT_MSG % ((title or "")[:80], tid))
+    except Exception as e:
+        print("!! fork from %s: %s" % (parent, str(e)[:120])); return ""
+    if not r.get("ok"):
+        print("!! fork from %s: %s" % (parent, r.get("err"))); return ""
+    register(reg, tid, project, name, kind=kind, title=title, url=url)
+    note("spawn", project=project, thread=tid, title=title, session=name, why="forked from " + parent)
+    print("++ %s forked from %s to own %r" % (name, parent, (title or "")[:40]))
+    return name
 
 
 def register(reg, pid, project, session, kind="", title="", url="", quiet=False):
@@ -648,6 +740,8 @@ HEADER = (
     "- Never write \"fixed\", \"done\" or \"deployed\" until it is proven on prod; `bc-threads\n"
     "  reply` refuses the claim without --proven. Questions and \"looking at this now\" can go\n"
     "  out any time.\n"
+    "- Replies are bullets, action first, short: people skim. `bc-threads reply` refuses\n"
+    "  a wall of prose.\n"
     "Full rules: ~/.claude/CLAUDE.md.\n")
 
 
@@ -741,7 +835,22 @@ def cmd_watch(a):
     for c in sorted(hits, key=lambda c: int(c["id"])):
         par = c.get("parent") or {}
         proj = str((c.get("bucket") or {}).get("id") or "")
-        sess, why, owned = nearest_session(reg, proj, par.get("id") or "")
+        sess, why, owned, spawn_from = nearest_session(reg, proj, par.get("id") or "")
+        if owned and spawn_from:
+            # A new thread under a tracked container: give it a session of its own. The
+            # mention is held either way \u2014 the child needs a sweep or two to come up and
+            # compact \u2014 and next sweep the leaf is tracked, so it routes straight there.
+            tid = str(par.get("id") or "")
+            if tid not in reg["places"]:
+                if a.dry_run:
+                    print("   would fork a child from %s for %r" % (sess, (par.get("title") or "?")[:40]))
+                elif (live.get(sess) or {}).get("status") in BLOCKED_STATUS:
+                    print("-- %s is %s \u2014 not forking mid-turn; holding" % (sess, live[sess]["status"]))
+                elif spawn_child(reg, sess, proj, tid, par.get("title") or "", c.get("app_url") or "",
+                                 par.get("type") or ""):
+                    dirty = True
+            held.append(int(c["id"]))
+            continue
         if not owned:
             # Park it for assignment. It is safely in the registry, so the watermark may
             # move past it; nothing is lost and nothing is guessed.
@@ -843,9 +952,34 @@ CLAIM_RE = re.compile(
     r"should (now )?(work|be working))\b", re.I)
 
 
+BULLET_RE = re.compile(r"^\s*([-*\u2022]|\d+[.)])\s+")
+
+
+def prose_wall(text):
+    """Why this reply is too much to read, or "" if it is fine.
+
+    People on these threads skim. Long prose buried the ask often enough that Mansoor
+    called it out (2026-09-23): replies are bullets, action first, short. A list can run
+    long; a wall of paragraphs cannot.
+    """
+    words = len((text or "").split())
+    lines = [l for l in (text or "").splitlines() if l.strip()]
+    bullets = sum(1 for l in lines if BULLET_RE.match(l))
+    if words > 250: return "%d words" % words
+    if words > 80 and bullets < 2: return "%d words of prose, no bullets" % words
+    return ""
+
+
 def cmd_reply(a):
     """Comment on a recording — and start tracking that recording, nothing wider."""
     reg = load()
+    wall = prose_wall(a.text)
+    if wall and not a.long:
+        sys.exit("REFUSED: %s. Humans skim; the ask gets lost in the volume.\n"
+                 "Lead with the action or answer. One bullet per point. Under ~80 words unless "
+                 "it is a list. Cut background nobody asked for.\n"
+                 "If it genuinely has to be long (a spec, a numbered checklist), re-run with "
+                 "--long \"<why>\"." % wall)
     m0 = CLAIM_RE.search(a.text or "")
     if m0 and not a.proven:
         sys.exit('REFUSED: this reply claims a fix ("%s") but carries no proof.\n'
@@ -1079,9 +1213,24 @@ def cmd_assign(a):
     proj, tid = str(o.get("project") or ""), str(o.get("thread") or "")
 
     d = fetch(proj, tid) if proj and tid else {}
-    register(reg, tid, proj, sess, kind=d.get("type") or o.get("kind") or "",
-             title=d.get("title") or d.get("subject") or o.get("title") or "",
-             url=d.get("app_url") or o.get("url") or "")
+    title = d.get("title") or d.get("subject") or o.get("title") or ""
+    if a.fork:
+        # Give the thread to a CHILD of the named session rather than to the session itself.
+        if (sessions().get(sess) or {}).get("status") in BLOCKED_STATUS:
+            sys.exit("%s is mid-turn \u2014 try again when it is idle (forking now would copy a half-written transcript)" % sess)
+        child = spawn_child(reg, sess, proj, tid, title, d.get("app_url") or o.get("url") or "",
+                            d.get("type") or o.get("kind") or "")
+        if not child: sys.exit(1)
+        save(reg)
+        print("waiting for %s to come up and compact\u2026" % child)
+        for _ in range(300):
+            time.sleep(1)
+            info = sessions().get(child, {})
+            if info.get("alive") and (info.get("status") or "") not in BLOCKED_STATUS and not pane_blocked(child): break
+        sess = child
+    else:
+        register(reg, tid, proj, sess, kind=d.get("type") or o.get("kind") or "", title=title,
+                 url=d.get("app_url") or o.get("url") or "")
     save(reg)
 
     # The orphan stays queued until it has actually been DELIVERED. Popping it first and
@@ -1093,7 +1242,7 @@ def cmd_assign(a):
     if not ready(sess, live, "assigned @mention"):
         print("%s now tracks the thread, but it is not deliverable right now \u2014 the "
               "mention stays queued. Re-run `bc-threads assign %s %s` when it is idle."
-              % (label_session(sess), a.cid, a.session))
+              % (label_session(sess), a.cid, sess))
         return
     path, first_new, n_new = sync_transcript(reg, proj, tid,
                                              o.get("title") or "", o.get("url") or "")
@@ -1271,6 +1420,7 @@ sp.add_argument("-v", "--verbose", action="store_true"); sp.set_defaults(fn=cmd_
 sp = sub.add_parser("reply"); sp.add_argument("recording"); sp.add_argument("text")
 sp.add_argument("-p", "--project"); sp.add_argument("-s", "--session")
 sp.add_argument("--no-track", action="store_true")
+sp.add_argument("--long", metavar="WHY", help="allow a long reply (a spec, a checklist) and say why")
 sp.add_argument("--proven", metavar="EVIDENCE",
                 help='required when the text claims a fix: e.g. "tests/offer.spec.ts green against https://prod..."')
 sp.set_defaults(fn=cmd_reply)
@@ -1293,7 +1443,7 @@ sp.add_argument("--warn-hours", type=float, default=4.0)
 sp.add_argument("--notify", default="_dashboard")
 sp.add_argument("--dry-run", action="store_true"); sp.add_argument("-v", "--verbose", action="store_true")
 sp.set_defaults(fn=cmd_orphancheck)
-sp = sub.add_parser("assign"); sp.add_argument("cid"); sp.add_argument("session")
+sp = sub.add_parser("assign"); sp.add_argument("cid"); sp.add_argument("session"); sp.add_argument("--fork", action="store_true", help="give the thread to a CHILD forked from this session, not the session itself")
 sp.set_defaults(fn=cmd_assign)
 sp = sub.add_parser("dismiss"); sp.add_argument("cid"); sp.set_defaults(fn=cmd_dismiss)
 sp = sub.add_parser("hooks"); sp.add_argument("--dry-run", action="store_true"); sp.set_defaults(fn=cmd_hooks)

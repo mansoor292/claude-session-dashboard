@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Put a Claude session to sleep, wake it, or let idle age and memory decide.
+
+    session-sleep <name> [--why TEXT] [--force]   stop the process, keep the conversation
+    session-wake  <name>                          resume it under the same name
+    session-sleep list                            who is asleep, and since when
+    session-sleep auto [--idle-days 3] [--floor-gb 3] [--min-days 1] [--dry-run]
+
+A sleeping session is a resume record without a process (~/.claude/sleeping.json, kept
+by the dashboard). Its Basecamp places stay bound to its name: bc-threads wakes it
+before delivering, so from a thread's side nothing changes but a minute's delay.
+
+`auto` is the memory policy. The box holds ~15 GB and each session 0.2-0.5 GB, so one
+session per task is only sustainable if the idle ones are put down. Two rules, in order:
+anything idle longer than --idle-days sleeps; then, while available memory is under
+--floor-gb, the longest-idle sessions sleep until it is not — but never one idle under
+--min-days, so a session someone used this morning is never taken out from under them.
+Idle is measured on the conversation transcript's mtime (every message, from any device),
+not tmux activity, which bumps on a status-line redraw.
+"""
+import argparse, glob, json, os, sys, time, urllib.parse, urllib.request
+
+HOME = os.path.expanduser("~")
+API = os.environ.get("DASHBOARD_URL", "http://127.0.0.1:5000")
+LOG = os.path.join(HOME, ".claude", "sleep.log")
+
+
+def api(path, post=False):
+    req = urllib.request.Request(API + path, method="POST" if post else "GET")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def log(line):
+    with open(LOG, "a") as f:
+        f.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), line))
+
+
+def transcripts():
+    """tmux name -> (transcript mtime, session id) for live Claude processes."""
+    out = {}
+    for f in glob.glob(os.path.join(HOME, ".claude*", "sessions", "*.json")):
+        try: d = json.load(open(f))
+        except Exception: continue
+        name = (d.get("tmux") or "").split(":")[0]
+        pid, sid, cwd = d.get("pid"), d.get("sessionId"), d.get("cwd")
+        if not (name and sid and cwd and pid and os.path.exists("/proc/%d" % pid)): continue
+        cfg = os.path.dirname(os.path.dirname(f))
+        proj = cwd.replace("/", "-").replace(".", "-").replace("_", "-")
+        try: mt = os.path.getmtime(os.path.join(cfg, "projects", proj, sid + ".jsonl"))
+        except OSError: continue
+        if name not in out or mt > out[name][0]: out[name] = (mt, sid)
+    return out
+
+
+def mem_available_gb():
+    for line in open("/proc/meminfo"):
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) / 1048576.0
+    return 0.0
+
+
+def do_sleep(name, why, force, dry=False):
+    if dry:
+        print("would sleep %s (%s)" % (name, why)); return True
+    r = api("/api/sleep?name=%s&why=%s%s" % (urllib.parse.quote(name), urllib.parse.quote(why or ""),
+                                              "&force=1" if force else ""), post=True)
+    if r.get("ok"):
+        print("asleep: %s%s" % (name, " (already)" if r.get("already") else ""))
+        log("sleep %s — %s" % (name, why or ""))
+    else:
+        print("could not sleep %s: %s" % (name, r.get("err")))
+    return bool(r.get("ok"))
+
+
+def do_wake(name):
+    r = api("/api/wake?name=%s" % urllib.parse.quote(name), post=True)
+    if r.get("ok"):
+        print("awake: %s%s" % (name, " (was not asleep)" if r.get("already") else ""))
+        log("wake %s" % name)
+    else:
+        print("could not wake %s: %s" % (name, r.get("err")))
+    return bool(r.get("ok"))
+
+
+def do_list():
+    s = api("/api/sleeping")
+    if not s: print("nobody is asleep"); return
+    now = time.time()
+    for name, r in sorted(s.items()):
+        print("%-30s asleep %5.1fd  last used %5.1fd ago  %s"
+              % (name, (now - r.get("sleptAt", now)) / 86400,
+                 (now - (r.get("lastUsed") or r.get("sleptAt") or now)) / 86400, r.get("why") or ""))
+
+
+def do_auto(a):
+    now = time.time()
+    sessions = api("/api/sessions")
+    tx = transcripts()
+    cands = []
+    for s in sessions:
+        n = s.get("name") or ""
+        if s.get("sleeping") or s.get("rc") or n.startswith("_") or not s.get("canSplit"): continue
+        if (s.get("status") or "") in ("busy", "waiting"): continue
+        if n not in tx: continue
+        idle = (now - tx[n][0]) / 86400
+        cands.append((idle, n, s.get("mem") or 0))
+    cands.sort(reverse=True)
+    slept = set()
+    for idle, n, mem in cands:
+        if idle > a.idle_days:
+            if do_sleep(n, "idle %.1fd" % idle, False, a.dry_run): slept.add(n)
+    avail = mem_available_gb()
+    if avail < a.floor_gb:
+        print("memory: %.1f GB available, floor %.1f GB" % (avail, a.floor_gb))
+        for idle, n, mem in cands:
+            if avail >= a.floor_gb: break
+            if n in slept or idle < a.min_days: continue
+            if do_sleep(n, "memory floor (%.1f GB free), idle %.1fd" % (avail, idle), False, a.dry_run):
+                slept.add(n); avail += mem / 1024.0
+    print("%d slept; %.1f GB available; %d live sessions considered"
+          % (len(slept), mem_available_gb() if not a.dry_run else avail, len(cands)))
+
+
+def main():
+    argv = sys.argv[1:]
+    as_wake = os.path.basename(sys.argv[0]) == "session-wake"
+    p = argparse.ArgumentParser(prog="session-sleep")
+    sub = p.add_subparsers(dest="cmd")
+    s = sub.add_parser("sleep"); s.add_argument("name"); s.add_argument("--why", default="by hand"); s.add_argument("--force", action="store_true")
+    w = sub.add_parser("wake"); w.add_argument("name")
+    sub.add_parser("list")
+    au = sub.add_parser("auto")
+    au.add_argument("--idle-days", type=float, default=3.0)
+    au.add_argument("--floor-gb", type=float, default=3.0)
+    au.add_argument("--min-days", type=float, default=1.0)
+    au.add_argument("--dry-run", action="store_true")
+    if as_wake: argv = ["wake"] + argv
+    elif argv and argv[0] not in ("sleep", "wake", "list", "auto", "-h", "--help"): argv = ["sleep"] + argv
+    a = p.parse_args(argv)
+    if a.cmd == "sleep": sys.exit(0 if do_sleep(a.name, a.why, a.force) else 1)
+    if a.cmd == "wake": sys.exit(0 if do_wake(a.name) else 1)
+    if a.cmd == "list": do_list()
+    elif a.cmd == "auto": do_auto(a)
+    else: p.print_help()
+
+
+if __name__ == "__main__":
+    main()
