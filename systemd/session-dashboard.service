@@ -6,6 +6,7 @@ After=network.target
 User=ubuntu
 Group=ubuntu
 Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
 # Point the dashboard at your own wildcard domain:
 Environment=DEV_DOMAIN=dev.example.com
 WorkingDirectory=/home/ubuntu/session-dashboard
