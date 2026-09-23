@@ -28,7 +28,7 @@ watermark and takes the batch on the next sweep.
 Site config lives in the registry (~/.claude/bc-threads.json), never in this file:
   ping_from / ping_repo_filter / ping_session / account / self
 """
-import json, os, re, subprocess, sys, time, html, argparse, glob, fcntl
+import json, os, re, subprocess, sys, time, html, argparse, glob, fcntl, calendar
 
 BASECAMP = os.environ.get("BASECAMP_BIN", os.path.expanduser("~/.local/bin/basecamp"))
 TMUX     = os.environ.get("TMUX_BIN", "/usr/bin/tmux")
@@ -516,8 +516,13 @@ COMPACT_MSG = (
 
 def child_name(parent, title):
     """<parent>__<slug of the thread title>, unique among live and sleeping sessions."""
-    slug = re.sub(r"[^a-z0-9]+", "-", (title or "thread").lower()).strip("-")[:28].rstrip("-") or "thread"
-    base = "%s__%s" % (parent, slug)
+    # The dashboard caps a session name at 40 chars, so build to fit rather than be cut.
+    # The child inherits the parent's cwd, so the repo prefix of a worktree name
+    # (digitalCatalogs__herrschners -> herrschners) carries nothing it needs.
+    short = parent.split("__")[-1][:24]
+    room = 40 - len(short) - 2 - 2                      # leave room for a "-2" suffix
+    slug = re.sub(r"[^a-z0-9]+", "-", (title or "thread").lower()).strip("-")[:room].rstrip("-") or "thread"
+    base = "%s__%s" % (short, slug)
     name, k = base, 2
     while tmux_has(name) or asleep(name):
         name = "%s-%d" % (base, k); k += 1
@@ -757,7 +762,7 @@ def brief_hint(tid):
     return ""
 
 
-def sync_transcript(reg, project, thread_id, title="", url="", write=True):
+def sync_transcript(reg, project, thread_id, title="", url="", write=True, edited=()):
     """Append whatever is new on a thread to its transcript file.
 
     The transcript IS the stream a session subscribes to. Instructions used to ride along
@@ -787,7 +792,25 @@ def sync_transcript(reg, project, thread_id, title="", url="", write=True):
                 f.write("\n#### %s · %s · %s\n\n%s\n"
                         % (c["id"], who, when, detag(c.get("content"))))
         tr["last_id"] = max(int(c["id"]) for c in fresh)
-    return path, (str(fresh[0]["id"]) if fresh else ""), len(fresh)
+    # An edited comment already sits in the file with its old text. Append the current
+    # text as a new entry rather than rewriting history: the file is append-only, and the
+    # session needs to see what changed, not lose what it had read.
+    fresh_ids = {str(c["id"]) for c in fresh}
+    ed = [c for c in edited if str(c["id"]) not in fresh_ids]
+    if ed:
+        with open(path, "a") as f:
+            for c in ed:
+                who = (c.get("creator") or {}).get("name") or "someone"
+                when = (c.get("updated_at") or "")[:16].replace("T", " ")
+                f.write("\n#### %s · %s · %s (edited)\n\n%s\n"
+                        % (c["id"], who, when, detag(c.get("content"))))
+    first_new = str(fresh[0]["id"]) if fresh else (str(ed[0]["id"]) if ed else "")
+    return path, first_new, len(fresh) + len(ed)
+
+
+def _secs(iso):
+    try: return calendar.timegm(time.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S"))
+    except Exception: return 0
 
 
 def cmd_watch(a):
@@ -816,17 +839,45 @@ def cmd_watch(a):
     seen_m = int(reg.get("mention_last_id") or 0)
     newest_m = seen_m
     hits = []
+    # An edited comment keeps its id, so the watermark never looks at it again. Christy
+    # added "@AI ... please publish this" to a comment 3\u00bd minutes after posting it
+    # (2026-09-22 23:16); the sweep had read the unedited version and moved on, and the
+    # request sat unseen overnight. Remember each edit we have considered, keyed by its
+    # updated_at, and re-read anything edited since.
+    seeding = "edits" not in reg      # first run with edit tracking: learn, deliver nothing
+    edits = reg.setdefault("edits", {})
+    live_ids = set()
     for c in comments:
-        cid = int(c["id"])
+        cid = int(c["id"]); live_ids.add(str(cid))
         if cid > newest_m: newest_m = cid
-        if first or cid <= seen_m: continue
+        ca, ua = c.get("created_at") or "", c.get("updated_at") or ""
+        # Basecamp bumps updated_at by a few seconds on its own (attachment processing);
+        # a person's edit comes minutes later. Under half a minute is not an edit.
+        was_edited = bool(ua) and ua != ca and _secs(ua) - _secs(ca) > 30
+        if first or cid <= seen_m:
+            if not was_edited or edits.get(str(cid)) == ua: continue
+            edits[str(cid)] = ua; dirty = True          # considered, whatever comes of it
+            if first or seeding: continue
+            c["_edited"] = True
+        elif was_edited:
+            edits[str(cid)] = ua; dirty = True          # new AND edited: once is enough
         if (c.get("creator") or {}).get("id") == me.get("id"): continue
         if FOOTER in (c.get("content") or ""): continue
         if mentions_only and me_id not in mentioned_ids(c.get("content")): continue
         hits.append(c)
+    for k in list(edits):                              # bounded to the fetch window
+        if k not in live_ids: edits.pop(k); dirty = True
     if first:
         reg["mention_last_id"] = newest_m; dirty = True
         if a.verbose: print("   starting from comment %s" % newest_m)
+
+    def hold(cs):
+        """Keep a mention for the next sweep. A new comment holds by rolling the watermark
+        back to it; an edited one cannot (its id is old, and rolling back that far would
+        replay everything since), so its edit is forgotten instead and re-seen next time."""
+        for c in cs:
+            if c.get("_edited"): edits.pop(str(c["id"]), None)
+            else: held.append(int(c["id"]))
 
     # One message per SESSION: `live` is sampled once per sweep, so a second deliver() to
     # the same pane would be typed into a session that went busy on the first.
@@ -849,7 +900,7 @@ def cmd_watch(a):
                 elif spawn_child(reg, sess, proj, tid, par.get("title") or "", c.get("app_url") or "",
                                  par.get("type") or ""):
                     dirty = True
-            held.append(int(c["id"]))
+            hold([c])
             continue
         if not owned:
             # Park it for assignment. It is safely in the registry, so the watermark may
@@ -873,7 +924,7 @@ def cmd_watch(a):
     for sess, items in sorted(by_sess.items()):
         label = "@mention x%d" % len(items)
         if not ready(sess, live, label):
-            held.extend(int(c["id"]) for c, _, _, _ in items); continue
+            hold([c for c, _, _, _ in items]); continue
         whys = sorted({w for _, _, _, w in items})
         # one transcript sync per thread; the pane message is only a pointer into it
         by_thread = {}
@@ -884,7 +935,8 @@ def cmd_watch(a):
             title = (cs[-1][1].get("title") or "")[:60]
             path, first_new, n_new = sync_transcript(reg, proj, tid, title,
                                                      cs[-1][0].get("app_url") or "",
-                                                     write=not a.dry_run)
+                                                     write=not a.dry_run,
+                                                     edited=[c for c, _ in cs if c.get("_edited")])
             if not a.dry_run: dirty = True
             who = ", ".join(sorted({(c.get("creator") or {}).get("name") or "someone"
                                     for c, _ in cs}))
@@ -897,8 +949,10 @@ def cmd_watch(a):
                      % (n_new, "y" if n_new == 1 else "ies", path, first_new)) if first_new \
                     else ("nothing new in %s — this mention IS the newest entry; read its tail."
                           % path)
-            parts.append('%s on "%s" (thread %s). %s%s Reply: bc-threads reply %s "..."'
-                         % (who, title, tid, where, brief_hint(tid), tid))
+            ed = sum(1 for c, _ in cs if c.get("_edited"))
+            parts.append('%s on "%s" (thread %s)%s. %s%s Reply: bc-threads reply %s "..."'
+                         % (who, title, tid, " \u2014 %d EDITED comment(s), re-read" % ed if ed else "",
+                            where, brief_hint(tid), tid))
         head = ("Basecamp — @mentioned %d time(s) across %d thread(s). "
                 % (len(items), len(by_thread))) if len(by_thread) > 1 else "Basecamp — "
         msg = clip(head + "  ".join(parts), BATCHMAX)
@@ -915,7 +969,7 @@ def cmd_watch(a):
             # session sorted after it. Hold this one, carry on with the rest.
             print("!! %s: delivery failed (%s) \u2014 holding" % (sess, str(ex)[:120]))
             note("hold", title=label, session=sess, why="delivery failed")
-            held.extend(int(c["id"]) for c, _, _, _ in items)
+            hold([c for c, _, _, _ in items])
             continue
         bridge = sessions().get(sess, {}).get("bridge") or ""
         print("-> %s: delivered %d @mention(s) across %d thread(s)" % (sess, len(items), len(by_thread)))
