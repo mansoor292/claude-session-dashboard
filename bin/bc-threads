@@ -529,23 +529,82 @@ def child_name(parent, title):
     return name
 
 
-def spawn_child(reg, parent, project, tid, title, url, kind):
-    """Fork a child from `parent` to own thread `tid`. Registers the leaf to the child.
+CHILD_PROMPT = (
+    "You are a fresh session for ONE Basecamp thread: \"%(title)s\" (thread %(tid)s, project "
+    "%(project)s). You have no conversation history, on purpose. Everything you know about this "
+    "client is the document below plus the tools you have (MCP servers, the repo you are in, "
+    "~/.claude/CLAUDE.md). Before acting: `bc-epoch show %(tid)s` for the thread's brief, then the "
+    "transcript at %(path)s.\n"
+    "When you are @mentioned you will be told where the new entries start. Reply only with "
+    "`bc-threads reply %(tid)s \"...\"`: bullets, action first, short. Ask when the ask is "
+    "underspecified; never claim a fix before it is proven on prod.\n"
+    "If the document and the tools are NOT enough to act on what is asked, do not guess and do not "
+    "improvise from general knowledge: ask on the thread, and record what was missing with "
+    "`bc-threads gap %(tid)s \"<what the document should have told you>\"` so the document gets "
+    "fixed for the next session.\n\n"
+    "--- CLIENT DOCUMENT: %(doc)s ---\n%(body)s\n--- END OF CLIENT DOCUMENT ---\n")
+GAPS = os.path.expanduser("~/.claude/client-gaps.jsonl")
 
-    Returns the child's name, or "" when the parent is mid-turn (a fork of a half-written
-    transcript is a child with a torn memory) \u2014 the caller holds and retries next sweep.
-    The child compacts itself first; delivery happens on a later sweep once it is idle.
+
+def client_doc(reg, project):
+    """The curated document for a Basecamp project's client, or "" when none is registered."""
+    p = (reg.get("client_docs") or {}).get(str(project)) or ""
+    p = os.path.expanduser(p)
+    return p if p and os.path.exists(p) else ""
+
+
+def record_gap(reg, project, thread, session, text, notify="_dashboard"):
+    """Something a fresh session needed and the client document did not carry."""
+    rec = {"ts": int(time.time()), "project": str(project), "thread": str(thread),
+           "session": session or "", "doc": (reg.get("client_docs") or {}).get(str(project)) or "",
+           "text": clip(text, 600)}
+    with open(GAPS, "a") as f: f.write(json.dumps(rec) + "\n")
+    note("gap", project=str(project), thread=str(thread), session=session or "", text=clip(text, HISTLEN))
+    if notify and tmux_has(notify):
+        try:
+            deliver(notify, "Client-doc gap from %s on thread %s (project %s): %s \u2014 fix the document %s; "
+                    "list: bc-threads gaps" % (session or "?", thread, project, clip(text, 300), rec["doc"] or "(none registered)"))
+        except Exception: pass
+
+
+def spawn_child(reg, parent, project, tid, title, url, kind):
+    """Start a session of its own for thread `tid`. Registers the leaf to it.
+
+    With a client document registered for the project, the child is a FRESH session carrying
+    that document in its system prompt and nothing else: a curated page every child shares,
+    reviewable, and fixable when it falls short. Compacting a forked lineage was tried first
+    and carried too much of the parent's other work along. Without a document the fork is
+    still used \u2014 and the missing document is recorded as a gap, so it gets written.
+    `parent` supplies the cwd and account either way.
+
+    Returns the child's name, or "" (parent mid-turn on the fork path, or the launch failed)
+    \u2014 the caller holds and retries next sweep. Delivery happens on a later sweep once
+    the child is idle.
     """
     name = child_name(parent, title)
+    doc = client_doc(reg, project)
     try:
-        r = dashboard("/api/fork?name=%s&as=%s" % (parent, name), COMPACT_MSG % ((title or "")[:80], tid))
+        if doc:
+            with open(doc) as f: body = f.read()
+            prompt = CHILD_PROMPT % {"title": (title or "")[:80], "tid": tid, "project": project,
+                                     "path": transcript_path(tid), "doc": doc, "body": body}
+            r = dashboard("/api/split?name=%s&as=%s&quiet=1" % (parent, name), prompt)
+            how = "from client doc %s (cwd of %s)" % (os.path.basename(doc), parent)
+        else:
+            r = dashboard("/api/fork?name=%s&as=%s" % (parent, name), COMPACT_MSG % ((title or "")[:80], tid))
+            how = "forked from " + parent
     except Exception as e:
-        print("!! fork from %s: %s" % (parent, str(e)[:120])); return ""
+        print("!! spawn for %s: %s" % (parent, str(e)[:120])); return ""
     if not r.get("ok"):
-        print("!! fork from %s: %s" % (parent, r.get("err"))); return ""
+        print("!! spawn for %s: %s" % (parent, r.get("err"))); return ""
+    name = r.get("name") or name                      # split de-duplicates the name itself
     register(reg, tid, project, name, kind=kind, title=title, url=url)
-    note("spawn", project=project, thread=tid, title=title, session=name, why="forked from " + parent)
-    print("++ %s forked from %s to own %r" % (name, parent, (title or "")[:40]))
+    note("spawn", project=project, thread=tid, title=title, session=name, why=how)
+    print("++ %s started %s to own %r" % (name, how, (title or "")[:40]))
+    if not doc:
+        record_gap(reg, project, tid, name, "no client document registered for project %s \u2014 "
+                   "child was forked from %s instead; write one and `bc-threads client-doc %s <path>`"
+                   % (project, parent, project))
     return name
 
 
@@ -1244,6 +1303,40 @@ def cmd_sync(a):
     save(reg)
 
 
+def cmd_gap(a):
+    """A session says what the client document should have told it."""
+    reg = load()
+    tid = recording_id(a.thread)
+    rec = reg["places"].get(tid) or {}
+    project = a.project or rec.get("project") or ""
+    if not project: sys.exit("cannot tell which project thread %s is in \u2014 pass --project" % tid)
+    record_gap(reg, project, tid, cur_session() or rec.get("session") or "", a.text, notify=a.notify)
+    print("gap recorded for project %s (doc: %s)" % (project, (reg.get("client_docs") or {}).get(str(project)) or "none"))
+
+
+def cmd_gaps(a):
+    if not os.path.exists(GAPS): print("no gaps recorded"); return
+    for line in open(GAPS):
+        try: g = json.loads(line)
+        except Exception: continue
+        print("%s  project %-9s thread %-12s %-38s %s" % (time.strftime("%m-%d %H:%M", time.localtime(g["ts"])),
+              g["project"], g["thread"], (g.get("session") or "")[:38], g["text"][:110]))
+
+
+def cmd_client_doc(a):
+    """Register (or show) the client document a project's fresh sessions are seeded with."""
+    reg = load(); docs = reg.setdefault("client_docs", {})
+    if a.path:
+        p = os.path.expanduser(a.path)
+        if not os.path.isfile(p): sys.exit("no such file: %s" % p)
+        docs[str(a.project)] = p; save(reg)
+        print("project %s -> %s (%d chars)" % (a.project, p, os.path.getsize(p)))
+    else:
+        for pid, p in sorted(docs.items()):
+            print("%s -> %s%s" % (pid, p, "" if os.path.exists(p) else "  (MISSING)"))
+        if not docs: print("no client documents registered")
+
+
 def cmd_orphans(a):
     """@mentions that arrived somewhere nobody owns."""
     reg = load()
@@ -1492,6 +1585,12 @@ sp.set_defaults(fn=cmd_ping_link)
 sp = sub.add_parser("sync"); sp.add_argument("recording", nargs="?")
 sp.add_argument("-p", "--project"); sp.set_defaults(fn=cmd_sync)
 sp = sub.add_parser("orphans"); sp.set_defaults(fn=cmd_orphans)
+sp = sub.add_parser("gap", help="record what the client document should have told this session")
+sp.add_argument("thread"); sp.add_argument("text"); sp.add_argument("--project"); sp.add_argument("--notify", default="_dashboard")
+sp.set_defaults(fn=cmd_gap)
+sp = sub.add_parser("gaps", help="list recorded client-document gaps"); sp.set_defaults(fn=cmd_gaps)
+sp = sub.add_parser("client-doc", help="register the document a project's fresh sessions are seeded with")
+sp.add_argument("project", nargs="?"); sp.add_argument("path", nargs="?"); sp.set_defaults(fn=cmd_client_doc)
 sp = sub.add_parser("orphancheck")
 sp.add_argument("--warn-hours", type=float, default=4.0)
 sp.add_argument("--notify", default="_dashboard")

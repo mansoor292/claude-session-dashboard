@@ -603,12 +603,13 @@ http.createServer((req,res)=>{
       const done=o=>{ res.writeHead(200,{'Content-Type':'application/json'}); res.end(JSON.stringify(o)); };
       try{
         const brief=body.trim();
-        if(!parent||!hasSession(parent)) return done({ok:false,err:'no such parent session: '+parent});
+        const asleepRec=readSleeping()[parent];
+        if(!parent||(!hasSession(parent)&&!asleepRec)) return done({ok:false,err:'no such parent session: '+parent});
         if(!wantName) return done({ok:false,err:'a name for the new session is required (as=)'});
         // A split with nothing in it is just a new session, and a session that thinks it
         // was briefed but was not is worse than one that knows it is starting cold.
         if(brief.length<80) return done({ok:false,err:'the brief is only '+brief.length+' chars \u2014 too thin to be a handoff'});
-        const ps=claudeSession(parent);
+        const ps=claudeSession(parent)||(asleepRec?{cwd:asleepRec.cwd,dir:asleepRec.dir,account:asleepRec.account}:null);
         const cwd=wantCwd||(ps&&ps.cwd)||CODE_ROOT;
         if(!fs.existsSync(cwd)) return done({ok:false,err:'cwd does not exist: '+cwd});
         let name=wantName; const b0=name; let k=2; while(hasSession(name)){ name=b0+'-'+k; k++; }
@@ -634,7 +635,9 @@ http.createServer((req,res)=>{
                   +' --append-system-prompt-file '+shq(file);
         tmux(['new-session','-d','-s',name,'-c',cwd].concat(envArgs).concat([cmd]));
         autoAnswer(name,'claude');
-        sendWhenReady(name,'You were split off from \u201c'+parent+'\u201d with a written brief \u2014 it is in your system prompt. Read it, then tell me in a few lines: what you understand the task to be, what the brief leaves unanswered, and what you would do first. Do not change any files until I answer.');
+        // quiet=1: an unattended split (bc-threads) delivers its own first message once the
+        // session is up; the interactive opener below would only get in its way.
+        if(u.searchParams.get('quiet')!=='1') sendWhenReady(name,'You were split off from \u201c'+parent+'\u201d with a written brief \u2014 it is in your system prompt. Read it, then tell me in a few lines: what you understand the task to be, what the brief leaves unanswered, and what you would do first. Do not change any files until I answer.');
         return done({ok:true,name,parent,cwd,brief:file,chars:brief.length});
       }catch(e){ return done({ok:false,err:String((e&&e.message)||e)}); }
     });
