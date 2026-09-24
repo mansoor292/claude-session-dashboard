@@ -471,6 +471,13 @@ def nearest_session(reg, project, thread_id):
     project, thread_id = str(project), str(thread_id)
     rec = reg["places"].get(thread_id)
     if rec and rec.get("session"):
+        # A session that owns several threads is not migrated by hand; each thread is
+        # peeled off the next time it is engaged (Mansoor, 2026-09-24). The owner is the
+        # closest relative — its cwd, its account, its client document — so the child is
+        # spawned from it and the thread re-bound before anything is delivered.
+        if reg.get("spawn_per_task", True) and len(leaves_of(reg, rec["session"])) > 1:
+            return rec["session"], ("it owns this thread among %d; peeling it off into a session of its own"
+                                    % len(leaves_of(reg, rec["session"]))), True, rec["session"]
         return rec["session"], "it already tracks this thread", True, ""
     gid = parent_id(reg, project, thread_id)
     if gid:
@@ -984,7 +991,7 @@ def cmd_watch(a):
             # mention is held either way \u2014 the child needs a sweep or two to come up and
             # compact \u2014 and next sweep the leaf is tracked, so it routes straight there.
             tid = str(par.get("id") or "")
-            if tid not in reg["places"]:
+            if tid not in reg["places"] or len(leaves_of(reg, spawn_from)) > 1:
                 if a.dry_run:
                     print("   would fork a child from %s for %r" % (sess, (par.get("title") or "?")[:40]))
                 elif (live.get(sess) or {}).get("status") in BLOCKED_STATUS:
