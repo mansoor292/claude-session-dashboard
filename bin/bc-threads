@@ -608,10 +608,43 @@ def spawn_child(reg, parent, project, tid, title, url, kind):
     return name
 
 
+# A thread is a leaf; a board or a to-do list is a container. One leaf, one session — hard.
+# Thirteen places funnelled into one Herrschners session without anyone deciding it, one
+# reply at a time, because replying on a thread quietly made the replier its owner. Now a
+# session that already owns a thread cannot take another: the binding is refused with the
+# way out (spawn a child, or reply --no-track), and `bc-threads audit` reports any drift.
+LEAF_KINDS = {"Message", "Todo", "Document", "Upload", "Card", "Kanban::Card", "Question", "Question::Answer"}
+
+
+def is_leaf(kind):
+    return (kind or "") in LEAF_KINDS
+
+
+def leaves_of(reg, session):
+    return sorted(pid for pid, r in reg["places"].items()
+                  if r.get("session") == session and is_leaf(r.get("kind")))
+
+
+def assert_one_leaf(reg, session, pid, kind):
+    """Refuse a binding that would give `session` a second thread, or give one to an internal session."""
+    if not session or not is_leaf(kind): return
+    if session.startswith("_"):
+        sys.exit("REFUSED: %s is an internal session and cannot own a thread. Pass --session <owner>, "
+                 "or spawn one: bc-threads spawn %s" % (session, pid))
+    others = [x for x in leaves_of(reg, session) if x != str(pid)]
+    if others:
+        r = reg["places"][others[0]]
+        sys.exit("REFUSED: %s already owns thread %s (%s) \u2014 one thread per session, no exceptions.\n"
+                 "Give this thread a session of its own:  bc-threads spawn %s --from %s\n"
+                 "or answer without taking it:            bc-threads reply %s \"...\" --no-track"
+                 % (session, others[0], (r.get("title") or "")[:40], pid, session, pid))
+
+
 def register(reg, pid, project, session, kind="", title="", url="", quiet=False):
     """Track a place. Idempotent: posting again into a place already tracked by this
     session must not reset its watermark and replay the thread."""
     pid = str(pid)
+    assert_one_leaf(reg, session, pid, kind or (reg["places"].get(pid) or {}).get("kind"))
     rec = reg["places"].get(pid)
     if rec is None:
         rec = {"connected": int(time.time()), "ours": []}
@@ -1107,6 +1140,11 @@ def cmd_reply(a):
                  "to slip past this check." % m0.group(0))
     rid = recording_id(a.recording)
     sess = a.session or cur_session()
+    # Would this reply make `sess` the owner of a thread it does not have? Decide that before
+    # posting: a refusal after the comment is out would leave a reply nobody routes.
+    if not a.no_track and sess and reg["places"].get(rid) is None and tmux_has(sess):
+        pre = fetch(a.project, rid) if a.project else {}
+        assert_one_leaf(reg, sess, rid, pre.get("type") or "Message")
     d = bc("comments", "create", rid, a.text, *(["--in", a.project] if a.project else [])) or {}
     project = str(a.project or (d.get("bucket") or {}).get("id") or "")
     rec = reg["places"].get(rid)
@@ -1303,6 +1341,68 @@ def cmd_sync(a):
     save(reg)
 
 
+def cmd_spawn(a):
+    """Give a thread a session of its own \u2014 the way out of every REFUSED above, and the
+    migration tool for sessions that own several threads today."""
+    reg = load()
+    rid = recording_id(a.thread)
+    rec = reg["places"].get(rid) or {}
+    project = a.project or rec.get("project") or ""
+    d = fetch(project, rid) if project else {}
+    if not d.get("id"):
+        # find the project by asking Basecamp for the recording across projects
+        for r in reg["places"].values():
+            if not r.get("project"): continue
+            d = fetch(r["project"], rid)
+            if d.get("id"): project = str((d.get("bucket") or {}).get("id") or r["project"]); break
+    if not d.get("id"): sys.exit("cannot find recording %s \u2014 pass --project" % rid)
+    kind = d.get("type") or rec.get("kind") or ""
+    if not is_leaf(kind): sys.exit("%s is a %s, not a thread \u2014 containers are parents, not owned" % (rid, kind))
+    parent = a.frm or rec.get("session") or ""
+    if not parent:
+        gid = parent_id(reg, project, rid)
+        parent = ((reg["places"].get(gid) or {}).get("session")) if gid else ""
+    parent = parent or cur_session()
+    if not parent or parent.startswith("_"):
+        sys.exit("say where the child's cwd and account come from: --from <session>")
+    if (sessions().get(parent) or {}).get("status") in BLOCKED_STATUS and not client_doc(reg, project):
+        sys.exit("%s is mid-turn and no client document is registered for project %s \u2014 a fork would copy a "
+                 "half-written transcript; try again when it is idle, or register a document" % (parent, project))
+    name = spawn_child(reg, parent, project, rid, d.get("title") or d.get("subject") or rec.get("title") or "",
+                       d.get("app_url") or rec.get("url") or "", kind)
+    if not name: sys.exit(1)
+    save(reg)
+    print("%s -> %s" % (rid, name))
+
+
+def audit_violations(reg):
+    """(session, [leaf ids]) for every session owning more than one thread, plus internal owners."""
+    by = {}
+    for pid, r in reg["places"].items():
+        if r.get("session") and is_leaf(r.get("kind")): by.setdefault(r["session"], []).append(pid)
+    return sorted((s, sorted(v)) for s, v in by.items() if len(v) > 1 or s.startswith("_"))
+
+
+def cmd_audit(a):
+    reg = load()
+    bad = audit_violations(reg)
+    if not bad:
+        print("one thread per session: holds (%d threads, %d sessions)"
+              % (sum(1 for r in reg["places"].values() if is_leaf(r.get("kind")) and r.get("session")),
+                 len({r["session"] for r in reg["places"].values() if r.get("session") and is_leaf(r.get("kind"))})))
+        return
+    for sess, pids in bad:
+        print("%s owns %d threads:" % (sess, len(pids)))
+        for pid in pids:
+            r = reg["places"][pid]
+            print("   %s  %-8s %s" % (pid, r.get("kind") or "?", (r.get("title") or "")[:60]))
+        print("   split: bc-threads spawn <thread> --from %s   (one per extra thread)" % sess)
+    if a.notify and tmux_has(a.notify):
+        deliver(a.notify, "bc-threads audit: %d session(s) own more than one thread \u2014 %s. Run `bc-threads audit`."
+                % (len(bad), ", ".join("%s (%d)" % (s, len(p)) for s, p in bad)))
+    sys.exit(1)
+
+
 def cmd_gap(a):
     """A session says what the client document should have told it."""
     reg = load()
@@ -1462,6 +1562,13 @@ def orphan_notice(reg, notify, warn_hours=0.0, dry=False):
 
 
 def cmd_orphancheck(a):
+    try:
+        bad = audit_violations(load())
+        if bad and a.notify and tmux_has(a.notify) and not a.dry_run:
+            deliver(a.notify, "bc-threads audit: %d session(s) own more than one thread \u2014 %s. Run `bc-threads audit`."
+                    % (len(bad), ", ".join("%s (%d)" % (s, len(p)) for s, p in bad)))
+    except Exception as e:
+        print("!! audit failed: %s" % str(e)[:120])
     reg = load()
     n = orphan_notice(reg, resolve_session(a.notify), a.warn_hours, dry=a.dry_run)
     if not a.dry_run: save(reg)
@@ -1585,6 +1692,11 @@ sp.set_defaults(fn=cmd_ping_link)
 sp = sub.add_parser("sync"); sp.add_argument("recording", nargs="?")
 sp.add_argument("-p", "--project"); sp.set_defaults(fn=cmd_sync)
 sp = sub.add_parser("orphans"); sp.set_defaults(fn=cmd_orphans)
+sp = sub.add_parser("spawn", help="give a thread a session of its own (fresh, from the client document)")
+sp.add_argument("thread"); sp.add_argument("--from", dest="frm", help="session whose cwd/account the child takes"); sp.add_argument("--project")
+sp.set_defaults(fn=cmd_spawn)
+sp = sub.add_parser("audit", help="one thread per session: report any session owning more than one")
+sp.add_argument("--notify", help="also ping this session when the rule is broken"); sp.set_defaults(fn=cmd_audit)
 sp = sub.add_parser("gap", help="record what the client document should have told this session")
 sp.add_argument("thread"); sp.add_argument("text"); sp.add_argument("--project"); sp.add_argument("--notify", default="_dashboard")
 sp.set_defaults(fn=cmd_gap)
