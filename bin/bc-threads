@@ -1570,10 +1570,18 @@ def orphan_notice(reg, notify, warn_hours=0.0, dry=False):
 
 def cmd_orphancheck(a):
     try:
-        bad = audit_violations(load())
-        if bad and a.notify and tmux_has(a.notify) and not a.dry_run:
-            deliver(a.notify, "bc-threads audit: %d session(s) own more than one thread \u2014 %s. Run `bc-threads audit`."
-                    % (len(bad), ", ".join("%s (%d)" % (s, len(p)) for s, p in bad)))
+        reg0 = load()
+        bad = audit_violations(reg0)
+        # The pre-rule owners drain one mention at a time; repeating the same list every
+        # hour is noise. Speak when the picture changes — a new violator, or one gone.
+        sig = ["%s:%d" % (s, len(p)) for s, p in bad]
+        if sig != (reg0.get("audit_last") or []) and a.notify and tmux_has(a.notify) and not a.dry_run:
+            if bad:
+                deliver(a.notify, "bc-threads audit: %d session(s) own more than one thread \u2014 %s. Run `bc-threads audit`."
+                        % (len(bad), ", ".join("%s (%d)" % (s, len(p)) for s, p in bad)))
+            else:
+                deliver(a.notify, "bc-threads audit: one thread per session now holds everywhere.")
+            reg0["audit_last"] = sig; save(reg0)
     except Exception as e:
         print("!! audit failed: %s" % str(e)[:120])
     reg = load()
