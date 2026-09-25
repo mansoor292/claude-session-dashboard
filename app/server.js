@@ -1026,4 +1026,16 @@ async function tick(){try{const d=await(await fetch('/api/sessions')).json();DAT
 setInterval(tick,4000);
 (function(){var tb=document.getElementById('ltbody');if(tb){tb.addEventListener('click',function(e){var tr=e.target.closest('tr');if(!tr)return;var name=tr.dataset.name;if(e.target.closest('.lkill')){killByName(name,tr.dataset.cwd,e,((tr.querySelector('.lopen')||{}).textContent||name).trim());return;}if(e.target.closest('.lbranch')){branchSession(name,e);return;}if(e.target.closest('.lsplit')){splitSession(name,e);return;}if(e.target.closest('.lzzz')){sleepSession(name,e);return;}if(e.target.closest('.lwake')||tr.querySelector('.pill.zz')){wakeSession(name,e);return;}if(e.target.closest('.vs'))return;if(tr.dataset.rc){window.open('https://claude.ai/code/'+tr.dataset.bridge,'_blank');}else{open_(encodeURIComponent(name));}});}setView(VIEW);})();
 </script></body></html>`);
-}).listen(PORT,'127.0.0.1',()=>console.log('dashboard on '+PORT));
+}).listen(PORT,'127.0.0.1',()=>{ console.log('dashboard on '+PORT); selfCheck(); });
+// The page is a template literal, so a slip in it (a raw newline inside a JS string, say)
+// is not a server syntax error — it is a dead page where no button works, and nothing said
+// so for a day (2026-09-24). Fetch our own page once at startup and parse each inline
+// script; shout in the journal if one does not compile.
+function selfCheck(){
+  http.get('http://127.0.0.1:'+PORT+'/', r=>{ let b=''; r.on('data',c=>b+=c); r.on('end',()=>{
+    const scripts=[...b.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map(m=>m[1]);
+    let bad=0;
+    scripts.forEach((src,i)=>{ try{ new Function(src); }catch(e){ bad++; console.error('PAGE SCRIPT '+i+' DOES NOT PARSE: '+e.message); } });
+    console.log(bad ? 'SELF-CHECK FAILED: '+bad+' inline script(s) broken — the sessions page is dead' : 'self-check: '+scripts.length+' inline script(s) parse');
+  }); }).on('error',e=>console.error('self-check could not fetch the page: '+e.message));
+}
