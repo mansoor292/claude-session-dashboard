@@ -24,7 +24,9 @@ answer_prompts() {
     sleep 3
     local pane; pane=$(tmux capture-pane -p -t "$name" -S -12 2>/dev/null)
     echo "$pane" | grep -q 'remote-control is active' && return 0
-    if echo "$pane" | grep -q 'trust this folder'; then tmux send-keys -t "$name" '1' Enter; continue; fi
+    # New trust dialog: arrow list, "No, exit" preselected — Down+Enter picks Yes. Old: "1".
+    if echo "$pane" | grep -q 'trust this folder'; then
+      if echo "$pane" | grep -q 'No, exit'; then tmux send-keys -t "$name" Down; sleep 0.3; tmux send-keys -t "$name" Enter; else tmux send-keys -t "$name" '1' Enter; fi; continue; fi
     if echo "$pane" | grep -qE 'Resume full session|Enter to confirm'; then tmux send-keys -t "$name" Enter; continue; fi
   done
 }

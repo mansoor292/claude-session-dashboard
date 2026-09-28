@@ -114,7 +114,10 @@ function sendWhenReady(name, text, tries){
 function autoAnswer(name, mode){
   const rcState={sent:false};
   const answer=()=>{ try{ const pane=tmux(['capture-pane','-p','-t',name]);
-    if(/trust this folder/.test(pane)) tmux(['send-keys','-t',name,'1','Enter']);
+    // Newer builds draw the trust dialog as an arrow-key list with "No, exit" selected by
+    // default; "1"+Enter there confirms EXIT (it killed the whatsapp session on wake,
+    // 2026-09-28). Older builds took a number. Answer whichever is on screen.
+    if(/trust this folder/.test(pane)) { if(/No, exit/.test(pane)) { tmux(['send-keys','-t',name,'Down']); setTimeout(()=>tmux(['send-keys','-t',name,'Enter']),300); } else tmux(['send-keys','-t',name,'1','Enter']); }
     else if(/Bypass Permissions mode/.test(pane) && /Yes, I accept/.test(pane)) tmux(['send-keys','-t',name,'2','Enter']);   // one-time per new config dir
     else if(/Teleport to Repo|Resume full session|Enter to confirm/.test(pane)) tmux(['send-keys','-t',name,'Enter']);
     else if(mode==='teleport' && !rcState.sent && !/remote-control is active/.test(pane) && /(Session resumed|bypass permissions on)/i.test(pane)){ tmux(['send-keys','-t',name,'/remote-control','Enter']); rcState.sent=true; } }catch{} };
