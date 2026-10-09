@@ -945,6 +945,13 @@ def cmd_watch(a):
     # updated_at, and re-read anything edited since.
     seeding = "edits" not in reg      # first run with edit tracking: learn, deliver nothing
     edits = reg.setdefault("edits", {})
+    # The watermark is one number for the whole account, and a HELD mention pins it below
+    # itself so it survives to the next sweep. Every comment above that pin is then re-read
+    # every sweep — and re-DELIVERED, because nothing remembered a delivery. One session
+    # parked on a Supabase confirm dialog (catipult-site-v2, 2026-10-09) held 8 mentions and
+    # made Christy's reply on Better Choice land again every 130 s for an hour. Delivered
+    # ids are remembered here, bounded to the fetch window, and skipped on replay.
+    delivered = reg.setdefault("delivered", {})
     live_ids = set()
     for c in comments:
         cid = int(c["id"]); live_ids.add(str(cid))
@@ -963,9 +970,12 @@ def cmd_watch(a):
         if (c.get("creator") or {}).get("id") == me.get("id"): continue
         if FOOTER in (c.get("content") or ""): continue
         if mentions_only and me_id not in mentioned_ids(c.get("content")): continue
+        if str(cid) in delivered and not c.get("_edited"): continue   # already landed; an edit re-opens it
         hits.append(c)
     for k in list(edits):                              # bounded to the fetch window
         if k not in live_ids: edits.pop(k); dirty = True
+    for k in list(delivered):
+        if k not in live_ids: delivered.pop(k); dirty = True
     if first:
         reg["mention_last_id"] = newest_m; dirty = True
         if a.verbose: print("   starting from comment %s" % newest_m)
@@ -1073,6 +1083,7 @@ def cmd_watch(a):
         bridge = sessions().get(sess, {}).get("bridge") or ""
         print("-> %s: delivered %d @mention(s) across %d thread(s)" % (sess, len(items), len(by_thread)))
         for c, par, proj, why in items:
+            delivered[str(c["id"])] = int(time.time()); dirty = True
             note("mention", project=proj, thread=str(par.get("id") or ""),
                  title=par.get("title") or "", session=sess,
                  frm=(c.get("creator") or {}).get("name") or "", cid=str(c["id"]),
@@ -1516,6 +1527,7 @@ def cmd_assign(a):
     ensure_bridge(sess)
     deliver(sess, msg)
     reg["orphans"].pop(str(a.cid), None)      # delivered — only now is it no longer waiting
+    reg.setdefault("delivered", {})[str(a.cid)] = int(time.time())
     save(reg)
     bridge = sessions().get(sess, {}).get("bridge") or ""
     note("mention", project=proj, thread=tid, title=o.get("title") or "", session=sess,
