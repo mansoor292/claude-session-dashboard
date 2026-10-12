@@ -716,6 +716,28 @@ def sweep_comments(limit):
     return bc("comments", "list", "--all-projects", "--limit", str(limit), check=False) or []
 
 
+def sweep_posts():
+    """Recent message-board POSTS, shaped like comments so the sweep treats them alike.
+
+    A mention in the body of a new post was invisible: the sweep read comments only, so
+    Christy's "Q & A" post on Better Choice (2026-10-12) sat unseen while every comment
+    around it was delivered. A post is its own thread \u2014 the record's `parent` is set
+    to the post itself, so routing lands on the board's owner (a container, which spawns
+    a child) and the transcript is keyed by the post id.
+    """
+    d = bc("api", "get", "/projects/recordings.json?type=Message&sort=created_at&direction=desc",
+           check=False)
+    out = []
+    for m in (d if isinstance(d, list) else []):
+        out.append({"id": m["id"], "created_at": m.get("created_at"), "updated_at": m.get("updated_at"),
+                    "creator": m.get("creator") or {}, "bucket": m.get("bucket") or {},
+                    "content": "%s\n%s" % (m.get("subject") or "", m.get("content") or ""),
+                    "app_url": m.get("app_url") or "", "_post": True,
+                    "parent": {"id": m["id"], "title": m.get("subject") or "", "type": "Message",
+                               "url": m.get("url") or ""}})
+    return out
+
+
 # ---- commands -------------------------------------------------------------
 def cmd_track(a):
     reg = load()
@@ -883,6 +905,15 @@ def sync_transcript(reg, project, thread_id, title="", url="", write=True, edite
         with open(path, "w") as f:
             f.write(HEADER % (title or "Basecamp thread " + tid, tid, project,
                               (" · " + url) if url else "", tid))
+            # A message thread's opening post is not one of its comments. Without it the
+            # file would start mid-conversation, so the post body is the first entry.
+            try:
+                m = bc("api", "get", "/buckets/%s/messages/%s.json" % (project, tid), check=False) or {}
+                if m.get("id"):
+                    f.write("\n#### %s · %s · %s (post)\n\n%s\n"
+                            % (m["id"], (m.get("creator") or {}).get("name") or "someone",
+                               (m.get("created_at") or "")[:16].replace("T", " "), detag(m.get("content"))))
+            except Exception: pass
     if fresh:
         with open(path, "a") as f:
             for c in fresh:
@@ -932,11 +963,21 @@ def cmd_watch(a):
     # WHETHER something is delivered, only WHERE it goes: an ordinary comment on a tracked
     # thread is now silence. Flip deliver_unmentioned in the registry to undo that.
     mentions_only = not reg.get("deliver_unmentioned")
-    comments = sweep_comments(a.limit)
+    comments = sweep_comments(a.limit) + sweep_posts()
 
     first = "mention_last_id" not in reg
     seen_m = int(reg.get("mention_last_id") or 0)
     newest_m = seen_m
+    # Posts are a second stream with their own watermark: ids interleave with comments, and
+    # the comment watermark has usually already passed a fresh post. First run starts a day
+    # back so the post that exposed the gap is caught, not seeded away.
+    posts = [c for c in comments if c.get("_post")]
+    if "post_last_id" not in reg:
+        cutoff = time.strftime("%Y-%m-%dT%H:%M", time.gmtime(time.time() - 86400))
+        old = [int(c["id"]) for c in posts if (c.get("created_at") or "") < cutoff]
+        reg["post_last_id"] = max(old) if old else 0; dirty = True
+    seen_p = int(reg.get("post_last_id") or 0)
+    newest_p = seen_p
     hits = []
     # An edited comment keeps its id, so the watermark never looks at it again. Christy
     # added "@AI ... please publish this" to a comment 3\u00bd minutes after posting it
@@ -955,12 +996,17 @@ def cmd_watch(a):
     live_ids = set()
     for c in comments:
         cid = int(c["id"]); live_ids.add(str(cid))
-        if cid > newest_m: newest_m = cid
+        if c.get("_post"):
+            if cid > newest_p: newest_p = cid
+            if cid <= seen_p and str(cid) in delivered: continue
+            if cid <= seen_p: continue
+        else:
+            if cid > newest_m: newest_m = cid
         ca, ua = c.get("created_at") or "", c.get("updated_at") or ""
         # Basecamp bumps updated_at by a few seconds on its own (attachment processing);
         # a person's edit comes minutes later. Under half a minute is not an edit.
         was_edited = bool(ua) and ua != ca and _secs(ua) - _secs(ca) > 30
-        if first or cid <= seen_m:
+        if (first or cid <= seen_m) and not c.get("_post"):
             if not was_edited or edits.get(str(cid)) == ua: continue
             edits[str(cid)] = ua; dirty = True          # considered, whatever comes of it
             if first or seeding: continue
@@ -1095,6 +1141,10 @@ def cmd_watch(a):
     if held: newest_m = min(newest_m, min(held) - 1)
     if not first and newest_m > seen_m:
         reg["mention_last_id"] = newest_m; dirty = True
+    held_p = [h for h in held if str(h) in {str(c["id"]) for c in posts}]
+    if held_p: newest_p = min(newest_p, min(held_p) - 1)
+    if newest_p > seen_p:
+        reg["post_last_id"] = newest_p; dirty = True
 
     # Parking a mention used to tell nobody. Announce anything newly unrouted in the same
     # sweep that parked it, so "waiting to be assigned" cannot quietly mean "forgotten".
