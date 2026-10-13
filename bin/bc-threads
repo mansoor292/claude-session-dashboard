@@ -305,7 +305,73 @@ def deliver(name, text):
 
 
 BLOCKED_STATUS = ("busy", "waiting")   # a tool call is running, or a dialog has the keyboard
-OVERLAY = re.compile(r"esc to cancel|Yes, I accept|trust this folder", re.I)
+OVERLAY = re.compile(r"esc to cancel|Yes, I accept|trust this folder|requests your input", re.I)
+ELICIT = re.compile(r"MCP server .(.+?). requests your input", re.I)
+DIALOG_DECLINE_MIN = int(os.environ.get("BC_DIALOG_DECLINE_MIN", "30"))
+
+
+def dialog_sweep(reg, notify, dry=False):
+    """Surface MCP elicitation dialogs, and decline the ones nobody answers.
+
+    An MCP server's own prompt ("MCP server X requests your input") renders only in the
+    terminal; Remote Control does not carry it, so a session parked on one looks merely
+    "waiting" from the app. One such confirm held catipult-site-v2 for three days with 16
+    of Pamela's mentions behind it (2026-10-09), and the Supabase destructive-SQL confirm
+    did it again on 2026-10-12. Now: the first sweep that sees a dialog pings `notify`
+    with the session, the server and the request text; after DIALOG_DECLINE_MIN it is
+    DECLINED (never accepted — a decline is the safe side; the session sees the refusal
+    and re-plans or asks). Accepting is a person's click, in the pane or via _dashboard.
+    """
+    dialogs = reg.setdefault("dialogs", {})
+    now = int(time.time()); dirty = False
+    live = {n: i for n, i in sessions().items() if i.get("alive") and not n.startswith("_")}
+    for name in sorted(live):
+        try:
+            pane = subprocess.run([TMUX, "-L", socket_for(name), "capture-pane", "-p", "-t", name + ":"],
+                                  capture_output=True, text=True, timeout=15).stdout
+        except Exception:
+            continue
+        m = ELICIT.search(pane)
+        if not m:
+            if name in dialogs: dialogs.pop(name); dirty = True
+            continue
+        # the request text sits between the server line and the Accept/Decline row
+        lines = [l.strip() for l in pane.splitlines() if l.strip()]
+        try:
+            i0 = next(i for i, l in enumerate(lines) if ELICIT.search(l))
+        except StopIteration:
+            i0 = 0
+        body = " ".join(lines[i0 + 1:i0 + 6])
+        body = re.sub(r"(Accept|Decline|Esc to cancel).*$", "", body).strip()[:400]
+        rec = dialogs.get(name)
+        if not rec or rec.get("body") != body:
+            dialogs[name] = {"since": now, "server": m.group(1), "body": body, "notified": False, "declined": False}
+            rec = dialogs[name]; dirty = True
+        age_min = (now - rec["since"]) / 60.0
+        if not rec["notified"] and notify and tmux_has(notify) and not dry:
+            deliver(notify, "Session %s is parked on an MCP dialog from %s: %s \u2014 invisible from the app. "
+                            "It is auto-DECLINED after %d min unless someone accepts it in the pane first."
+                            % (name, rec["server"], body or "(no text captured)", DIALOG_DECLINE_MIN))
+            rec["notified"] = True; dirty = True
+        if age_min >= DIALOG_DECLINE_MIN and not rec["declined"] and not dry:
+            sock = socket_for(name)
+            subprocess.run([TMUX, "-L", sock, "send-keys", "-t", name + ":", "Right"], check=False)
+            time.sleep(0.4)
+            after = subprocess.run([TMUX, "-L", sock, "capture-pane", "-p", "-t", name + ":"],
+                                   capture_output=True, text=True).stdout
+            if re.search(r"\u276f\s*Decline", after):
+                subprocess.run([TMUX, "-L", sock, "send-keys", "-t", name + ":", "Enter"], check=False)
+                rec["declined"] = True; dirty = True
+                note("dialog", session=name, why="declined after %d min" % int(age_min), text=body)
+                print("-- %s: MCP dialog declined after %d min" % (name, int(age_min)))
+                if notify and tmux_has(notify):
+                    deliver(notify, "Declined the %s dialog in %s after %d min unanswered: %s"
+                                    % (rec["server"], name, int(age_min), body[:200]))
+            else:
+                print("-- %s: could not land the cursor on Decline; left alone" % name)
+        elif m:
+            print("-- %s: MCP dialog up %d min (%s)" % (name, int(age_min), body[:60]))
+    return dirty
 
 
 def pane_blocked(sess):
@@ -952,6 +1018,10 @@ def cmd_watch(a):
     if not a.no_pings:
         try: cmd_pings(argparse.Namespace(to=None, dry_run=a.dry_run, verbose=a.verbose))
         except Exception as e: print("!! ping sweep failed: %s" % e)
+    try:
+        if dialog_sweep(reg, resolve_session(a.notify), dry=a.dry_run): save(reg)
+    except Exception as e:
+        print("!! dialog sweep failed: %s" % str(e)[:120])
     if not reg["places"] and a.verbose: print("no places tracked")
     dirty = False
     cached = len(reg["parents"])
