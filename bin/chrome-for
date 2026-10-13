@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# chrome-for — give a Claude session a real Chrome on a virtual display, viewable in a browser.
+#
+#   chrome-for <session>            start (or report) Chrome + viewer for this session
+#   chrome-for <session> stop       stop everything for it; the profile (logins) is kept
+#   chrome-for <session> status     endpoints, pids, viewer URL
+#   chrome-for list                 every session that has one
+#
+# What runs, per session, all bound to localhost:
+#   Xvfb :<display>                 a virtual screen, 1600x1000
+#   google-chrome                   a REAL Chrome (not headless) on that screen, with
+#                                   --remote-debugging-port so the session drives it over
+#                                   CDP (Playwright: chromium.connectOverCDP(url))
+#   x11vnc                          shares the screen, VNC-password protected
+#   websockify + noVNC              serves the screen to a browser on one port
+#
+# The viewer is at https://p<port>.dev.catalogshub.com/vnc.html — the box's wildcard proxy
+# publishes every local port, UNAUTHENTICATED, so the VNC password is the only gate. Keep
+# it; never start the viewer without one. A manager who opens that URL sees the live tab,
+# can click and type into it (shared desktop), and hands back by leaving it alone.
+#
+# State: ~/.claude/chrome/<session>/ — profile/ (Chrome's user-data-dir: logins survive a
+# restart), info.json (display, cdp, vnc, viewer, password), *.pid, *.log.
+set -euo pipefail
+ROOT="$HOME/.claude/chrome"
+DOMAIN="${DEV_DOMAIN:-dev.catalogshub.com}"
+W=1600; H=1000
+
+die(){ echo "chrome-for: $*" >&2; exit 1; }
+alive(){ [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+pidof_file(){ [ -f "$1" ] && cat "$1" || true; }
+# Stable, non-colliding numbers from the session name: display 100-199, ports 6100-6499.
+slot(){ printf '%d' "$(( ( $(printf '%s' "$1" | cksum | cut -d' ' -f1) % 100 ) ))"; }
+port_free(){ ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$1\$"; }
+
+cmd_list(){
+  [ -d "$ROOT" ] || { echo "none"; return; }
+  for d in "$ROOT"/*/; do [ -f "$d/info.json" ] || continue
+    n=$(basename "$d"); c=$(pidof_file "$d/chrome.pid")
+    printf '%-40s %s  %s\n' "$n" "$(alive "$c" && echo running || echo stopped)" "$(python3 -c "import json;print(json.load(open('$d/info.json'))['viewer'])")"
+  done
+}
+
+cmd_status(){
+  local d="$ROOT/$1"; [ -f "$d/info.json" ] || die "no Chrome for $1"
+  python3 - "$d" <<'EOF'
+import json,sys,os
+d=sys.argv[1]; i=json.load(open(d+'/info.json'))
+def up(f):
+    try: pid=int(open(d+'/'+f).read().strip()); os.kill(pid,0); return 'up'
+    except Exception: return 'DOWN'
+print("session  ", i['session'])
+print("viewer   ", i['viewer'], " password:", i['password'])
+print("cdp      ", i['cdp'], " (Playwright: chromium.connectOverCDP)")
+print("display  ", i['display'], " vnc 127.0.0.1:%s" % i['vnc'])
+for f in ('xvfb','chrome','x11vnc','websockify'): print("%-9s %s" % (f, up(f+'.pid')))
+EOF
+}
+
+cmd_stop(){
+  local d="$ROOT/$1"; [ -d "$d" ] || die "no Chrome for $1"
+  for f in websockify x11vnc chrome xvfb; do p=$(pidof_file "$d/$f.pid"); alive "$p" && kill "$p" 2>/dev/null || true; rm -f "$d/$f.pid"; done
+  sleep 1; echo "stopped Chrome for $1 (profile kept in $d/profile)"
+}
+
+cmd_start(){
+  local s="$1" d="$ROOT/$1"; mkdir -p "$d/profile"
+  if alive "$(pidof_file "$d/chrome.pid")" && alive "$(pidof_file "$d/websockify.pid")"; then cmd_status "$s"; return; fi
+  cmd_stop "$s" >/dev/null 2>&1 || true
+  local n; n=$(slot "$s"); local disp=$((100+n)) cdp=$((6100+n)) vnc=$((6200+n)) web=$((6300+n))
+  for p in $cdp $vnc $web; do port_free "$p" || die "port $p is taken — pass a different session name or free it"; done
+  # one password per session, kept in the state dir (0600); 8 chars is VNC's limit
+  local pw; if [ -f "$d/password" ]; then pw=$(cat "$d/password"); else pw=$(head -c 64 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 8); (umask 077; printf '%s' "$pw" >"$d/password"); fi
+  (umask 077; x11vnc -storepasswd "$pw" "$d/vncpass" >/dev/null 2>&1)
+
+  Xvfb ":$disp" -screen 0 "${W}x${H}x24" -nolisten tcp >"$d/xvfb.log" 2>&1 & echo $! >"$d/xvfb.pid"
+  for i in $(seq 1 30); do [ -e "/tmp/.X11-unix/X$disp" ] && break; sleep 0.2; done
+  [ -e "/tmp/.X11-unix/X$disp" ] || die "Xvfb :$disp did not come up — $d/xvfb.log"
+
+  DISPLAY=":$disp" google-chrome \
+      --user-data-dir="$d/profile" --remote-debugging-port="$cdp" --remote-debugging-address=127.0.0.1 \
+      --no-first-run --no-default-browser-check --disable-gpu --disable-dev-shm-usage \
+      --window-position=0,0 --window-size="$W,$H" --disable-session-crashed-bubble --hide-crash-restore-bubble \
+      about:blank >"$d/chrome.log" 2>&1 & echo $! >"$d/chrome.pid"
+  for i in $(seq 1 50); do curl -fs "http://127.0.0.1:$cdp/json/version" >/dev/null 2>&1 && break; sleep 0.2; done
+  curl -fs "http://127.0.0.1:$cdp/json/version" >/dev/null 2>&1 || die "Chrome's debugging port never answered — $d/chrome.log"
+
+  x11vnc -display ":$disp" -rfbport "$vnc" -localhost -forever -shared -noxdamage -rfbauth "$d/vncpass" -bg -o "$d/x11vnc.log" >/dev/null 2>&1
+  sleep 0.5; pgrep -f "x11vnc -display :$disp " | head -1 >"$d/x11vnc.pid"
+  websockify --web /usr/share/novnc "127.0.0.1:$web" "127.0.0.1:$vnc" >"$d/websockify.log" 2>&1 & echo $! >"$d/websockify.pid"
+  sleep 0.5
+
+  local viewer="https://p${web}.${DOMAIN}/vnc.html?autoconnect=1&resize=scale"
+  python3 - "$d" "$s" "$disp" "$cdp" "$vnc" "$web" "$viewer" "$pw" <<'EOF'
+import json,sys,time
+d,s,disp,cdp,vnc,web,viewer,pw=sys.argv[1:]
+json.dump({"session":s,"display":":"+disp,"cdp":"http://127.0.0.1:%s"%cdp,"vnc":vnc,"web":web,"viewer":viewer,"password":pw,"startedAt":int(time.time())}, open(d+"/info.json","w"), indent=1)
+EOF
+  chmod 600 "$d/info.json"
+  cmd_status "$s"
+}
+
+case "${1:-}" in
+  ""|-h|--help) sed -n '2,24p' "$0"; exit 0;;
+  list) cmd_list;;
+  *) s="$1"; case "${2:-start}" in start) cmd_start "$s";; stop) cmd_stop "$s";; status) cmd_status "$s";; *) die "unknown action $2";; esac;;
+esac
