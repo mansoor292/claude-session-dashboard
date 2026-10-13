@@ -344,7 +344,9 @@ def dialog_sweep(reg, notify, dry=False):
         body = " ".join(lines[i0 + 1:i0 + 6])
         body = re.sub(r"(Accept|Decline|Esc to cancel).*$", "", body).strip()[:400]
         rec = dialogs.get(name)
-        if not rec or rec.get("body") != body:
+        # the pane truncates long lines differently between redraws ("UPDAT…" vs "UPDATE
+        # without WHERE"), so compare on the opening words, not the whole capture
+        if not rec or rec.get("body", "")[:48] != body[:48]:
             dialogs[name] = {"since": now, "server": m.group(1), "body": body, "notified": False, "declined": False}
             rec = dialogs[name]; dirty = True
         age_min = (now - rec["since"]) / 60.0
