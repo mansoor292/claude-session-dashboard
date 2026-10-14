@@ -333,7 +333,13 @@ def dialog_sweep(reg, notify, dry=False):
             continue
         m = ELICIT.search(pane)
         if not m:
-            if name in dialogs: dialogs.pop(name); dirty = True
+            # The Supabase confirm expires on its own after a few minutes and the session
+            # re-issues the statement, so the dialog blinks out between sweeps. Dropping the
+            # record on a blink reset the clock every time: the 30-minute decline never came
+            # and every reappearance pinged again (2026-10-14). Keep the record through a
+            # 10-minute gap; only a dialog gone for longer than that is really answered.
+            rec = dialogs.get(name)
+            if rec and now - rec.get("last_seen", rec["since"]) > 600: dialogs.pop(name); dirty = True
             continue
         # the request text sits between the server line and the Accept/Decline row
         lines = [l.strip() for l in pane.splitlines() if l.strip()]
@@ -347,12 +353,14 @@ def dialog_sweep(reg, notify, dry=False):
         # the pane truncates long lines differently between redraws ("UPDAT…" vs "UPDATE
         # without WHERE"), so compare on the opening words, not the whole capture
         if not rec or rec.get("body", "")[:48] != body[:48]:
-            dialogs[name] = {"since": now, "server": m.group(1), "body": body, "notified": False, "declined": False}
+            dialogs[name] = {"since": now, "server": m.group(1), "body": body, "notified": False, "declined": False, "times": 0}
             rec = dialogs[name]; dirty = True
+        if rec.get("last_seen", 0) < now - 90: rec["times"] = rec.get("times", 0) + 1   # a fresh appearance
+        rec["last_seen"] = now; rec["declined"] = False; dirty = True                   # re-raised: eligible again
         age_min = (now - rec["since"]) / 60.0
         if not rec["notified"] and notify and tmux_has(notify) and not dry:
             deliver(notify, "Session %s is parked on an MCP dialog from %s: %s \u2014 invisible from the app. "
-                            "It is auto-DECLINED after %d min unless someone accepts it in the pane first."
+                            "Auto-DECLINED once it has been up %d min in total (blinking out and re-raising no longer resets the clock). Accept it in the pane to let it through."
                             % (name, rec["server"], body or "(no text captured)", DIALOG_DECLINE_MIN))
             rec["notified"] = True; dirty = True
         if age_min >= DIALOG_DECLINE_MIN and not rec["declined"] and not dry:
