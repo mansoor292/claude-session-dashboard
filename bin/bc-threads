@@ -388,7 +388,13 @@ def pane_blocked(sess):
                               capture_output=True, text=True, timeout=15).stdout
     except Exception:
         return False                        # cannot tell; status checks still apply
-    return bool(OVERLAY.search(pane))
+    if OVERLAY.search(pane): return True
+    # Text already sitting in the prompt means someone's keystrokes have not been submitted
+    # (a /compact whose Enter was lost, a human mid-sentence on the phone). Typing a delivery
+    # after it glues the two into one message — that is how a child got "/compact …" and a
+    # Basecamp pointer in a single unsent line (2026-10-14). Hold until the line is empty.
+    lines = [l for l in pane.splitlines() if l.startswith("\u276f")]
+    return bool(lines) and lines[-1][1:].strip() != ""
 
 
 def ready(sess, live, label):
@@ -658,6 +664,13 @@ def spawn_child(reg, parent, project, tid, title, url, kind):
     """
     name = child_name(parent, title)
     doc = client_doc(reg, project)
+    # A fork needs the parent's live conversation; a split only its cwd. Delivery wakes a
+    # sleeping owner, but spawning did not — Mansoor's mention on a moltbook-plan thread
+    # sat held with "no Claude conversation — nothing to fork" (2026-10-14). Wake first.
+    if not doc and asleep(parent):
+        print("-- %s is asleep — waking it to fork from" % parent)
+        if not wake(parent):
+            print("!! could not wake %s" % parent); return ""
     try:
         if doc:
             with open(doc) as f: body = f.read()

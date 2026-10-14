@@ -104,7 +104,14 @@ function sendWhenReady(name, text, tries){
     let pane=''; try{ pane=tmux(['capture-pane','-p','-t',name]); }catch{}
     if(/bypass permissions on/.test(pane) && !/trust this folder|Yes, I accept/.test(pane)){
       tmux(['send-keys','-t',name,'-l',text]);
-      setTimeout(()=>tmux(['send-keys','-t',name,'Enter']),600);
+      // Enter can be swallowed while the TUI is still settling after a long --resume; a
+      // first message left unsent then glues itself to the next thing typed into the pane.
+      // Press Enter, and keep pressing (up to 5x) until the prompt line is empty again.
+      let tries=0; const submit=()=>{ tmux(['send-keys','-t',name,'Enter']); tries++;
+        setTimeout(()=>{ let p=''; try{ p=tmux(['capture-pane','-p','-t',name]); }catch{}
+          const lines=p.split('\n').filter(l=>l.startsWith('\u276f')); const last=lines.length?lines[lines.length-1].slice(1).trim():'';
+          if(last && tries<5) submit(); }, 1500); };
+      setTimeout(submit,600);
       return;
     }
     if(n<max) setTimeout(tick,2500);
