@@ -1771,6 +1771,9 @@ def cmd_dismiss(a):
     reg = load()
     o = (reg.get("orphans") or {}).pop(str(a.cid), None)
     if o is None: sys.exit("no unrouted mention with id %s" % a.cid)
+    # A dismissed mention is finished with. Without this it sat above a pinned watermark and
+    # the next sweep queued it again (2026-10-16: the same comment re-nagged after dismiss).
+    reg.setdefault("delivered", {})[str(a.cid)] = int(time.time())
     save(reg)
     note("dismiss", project=o.get("project") or "", thread=o.get("thread") or "",
          title=o.get("title") or "", cid=str(a.cid), text="dismissed without assigning")
