@@ -262,6 +262,14 @@ def asleep(name):
         return False
 
 
+def quarantined(name):
+    """Asleep on purpose and never to be woken by this bridge (see session-sleep --quarantine)."""
+    try:
+        with open(SLEEPING) as f: return bool((json.load(f).get(name) or {}).get("quarantine"))
+    except Exception:
+        return False
+
+
 def wake(name, wait=120):
     """A sleeping session keeps its places; deliver by waking it, not by holding forever.
 
@@ -552,6 +560,9 @@ def nearest_session(reg, project, thread_id):
     """
     project, thread_id = str(project), str(thread_id)
     rec = reg["places"].get(thread_id)
+    # A quarantined owner is no owner: its mentions queue for a human instead of waking it.
+    if rec and rec.get("session") and quarantined(rec["session"]):
+        return "", "its owner %s is quarantined; a person must reassign this thread" % rec["session"], False, ""
     if rec and rec.get("session"):
         # A session that owns several threads is not migrated by hand; each thread is
         # peeled off the next time it is engaged (Mansoor, 2026-09-24). The owner is the
@@ -564,6 +575,8 @@ def nearest_session(reg, project, thread_id):
     gid = parent_id(reg, project, thread_id)
     if gid:
         rec = reg["places"].get(gid)
+        if rec and rec.get("session") and quarantined(rec["session"]):
+            return "", "the board's owner %s is quarantined; a person must reassign" % rec["session"], False, ""
         if rec and rec.get("session"):
             # One session per thread. Tracking a board or a to-do list used to make its
             # session the owner of every thread inside it, which is how thirteen places
@@ -675,6 +688,8 @@ def spawn_child(reg, parent, project, tid, title, url, kind):
     # A fork needs the parent's live conversation; a split only its cwd. Delivery wakes a
     # sleeping owner, but spawning did not — Mansoor's mention on a moltbook-plan thread
     # sat held with "no Claude conversation — nothing to fork" (2026-10-14). Wake first.
+    if quarantined(parent):
+        print("!! %s is quarantined — not forking from it" % parent); return ""
     if not doc and asleep(parent):
         print("-- %s is asleep — waking it to fork from" % parent)
         if not wake(parent):

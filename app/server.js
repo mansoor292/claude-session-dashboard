@@ -143,9 +143,11 @@ const SLEEP_FILE = HOMEDIR+'/.claude/sleeping.json';
 function readSleeping(){ try{ return JSON.parse(fs.readFileSync(SLEEP_FILE,'utf8'))||{}; }catch{ return {}; } }
 function writeSleeping(o){ const tmp=SLEEP_FILE+'.tmp'; fs.writeFileSync(tmp, JSON.stringify(o,null,1)); fs.renameSync(tmp, SLEEP_FILE); }
 const shq = v => "'"+String(v).replace(/'/g,"'\\''")+"'";
-function sleepSession(name, why, force){
+function sleepSession(name, why, force, quarantine){
   if(!name || name.startsWith('_')) return {ok:false,err:'not a sleepable session'};
-  if(!hasSession(name)) return readSleeping()[name] ? {ok:true,already:true} : {ok:false,err:'no such session: '+name};
+  if(!hasSession(name)){ const sl=readSleeping(); if(!sl[name]) return {ok:false,err:'no such session: '+name};
+    if(quarantine && !sl[name].quarantine){ sl[name].quarantine=true; sl[name].why=why||sl[name].why; writeSleeping(sl); }
+    return {ok:true,already:true,quarantine:!!sl[name].quarantine}; }
   const ps=claudeSession(name);
   if(!ps||!ps.sid||!ps.cwd) return {ok:false,err:'no Claude conversation in '+name+' — nothing to resume later, so nothing to sleep'};
   if(ps.status==='busy' && !force) return {ok:false,err:name+' is busy'};
@@ -153,16 +155,21 @@ function sleepSession(name, why, force){
   if(!fs.existsSync(tx)) return {ok:false,err:'transcript missing: '+tx};
   const s=readSleeping();
   s[name]={sid:ps.sid,cwd:ps.cwd,dir:ps.dir,account:ps.account,sleptAt:Math.floor(Date.now()/1000),
-           why:why||'',lastUsed:transcriptMtime(ps.dir,ps.sid,ps.cwd)};
+           why:why||'',lastUsed:transcriptMtime(ps.dir,ps.sid,ps.cwd),quarantine:!!quarantine};
   writeSleeping(s);                                   // the seat exists before the process dies
   tmux(['kill-session','-t','='+name]);
   bcNote({kind:'sleep',session:name,text:why||''});
   return {ok:true,name,sid:ps.sid};
 }
-function wakeSession(name){
+function wakeSession(name, force){
   const s=readSleeping(); const r=s[name];
   if(hasSession(name)){ if(r){ delete s[name]; writeSleeping(s); } return {ok:true,already:true}; }
   if(!r) return {ok:false,err:'not asleep: '+name};
+  // Quarantine: asleep on purpose and NOT to be woken by the bridge. A session that pushed
+  // to master without Mansoor was slept at 13:09 and woken at 13:10 by a mention on a
+  // thread it owned, then pushed again the next day (2026-10-15). Sleep is not a stop;
+  // this is. Only an explicit force (a person) wakes it.
+  if(r.quarantine && !force) return {ok:false,err:name+' is quarantined — wake it with force=1 only if a person has decided to',quarantined:true};
   const tx=r.dir+'/projects/'+projDir(r.cwd)+'/'+r.sid+'.jsonl';
   if(!fs.existsSync(tx)) return {ok:false,err:'transcript missing: '+tx};
   if(!fs.existsSync(r.cwd)) return {ok:false,err:'cwd gone: '+r.cwd};
@@ -662,8 +669,8 @@ http.createServer((req,res)=>{
     });
     return;
   }
-  if(req.method==='POST'&&u.pathname==='/api/sleep'){ const r=sleepSession(clean(u.searchParams.get('name')), (u.searchParams.get('why')||'').slice(0,120), u.searchParams.get('force')==='1'); res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(r)); }
-  if(req.method==='POST'&&u.pathname==='/api/wake'){ const r=wakeSession(clean(u.searchParams.get('name'))); res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(r)); }
+  if(req.method==='POST'&&u.pathname==='/api/sleep'){ const r=sleepSession(clean(u.searchParams.get('name')), (u.searchParams.get('why')||'').slice(0,120), u.searchParams.get('force')==='1', u.searchParams.get('quarantine')==='1'); res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(r)); }
+  if(req.method==='POST'&&u.pathname==='/api/wake'){ const r=wakeSession(clean(u.searchParams.get('name')), u.searchParams.get('force')==='1'); res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(r)); }
   if(u.pathname==='/api/sleeping'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(readSleeping())); }
   // Fork: parent + child name; an optional body is typed into the child as its first message.
   if(req.method==='POST'&&u.pathname==='/api/fork'){

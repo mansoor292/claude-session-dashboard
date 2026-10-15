@@ -60,13 +60,13 @@ def mem_available_gb():
     return 0.0
 
 
-def do_sleep(name, why, force, dry=False):
+def do_sleep(name, why, force, dry=False, quarantine=False):
     if dry:
         print("would sleep %s (%s)" % (name, why)); return True
-    r = api("/api/sleep?name=%s&why=%s%s" % (urllib.parse.quote(name), urllib.parse.quote(why or ""),
-                                              "&force=1" if force else ""), post=True)
+    r = api("/api/sleep?name=%s&why=%s%s%s" % (urllib.parse.quote(name), urllib.parse.quote(why or ""),
+                                                "&force=1" if force else "", "&quarantine=1" if quarantine else ""), post=True)
     if r.get("ok"):
-        print("asleep: %s%s" % (name, " (already)" if r.get("already") else ""))
+        print("asleep: %s%s%s" % (name, " (already)" if r.get("already") else "", " QUARANTINED — the bridge will not wake it" if quarantine else ""))
         log("sleep %s — %s" % (name, why or ""))
     else:
         print("could not sleep %s: %s" % (name, r.get("err")))
@@ -88,9 +88,10 @@ def do_list():
     if not s: print("nobody is asleep"); return
     now = time.time()
     for name, r in sorted(s.items()):
-        print("%-30s asleep %5.1fd  last used %5.1fd ago  %s"
+        print("%-30s asleep %5.1fd  last used %5.1fd ago  %s%s"
               % (name, (now - r.get("sleptAt", now)) / 86400,
-                 (now - (r.get("lastUsed") or r.get("sleptAt") or now)) / 86400, r.get("why") or ""))
+                 (now - (r.get("lastUsed") or r.get("sleptAt") or now)) / 86400,
+                 "QUARANTINED  " if r.get("quarantine") else "", r.get("why") or ""))
 
 
 def do_auto(a):
@@ -128,6 +129,7 @@ def main():
     p = argparse.ArgumentParser(prog="session-sleep")
     sub = p.add_subparsers(dest="cmd")
     s = sub.add_parser("sleep"); s.add_argument("name"); s.add_argument("--why", default="by hand"); s.add_argument("--force", action="store_true")
+    s.add_argument("--quarantine", action="store_true", help="never to be woken by the bridge; its threads queue for a human")
     w = sub.add_parser("wake"); w.add_argument("name")
     sub.add_parser("list")
     au = sub.add_parser("auto")
@@ -138,7 +140,7 @@ def main():
     if as_wake: argv = ["wake"] + argv
     elif argv and argv[0] not in ("sleep", "wake", "list", "auto", "-h", "--help"): argv = ["sleep"] + argv
     a = p.parse_args(argv)
-    if a.cmd == "sleep": sys.exit(0 if do_sleep(a.name, a.why, a.force) else 1)
+    if a.cmd == "sleep": sys.exit(0 if do_sleep(a.name, a.why, a.force or a.quarantine, quarantine=a.quarantine) else 1)
     if a.cmd == "wake": sys.exit(0 if do_wake(a.name) else 1)
     if a.cmd == "list": do_list()
     elif a.cmd == "auto": do_auto(a)
