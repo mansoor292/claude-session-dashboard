@@ -724,7 +724,8 @@ def spawn_child(reg, parent, project, tid, title, url, kind):
 # reply at a time, because replying on a thread quietly made the replier its owner. Now a
 # session that already owns a thread cannot take another: the binding is refused with the
 # way out (spawn a child, or reply --no-track), and `bc-threads audit` reports any drift.
-LEAF_KINDS = {"Message", "Todo", "Document", "Upload", "Card", "Kanban::Card", "Question", "Question::Answer"}
+LEAF_KINDS = {"Message", "Todo", "Document", "Upload", "Card", "Kanban::Card", "Question", "Question::Answer",
+              "Inbox::Forward"}   # a forwarded email is a thread; the inbox it sits in is a container
 
 
 def is_leaf(kind):

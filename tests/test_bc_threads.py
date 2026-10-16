@@ -214,6 +214,13 @@ class RoutingTests(unittest.TestCase):
     def test_unknown_thread_is_not_claimed(self):
         self.assertFalse(self.m.nearest_session(self.reg, "P", "ZZZ")[2])
 
+    def test_forwarded_email_is_a_leaf_and_its_inbox_a_container(self):
+        self.reg["places"]["INBOX"] = {"session": "parent", "kind": "Inbox", "project": "P"}
+        self.m.parent_id = lambda reg, proj, rid, url="": {"FWD": "INBOX"}.get(str(rid), "")
+        s, why, owned, spawn_from = self.m.nearest_session(self.reg, "P", "FWD")
+        self.assertEqual((s, owned, spawn_from), ("parent", True, "parent"))
+        with self.assertRaises(SystemExit): self.m.assert_one_leaf(self.reg, "owner", "FWD", "Inbox::Forward")
+
     def test_one_leaf_per_session(self):
         with self.assertRaises(SystemExit): self.m.assert_one_leaf(self.reg, "owner", "L9", "Todo")
         with self.assertRaises(SystemExit): self.m.assert_one_leaf(self.reg, "_dashboard", "L9", "Message")
