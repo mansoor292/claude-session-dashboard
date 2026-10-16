@@ -404,13 +404,12 @@ def pane_blocked(sess):
                               capture_output=True, text=True, timeout=15).stdout
     except Exception:
         return False                        # cannot tell; status checks still apply
-    if OVERLAY.search(pane): return True
-    # Text already sitting in the prompt means someone's keystrokes have not been submitted
-    # (a /compact whose Enter was lost, a human mid-sentence on the phone). Typing a delivery
-    # after it glues the two into one message — that is how a child got "/compact …" and a
-    # Basecamp pointer in a single unsent line (2026-10-14). Hold until the line is empty.
-    lines = [l for l in pane.splitlines() if l.startswith("\u276f")]
-    return bool(lines) and lines[-1][1:].strip() != ""
+    # NOT checked: text after the last "❯". Claude Code echoes every SUBMITTED message with
+    # that same prefix, so "unsent input" cannot be told from "last thing said" in a pane
+    # capture — the check held seven mentions for a day on idle sessions (2026-10-16). The
+    # glued-/compact case it was meant to catch is handled where the typing happens (the
+    # dashboard re-presses Enter until the message submits).
+    return bool(OVERLAY.search(pane))
 
 
 def ready(sess, live, label):
