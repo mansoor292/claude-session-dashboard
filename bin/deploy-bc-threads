@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Install bin/bc-threads to /usr/local/bin — but only when the regression suite is green.
+# Five sweep bugs shipped in one week, two of them from fixes to the other three; a dry run
+# does not catch a replay or a lost hold. The suite does.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+python3 -m py_compile bin/bc-threads
+python3 tests/test_bc_threads.py 2>&1 | grep -E "^(Ran|OK|FAILED|FAIL:|ERROR:)" | sed 's/^/  /'
+python3 tests/test_bc_threads.py >/dev/null 2>&1 || { echo "deploy-bc-threads: tests FAILED — not installing"; exit 1; }
+sudo install -m 755 bin/bc-threads /usr/local/bin/bc-threads
+echo "deploy-bc-threads: installed $(sha256sum bin/bc-threads | cut -c1-12)"
