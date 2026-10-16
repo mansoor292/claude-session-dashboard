@@ -316,6 +316,7 @@ BLOCKED_STATUS = ("busy", "waiting")   # a tool call is running, or a dialog has
 OVERLAY = re.compile(r"esc to cancel|Yes, I accept|trust this folder|requests your input", re.I)
 ELICIT = re.compile(r"MCP server .(.+?). requests your input", re.I)
 DIALOG_DECLINE_MIN = int(os.environ.get("BC_DIALOG_DECLINE_MIN", "30"))
+HOLD_NAG_HOURS = float(os.environ.get("BC_HOLD_NAG_HOURS", "2"))
 
 
 def dialog_sweep(reg, notify, dry=False):
@@ -1245,6 +1246,27 @@ def cmd_watch(a):
 
     # A held mention must survive to the next sweep. The watermark is one number across the
     # account, so it can only advance to just below the oldest thing still waiting.
+    # A held mention is silent: nothing told anyone that seven of them sat for a day behind
+    # a false "dialog open" (2026-10-16). Once a mention has been held past HOLD_NAG_HOURS,
+    # say so to `notify`, once per comment, with the session and the reason the sweep gave.
+    try:
+        nagged = reg.setdefault("held_nagged", {})
+        by_id = {int(c["id"]): c for c in hits}
+        stale = [h for h in held if h in by_id and str(h) not in nagged
+                 and time.time() - _secs(by_id[h].get("created_at") or "") > HOLD_NAG_HOURS * 3600]
+        if stale and a.notify and tmux_has(a.notify) and not a.dry_run:
+            parts = []
+            for h in stale[:6]:
+                c = by_id[h]; sess, why, _, _ = nearest_session(reg, str((c.get("bucket") or {}).get("id") or ""), str((c.get("parent") or {}).get("id") or ""))
+                parts.append('%s on "%s" -> %s (%s, %.0fh)' % ((c.get("creator") or {}).get("name") or "?", ((c.get("parent") or {}).get("title") or "")[:36], sess or "?", why[:40], (time.time() - _secs(c.get("created_at") or "")) / 3600))
+            deliver(a.notify, "bc-threads: %d mention(s) have been HELD for over %dh — the owner never became deliverable. %s. Check `bc-threads watch --dry-run --verbose` for the hold reason."
+                    % (len(stale), HOLD_NAG_HOURS, "; ".join(parts)))
+            for h in stale: nagged[str(h)] = int(time.time())
+            dirty = True
+        for k in list(nagged):
+            if int(k) not in held: nagged.pop(k); dirty = True
+    except Exception as e:
+        print("!! hold nag failed: %s" % str(e)[:120])
     if held: newest_m = min(newest_m, min(held) - 1)
     if not first and newest_m > seen_m:
         reg["mention_last_id"] = newest_m; dirty = True
