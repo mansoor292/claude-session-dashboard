@@ -1653,6 +1653,11 @@ def cmd_assign(a):
     o = (reg.get("orphans") or {}).get(str(a.cid))
     if not o: sys.exit("no unrouted mention with id %s" % a.cid)
     sess = resolve_session(a.session)
+    # The target may be asleep: wake it (a quarantined one stays down — pick another).
+    if not tmux_has(sess) and asleep(sess):
+        if quarantined(sess): sys.exit("%s is quarantined — assign to another session" % sess)
+        print("-- %s is asleep — waking it" % sess)
+        if not wake(sess): sys.exit("could not wake %s" % sess)
     if not tmux_has(sess): sys.exit("no such session: %s" % a.session)
     me = whoami(reg); me_id = str(me.get("id") or "")
     proj, tid = str(o.get("project") or ""), str(o.get("thread") or "")

@@ -167,6 +167,21 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(len(nags), 1)
         self.assertIn("Christy", nags[0])
 
+    # -- assign wakes a sleeping target; a quarantined one is refused ---------------------
+    def test_assign_wakes_sleeper_and_refuses_quarantined(self):
+        h = Harness(self.m, {"_dashboard": "idle"}, {})
+        h.comments = [comment(101, "T9", "orphan")]; h.sweep()
+        json.dump({"zz": {"sid": "x", "cwd": "/tmp", "dir": "/tmp"}, "q": {"sid": "x", "cwd": "/tmp", "dir": "/tmp", "quarantine": True}},
+                  open(self.m.SLEEPING, "w"))
+        self.m.tmux_has = lambda n: n in h.sessions
+        woke = []
+        self.m.wake = lambda n, wait=120: (woke.append(n), h.sessions.__setitem__(n, "idle")) and True
+        self.m.register = lambda reg, pid, project, session, **k: reg["places"].setdefault(str(pid), {"session": session, "kind": "Todo", "project": project})
+        with self.assertRaises(SystemExit): self.m.cmd_assign(argparse.Namespace(cid="101", session="q", fork=False))
+        self.m.cmd_assign(argparse.Namespace(cid="101", session="zz", fork=False))
+        self.assertEqual(woke, ["zz"])
+        self.assertEqual(len(h.to("zz")), 1)
+
     # -- dismiss finishes a mention for good ---------------------------------------------
     def test_dismiss_marks_handled(self):
         h = Harness(self.m, {}, {})
