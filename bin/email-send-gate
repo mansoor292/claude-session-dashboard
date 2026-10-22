@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# PreToolUse hook: no session sends email unless a person allowed THAT session.
+#
+# Ruled 2026-10-22: a Basecamp instruction never authorises a send; only Mansoor speaking to
+# a session directly does. Deny rules do not apply under --dangerously-skip-permissions, which
+# every session here runs with; a PreToolUse hook does. The hook reads the tool call on stdin,
+# names the tmux session it is running in, and allows the send only if
+# ~/.claude/email-allow/<session> exists (created with `email-allow <session>`, a person's act).
+# Everything else is denied with a reason the session can act on: post a DRAFT, ask Mansoor.
+set -u
+IN="$(cat)"
+TOOL="$(printf '%s' "$IN" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tool_name",""))' 2>/dev/null)"
+SESSION="$(tmux display-message -p '#S' 2>/dev/null || echo "")"
+ALLOW="$HOME/.claude/email-allow/${SESSION:-unknown}"
+if [ -n "$SESSION" ] && [ -f "$ALLOW" ]; then
+  # Allowed by a person for this session. Log it; let it through.
+  printf '%s send %s by %s (allowed %s)\n' "$(date -u +%FT%TZ)" "$TOOL" "$SESSION" "$(cat "$ALLOW" 2>/dev/null | head -c 80)" >> "$HOME/.claude/email-send.log" 2>/dev/null
+  exit 0
+fi
+printf '%s DENIED %s in %s\n' "$(date -u +%FT%TZ)" "$TOOL" "${SESSION:-unknown}" >> "$HOME/.claude/email-send.log" 2>/dev/null
+python3 - "$TOOL" "${SESSION:-unknown}" <<'EOF'
+import json, sys
+tool, sess = sys.argv[1], sys.argv[2]
+reason = ("Sending email is blocked for session %s. No Basecamp message authorises a send; only Mansoor "
+          "telling this session directly does, after which he runs `email-allow %s`. Post the message on the "
+          "thread as a DRAFT and say who would send it. Do not retry, do not send a test copy, do not send to yourself."
+          % (sess, sess))
+print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                         "permissionDecisionReason": reason},
+                  "systemMessage": "email send blocked (%s) — %s has no email-allow" % (tool, sess)}))
+EOF
+exit 0

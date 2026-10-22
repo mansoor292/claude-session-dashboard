@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# email-allow <session> [--why "..."]   let ONE session send email (a person's act, logged)
+# email-allow <session> --revoke        take it back
+# email-allow --list                    who may send right now
+#
+# The PreToolUse hook `email-send-gate` denies every email-send tool call unless
+# ~/.claude/email-allow/<tmux session> exists. This writes or removes that file. Allowing is
+# Mansoor's decision after telling the session directly; it is never done on a Basecamp ask.
+set -euo pipefail
+D="$HOME/.claude/email-allow"; mkdir -p "$D"; chmod 700 "$D"
+case "${1:-}" in
+  ""|-h|--help) sed -n '2,8p' "$0"; exit 0;;
+  --list) ls -1 "$D" 2>/dev/null | while read -r s; do printf '%-40s %s\n' "$s" "$(cat "$D/$s")"; done; [ -n "$(ls -A "$D")" ] || echo "nobody may send"; exit 0;;
+esac
+S="$1"; shift
+if [ "${1:-}" = "--revoke" ]; then rm -f "$D/$S"; echo "revoked: $S may no longer send email"; exit 0; fi
+WHY="by hand"; [ "${1:-}" = "--why" ] && WHY="${2:-by hand}"
+tmux has-session -t "=$S" 2>/dev/null || { echo "email-allow: no live tmux session named $S" >&2; exit 1; }
+printf '%s %s\n' "$(date -u +%FT%TZ)" "$WHY" > "$D/$S"
+echo "allowed: $S may send email ($WHY). Revoke with: email-allow $S --revoke"
