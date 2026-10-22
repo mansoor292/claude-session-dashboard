@@ -236,6 +236,12 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual((s, owned, spawn_from), ("parent", True, "parent"))
         with self.assertRaises(SystemExit): self.m.assert_one_leaf(self.reg, "owner", "FWD", "Inbox::Forward")
 
+    def test_nested_folder_finds_the_vault_owner(self):
+        self.reg["places"]["VAULT"] = {"session": "parent", "kind": "Vault", "project": "P"}
+        self.m.parent_id = lambda reg, proj, rid, url="": {"DOC": "FOLDER", "FOLDER": "VAULT"}.get(str(rid), "")
+        s, why, owned, spawn_from = self.m.nearest_session(self.reg, "P", "DOC")
+        self.assertEqual((s, owned, spawn_from), ("parent", True, "parent"))
+
     def test_one_leaf_per_session(self):
         with self.assertRaises(SystemExit): self.m.assert_one_leaf(self.reg, "owner", "L9", "Todo")
         with self.assertRaises(SystemExit): self.m.assert_one_leaf(self.reg, "_dashboard", "L9", "Message")

@@ -572,7 +572,13 @@ def nearest_session(reg, project, thread_id):
             return rec["session"], ("it owns this thread among %d; peeling it off into a session of its own"
                                     % len(leaves_of(reg, rec["session"]))), True, rec["session"]
         return rec["session"], "it already tracks this thread", True, ""
+    # Containers nest: a Document in Docs & Files sits in a folder (a Vault) inside the
+    # project's root Vault, and only the root is tracked. Walk up to three levels so a
+    # sub-folder's thread still finds the owner of the vault above it (2026-10-22).
     gid = parent_id(reg, project, thread_id)
+    hops = 0
+    while gid and gid not in reg["places"] and hops < 2:
+        gid = parent_id(reg, project, gid); hops += 1
     if gid:
         rec = reg["places"].get(gid)
         if rec and rec.get("session") and quarantined(rec["session"]):
