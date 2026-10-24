@@ -47,10 +47,40 @@ def transcripts():
         if not (name and sid and cwd and pid and os.path.exists("/proc/%d" % pid)): continue
         cfg = os.path.dirname(os.path.dirname(f))
         proj = cwd.replace("/", "-").replace(".", "-").replace("_", "-")
-        try: mt = os.path.getmtime(os.path.join(cfg, "projects", proj, sid + ".jsonl"))
-        except OSError: continue
+        mt = last_message_time(os.path.join(cfg, "projects", proj, sid + ".jsonl"))
+        if mt is None: continue
         if name not in out or mt > out[name][0]: out[name] = (mt, sid)
     return out
+
+
+def last_message_time(path, tail_bytes=400_000):
+    """When a person or the model last said something in this transcript.
+
+    The file's mtime is useless for this: Claude Code rewrites housekeeping entries
+    (bridge-session, permission-mode, atis-latch) in place, so every live session read as
+    idle 0.0 days and the sleep policy slept nothing for weeks — 43 sessions awake, 12 GB
+    resident, swap exhausted, OOM on 2026-10-24. Scan the tail for the newest user or
+    assistant entry with a timestamp; fall back to mtime only if the file has none.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - tail_bytes)); chunk = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    best = None
+    for line in chunk.splitlines():
+        if '"type":"user"' not in line and '"type":"assistant"' not in line and \
+           '"type": "user"' not in line and '"type": "assistant"' not in line: continue
+        try: e = json.loads(line)
+        except Exception: continue
+        if e.get("type") in ("user", "assistant") and e.get("timestamp"):
+            best = max(best or "", e["timestamp"])
+    if not best:
+        try: return os.path.getmtime(path)
+        except OSError: return None
+    try: return time.mktime(time.strptime(best[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+    except Exception: return None
 
 
 def mem_available_gb():

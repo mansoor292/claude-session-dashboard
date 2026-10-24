@@ -84,9 +84,23 @@ function claudeSession(tname){
 // Claude's per-project transcript dir mangles every '/', '.' and '_' in the cwd to '-',
 // so ~/Code/.worktrees/repo__wt lives in projects/-home-ubuntu-Code--worktrees-repo--wt.
 const projDir = cwd => cwd.replace(/[/._]/g,'-');
+// "Last used" is the newest user/assistant message, NOT the file's mtime: Claude Code
+// rewrites housekeeping entries in place, so mtime is always now (2026-10-24).
 function transcriptMtime(dir, sessionId, cwd){
   if(!sessionId || !cwd) return 0;
-  try{ return Math.floor(fs.statSync(dir+'/projects/'+projDir(cwd)+'/'+sessionId+'.jsonl').mtimeMs/1000); }catch{ return 0; }
+  const p=dir+'/projects/'+projDir(cwd)+'/'+sessionId+'.jsonl';
+  let st; try{ st=fs.statSync(p); }catch{ return 0; }
+  try{
+    const fd=fs.openSync(p,'r'); const len=Math.min(st.size, 400000); const buf=Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, st.size-len); fs.closeSync(fd);
+    let best='';
+    for(const line of buf.toString('utf8').split('\n')){
+      if(!/"type":\s*"(user|assistant)"/.test(line)) continue;
+      try{ const e=JSON.parse(line); if((e.type==='user'||e.type==='assistant') && e.timestamp && e.timestamp>best) best=e.timestamp; }catch{}
+    }
+    if(best) return Math.floor(Date.parse(best)/1000);
+  }catch{}
+  return Math.floor(st.mtimeMs/1000);
 }
 const NCPU = os.cpus().length;
 
