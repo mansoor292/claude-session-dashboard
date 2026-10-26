@@ -129,10 +129,20 @@ def do_auto(a):
     sessions = api("/api/sessions")
     tx = transcripts()
     cands = []
+    import subprocess
     for s in sessions:
         n = s.get("name") or ""
         if s.get("sleeping") or s.get("rc") or n.startswith("_") or not s.get("canSplit"): continue
         if (s.get("status") or "") in ("busy", "waiting"): continue
+        # Woken for work less than 6 h ago: leave it, even if its last message is old. The
+        # bridge woke a session at 18:38 for a mention, this policy slept it at 19:03 on
+        # "idle since 10/12", and the mention was lost in between (2026-10-26).
+        try:
+            created = int(subprocess.run(["tmux", "display-message", "-p", "-t", n + ":", "#{session_created}"],
+                                         capture_output=True, text=True, timeout=10).stdout.strip() or 0)
+            if created and now - created < 6 * 3600: continue
+        except Exception:
+            pass
         if n not in tx: continue
         idle = (now - tx[n][0]) / 86400
         cands.append((idle, n, s.get("mem") or 0))

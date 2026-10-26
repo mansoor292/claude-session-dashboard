@@ -285,8 +285,22 @@ def wake(name, wait=120):
     for _ in range(wait):
         time.sleep(1)
         info = sessions().get(name, {})
-        if info.get("alive") and (info.get("status") or "") not in BLOCKED_STATUS: return True
+        if info.get("alive") and (info.get("status") or "") not in BLOCKED_STATUS and prompt_ready(name):
+            time.sleep(3)                      # let the TUI settle; keys typed mid-render are lost
+            return True
     return False
+
+
+def prompt_ready(name):
+    """Is the input line actually on screen? The registry says idle before the resumed TUI has
+    finished drawing; a delivery typed then vanishes (Christy's Q&A mentions, 2026-10-26)."""
+    try:
+        pane = subprocess.run([TMUX, "-L", socket_for(name), "capture-pane", "-p", "-t", name + ":"],
+                              capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return False
+    return ("bypass permissions on" in pane or "\u276f" in pane) and not OVERLAY.search(pane) \
+        and "Resume full session" not in pane and "Loading" not in pane
 
 
 def ensure_bridge(name, wait=30):
@@ -304,12 +318,29 @@ def ensure_bridge(name, wait=30):
 
 
 def deliver(name, text):
-    """Type one line, then Enter. A newline would submit early, so flatten."""
+    """Type one line, then Enter — and check it was taken. A delivery typed into a TUI that
+    is still loading, or whose Enter is swallowed, leaves no trace; the session goes busy
+    within seconds when it really received a message. One retry, then it is reported."""
     line = " ".join(text.split())
     sock = socket_for(name)
-    subprocess.run([TMUX, "-L", sock, "send-keys", "-t", name, "-l", line], check=True)
-    time.sleep(0.4)
-    subprocess.run([TMUX, "-L", sock, "send-keys", "-t", name, "Enter"], check=True)
+    for attempt in (1, 2):
+        subprocess.run([TMUX, "-L", sock, "send-keys", "-t", name, "-l", line], check=True)
+        time.sleep(0.6)
+        subprocess.run([TMUX, "-L", sock, "send-keys", "-t", name, "Enter"], check=True)
+        if name.startswith("_"): return                 # internal sessions: no status to wait on
+        for _ in range(12):
+            time.sleep(1)
+            st = sessions().get(name, {}).get("status") or ""
+            if st in BLOCKED_STATUS: return             # busy/waiting: it took the message
+        try:
+            pane = subprocess.run([TMUX, "-L", sock, "capture-pane", "-p", "-t", name + ":", "-S", "-30"],
+                                  capture_output=True, text=True, timeout=15).stdout
+        except Exception:
+            pane = ""
+        if line[:40] in pane: return                     # echoed as a submitted message
+        print("!! %s: delivery not taken (attempt %d) — retyping" % (name, attempt))
+        note("hold", title="delivery", session=name, why="delivery not taken, attempt %d" % attempt)
+    raise RuntimeError("delivery to %s was typed twice and never taken" % name)
 
 
 BLOCKED_STATUS = ("busy", "waiting")   # a tool call is running, or a dialog has the keyboard

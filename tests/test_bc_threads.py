@@ -262,6 +262,37 @@ class RoutingTests(unittest.TestCase):
         self.m.assert_one_leaf(self.reg, "fresh", "L9", "Todo")
 
 
+class DeliverTests(unittest.TestCase):
+    """deliver() must notice when its keystrokes were not taken."""
+
+    def setUp(self):
+        self.m = load_module(tempfile.mkdtemp()); self.keys = []; self.status = "idle"; self.pane = ""
+        m = self.m; h = self
+        class R:
+            def __init__(self, args, **k):
+                self.stdout = h.pane
+                if "send-keys" in args: h.keys.append(args[-1])
+        m.subprocess = types.SimpleNamespace(run=lambda args, **k: R(args, **k), CalledProcessError=Exception)
+        m.sessions = lambda: {"s": dict(alive=True, status=h.status)}
+        m.time = types.SimpleNamespace(time=m.time.time, sleep=lambda x: None, strftime=m.time.strftime)
+
+    def test_taken_when_session_goes_busy(self):
+        self.status = "busy"; self.m.deliver("s", "hello there")
+        self.assertEqual(self.keys.count("Enter"), 1)
+
+    def test_taken_when_echoed(self):
+        self.pane = "\u276f hello there\n"; self.m.deliver("s", "hello there")
+        self.assertEqual(self.keys.count("Enter"), 1)
+
+    def test_retyped_once_then_reported(self):
+        with self.assertRaises(RuntimeError): self.m.deliver("s", "hello there")
+        self.assertEqual(self.keys.count("Enter"), 2)
+
+    def test_prompt_ready(self):
+        self.pane = "Resume full session\n  Enter to confirm"; self.assertFalse(self.m.prompt_ready("s"))
+        self.pane = "\u276f \n  bypass permissions on"; self.assertTrue(self.m.prompt_ready("s"))
+
+
 class GateTests(unittest.TestCase):
     def setUp(self):
         self.m = load_module(tempfile.mkdtemp())
