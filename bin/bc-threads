@@ -411,12 +411,21 @@ def dialog_sweep(reg, notify, dry=False):
                                    capture_output=True, text=True).stdout
             if re.search(r"\u276f\s*Decline", after):
                 subprocess.run([TMUX, "-L", sock, "send-keys", "-t", name + ":", "Enter"], check=False)
-                rec["declined"] = True; dirty = True
+                rec["declined"] = True; rec["declines"] = rec.get("declines", 0) + 1; dirty = True
                 note("dialog", session=name, why="declined after %d min" % int(age_min), text=body)
-                print("-- %s: MCP dialog declined after %d min" % (name, int(age_min)))
-                if notify and tmux_has(notify):
+                print("-- %s: MCP dialog declined after %d min (decline #%d)" % (name, int(age_min), rec["declines"]))
+                # A session that re-issues the statement after a decline would be declined and
+                # reported every few minutes (tax-practice-ui, 2026-10-26). Report the first
+                # decline; after that, tell the SESSION once to stop, and stay quiet.
+                if rec["declines"] == 1 and notify and tmux_has(notify):
                     deliver(notify, "Declined the %s dialog in %s after %d min unanswered: %s"
                                     % (rec["server"], name, int(age_min), body[:200]))
+                elif rec["declines"] == 2:
+                    try:
+                        time.sleep(3)
+                        deliver(name, "Your %s confirm has now been declined twice by the box's dialog watch (nobody can see it from the app). "
+                                      "Do not re-issue it. Say in your pane exactly what you want applied and why, and wait for Mansoor to accept it himself." % rec["server"])
+                    except Exception: pass
             else:
                 print("-- %s: could not land the cursor on Decline; left alone" % name)
         elif m:
