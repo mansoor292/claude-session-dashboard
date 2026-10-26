@@ -182,6 +182,18 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(woke, ["zz"])
         self.assertEqual(len(h.to("zz")), 1)
 
+    # -- a to-do assigned to the agent routes like a mention, once -----------------------
+    def test_assignment_routes_once(self):
+        h = Harness(self.m, {}, {})
+        self.m.sweep_assignments = lambda reg: [{"id": 555, "created_at": "2026-10-21T10:00:00.000Z", "updated_at": "2026-10-21T10:00:00.000Z",
+            "creator": {"id": 7, "name": "Bibi"}, "bucket": {"id": "49334092"}, "content": "ASSIGNED TO THE AGENT: covers", "app_url": "",
+            "_post": True, "_assigned": True, "parent": {"id": 555, "title": "Full Beauty Brands", "type": "Todo", "url": ""}}]
+        reg = h.sweep()
+        self.assertIn("555", reg["orphans"], "nobody owns it: it queues for a person")
+        self.assertIn("555", reg["assigned_seen"])
+        n = len(reg["orphans"]); h.sweep()
+        self.assertEqual(len(h.m.load()["orphans"]), n, "injected once, not every sweep")
+
     # -- dismiss finishes a mention for good ---------------------------------------------
     def test_dismiss_marks_handled(self):
         h = Harness(self.m, {}, {})

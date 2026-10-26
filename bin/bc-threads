@@ -829,6 +829,31 @@ def sweep_comments(limit):
     return bc("comments", "list", "--all-projects", "--limit", str(limit), check=False) or []
 
 
+def sweep_assignments(reg):
+    """Open to-dos ASSIGNED to the agent account, shaped like a mention on the to-do itself.
+
+    Bibi assigned "Full Beauty Brands" to AI on 2026-10-21 and nobody mentioned the agent;
+    the sweep reads mentions, so it sat five days until her reminder. An assignment is the
+    same intent as a mention. Each open assigned to-do is injected once (remembered in
+    reg["assigned_seen"]) and routes like any thread: owner, container spawn, or the queue.
+    """
+    d = bc("api", "get", "/my/assignments.json", check=False) or {}
+    items = (d.get("priorities") or []) + (d.get("non_priorities") or []) if isinstance(d, dict) else []
+    seen = reg.setdefault("assigned_seen", {})
+    out = []
+    for t in items:
+        if not isinstance(t, dict) or t.get("type") != "todo" or t.get("completed"): continue
+        tid = str(t.get("id") or "")
+        if not tid or tid in seen or tid in reg["places"]: continue
+        out.append({"id": t["id"], "created_at": t.get("created_at"), "updated_at": t.get("created_at"),
+                    "creator": t.get("creator") or {"name": "assignment"}, "bucket": t.get("bucket") or {},
+                    "content": "ASSIGNED TO THE AGENT: %s\n%s" % (t.get("title") or t.get("content") or "", t.get("description") or ""),
+                    "app_url": t.get("app_url") or "", "_post": True, "_assigned": True,
+                    "parent": {"id": t["id"], "title": t.get("title") or t.get("content") or "", "type": "Todo",
+                               "url": t.get("url") or ""}})
+    return out
+
+
 def sweep_posts():
     """Recent message-board POSTS, shaped like comments so the sweep treats them alike.
 
@@ -1083,6 +1108,8 @@ def cmd_watch(a):
     # thread is now silence. Flip deliver_unmentioned in the registry to undo that.
     mentions_only = not reg.get("deliver_unmentioned")
     comments = sweep_comments(a.limit) + sweep_posts()
+    try: comments += sweep_assignments(reg)
+    except Exception as e: print("!! assignment sweep failed: %s" % str(e)[:120])
 
     first = "mention_last_id" not in reg
     seen_m = int(reg.get("mention_last_id") or 0)
@@ -1115,7 +1142,9 @@ def cmd_watch(a):
     live_ids = set()
     for c in comments:
         cid = int(c["id"]); live_ids.add(str(cid))
-        if c.get("_post"):
+        if c.get("_assigned"):
+            if str(cid) in delivered or str(cid) in reg.get("orphans", {}): continue
+        elif c.get("_post"):
             if cid > newest_p: newest_p = cid
             if cid <= seen_p and str(cid) in delivered: continue
             if cid <= seen_p: continue
@@ -1134,7 +1163,7 @@ def cmd_watch(a):
             edits[str(cid)] = ua; dirty = True          # new AND edited: once is enough
         if (c.get("creator") or {}).get("id") == me.get("id"): continue
         if FOOTER in (c.get("content") or ""): continue
-        if mentions_only and me_id not in mentioned_ids(c.get("content")): continue
+        if mentions_only and not c.get("_assigned") and me_id not in mentioned_ids(c.get("content")): continue
         if str(cid) in delivered and not c.get("_edited"): continue   # already landed; an edit re-opens it
         hits.append(c)
     for k in list(edits):                              # bounded to the fetch window
@@ -1195,6 +1224,8 @@ def cmd_watch(a):
             continue
         by_sess.setdefault(sess, []).append((c, par, proj, why))
 
+    for c in hits:
+        if c.get("_assigned"): reg.setdefault("assigned_seen", {})[str(c["id"])] = int(time.time()); dirty = True
     for sess, items in sorted(by_sess.items()):
         label = "@mention x%d" % len(items)
         if not ready(sess, live, label):
