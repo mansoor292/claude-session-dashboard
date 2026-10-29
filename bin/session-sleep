@@ -94,7 +94,7 @@ BRIDGE_PREFIXES = ("Basecamp \u2014", "From _dashboard", "Client-doc gap", "Task
                    "STOP, from _dashboard", "Standing order from Mansoor via _dashboard", "Doc maintenance", "RULE from Mansoor")
 
 
-def human_spoke_recently(name, hours=2.0):
+def human_spoke_recently(name, hours=6.0):
     """Did a PERSON (not the bridge) type into this session in the last `hours`?
 
     Quarantining a session Mansoor was actively directing killed his catalog-design task
@@ -109,14 +109,13 @@ def human_spoke_recently(name, hours=2.0):
         cfg = os.path.dirname(os.path.dirname(f))
         proj = (d.get("cwd") or "").replace("/", "-").replace(".", "-").replace("_", "-")
         path = os.path.join(cfg, "projects", proj, d["sessionId"] + ".jsonl")
-        try:
-            size = os.path.getsize(path)
-            with open(path, "rb") as fh:
-                fh.seek(max(0, size - 600_000)); chunk = fh.read().decode("utf-8", "replace")
-        except OSError:
-            continue
+        # Whole file, streamed: a busy session writes megabytes of tool output after a
+        # person's last line, so a tail window misses exactly the message that matters.
+        try: fh = open(path, "rb")
+        except OSError: continue
         cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - hours * 3600))
-        for line in chunk.splitlines():
+        for raw in fh:
+            line = raw.decode("utf-8", "replace")
             if '"type":"user"' not in line and '"type": "user"' not in line: continue
             try: e = json.loads(line)
             except Exception: continue
@@ -134,7 +133,7 @@ def do_sleep(name, why, force, dry=False, quarantine=False):
     if quarantine and not force:
         when = human_spoke_recently(name)
         if when:
-            print("REFUSED: a person typed into %s at %s — it is being used. Quarantine with --force only if you have decided to cut them off." % (name, when))
+            print("REFUSED: a person typed into %s at %s (last 6 h) — it is being used. Quarantine with --force only if you have decided to cut them off." % (name, when))
             return False
     r = api("/api/sleep?name=%s&why=%s%s%s" % (urllib.parse.quote(name), urllib.parse.quote(why or ""),
                                                 "&force=1" if force else "", "&quarantine=1" if quarantine else ""), post=True)
