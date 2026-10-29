@@ -90,9 +90,52 @@ def mem_available_gb():
     return 0.0
 
 
+BRIDGE_PREFIXES = ("Basecamp \u2014", "From _dashboard", "Client-doc gap", "Task from Mansoor (via _dashboard)",
+                   "STOP, from _dashboard", "Standing order from Mansoor via _dashboard", "Doc maintenance", "RULE from Mansoor")
+
+
+def human_spoke_recently(name, hours=2.0):
+    """Did a PERSON (not the bridge) type into this session in the last `hours`?
+
+    Quarantining a session Mansoor was actively directing killed his catalog-design task
+    mid-flight (2026-10-29). Bridge deliveries all start with a known prefix; anything else
+    from the user side within the window is a person, and the session is not stopped
+    without --force.
+    """
+    for f in glob.glob(os.path.join(HOME, ".claude*", "sessions", "*.json")):
+        try: d = json.load(open(f))
+        except Exception: continue
+        if (d.get("tmux") or "").split(":")[0] != name or not d.get("sessionId"): continue
+        cfg = os.path.dirname(os.path.dirname(f))
+        proj = (d.get("cwd") or "").replace("/", "-").replace(".", "-").replace("_", "-")
+        path = os.path.join(cfg, "projects", proj, d["sessionId"] + ".jsonl")
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as fh:
+                fh.seek(max(0, size - 600_000)); chunk = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - hours * 3600))
+        for line in chunk.splitlines():
+            if '"type":"user"' not in line and '"type": "user"' not in line: continue
+            try: e = json.loads(line)
+            except Exception: continue
+            if e.get("type") != "user" or (e.get("timestamp") or "") < cutoff: continue
+            c = (e.get("message") or {}).get("content")
+            text = c if isinstance(c, str) else " ".join(b.get("text", "") for b in c if isinstance(b, dict)) if isinstance(c, list) else ""
+            text = text.strip()
+            if text and not text.startswith(BRIDGE_PREFIXES) and not text.startswith("/"): return e.get("timestamp")
+    return None
+
+
 def do_sleep(name, why, force, dry=False, quarantine=False):
     if dry:
         print("would sleep %s (%s)" % (name, why)); return True
+    if quarantine and not force:
+        when = human_spoke_recently(name)
+        if when:
+            print("REFUSED: a person typed into %s at %s — it is being used. Quarantine with --force only if you have decided to cut them off." % (name, when))
+            return False
     r = api("/api/sleep?name=%s&why=%s%s%s" % (urllib.parse.quote(name), urllib.parse.quote(why or ""),
                                                 "&force=1" if force else "", "&quarantine=1" if quarantine else ""), post=True)
     if r.get("ok"):
@@ -180,7 +223,7 @@ def main():
     if as_wake: argv = ["wake"] + argv
     elif argv and argv[0] not in ("sleep", "wake", "list", "auto", "-h", "--help"): argv = ["sleep"] + argv
     a = p.parse_args(argv)
-    if a.cmd == "sleep": sys.exit(0 if do_sleep(a.name, a.why, a.force or a.quarantine, quarantine=a.quarantine) else 1)
+    if a.cmd == "sleep": sys.exit(0 if do_sleep(a.name, a.why, a.force, quarantine=a.quarantine) else 1)
     if a.cmd == "wake": sys.exit(0 if do_wake(a.name) else 1)
     if a.cmd == "list": do_list()
     elif a.cmd == "auto": do_auto(a)
