@@ -321,6 +321,7 @@ class DialogTests(unittest.TestCase):
         m.tmux_has = lambda n: True
         self.sent = []
         m.deliver = lambda n, t: self.sent.append(t)
+        m.person_driving = lambda name, hours=6.0: None
         fake_time = types.SimpleNamespace(time=lambda: self.now, sleep=lambda s: None,
                                           strftime=m.time.strftime, gmtime=m.time.gmtime, localtime=m.time.localtime, strptime=m.time.strptime)
         m.time = fake_time
@@ -353,6 +354,13 @@ class DialogTests(unittest.TestCase):
         self.assertTrue(self.reg["dialogs"]["s"]["declined"])
         self.assertEqual(self.keys[-2:], ["Right", "Enter"])
         self.assertTrue(any("Declined" in t for t in self.sent))
+
+    def test_person_driven_session_is_never_declined(self):
+        m = self.m; m.person_driving = lambda name, hours=6.0: "2026-11-02T17:43:00"
+        self.pane = self.DIALOG; m.dialog_sweep(self.reg, "_dashboard")
+        self.assertEqual(len(self.sent), 1); self.assertIn("will NOT decline", self.sent[0])
+        self.now += 45 * 60; m.dialog_sweep(self.reg, "_dashboard")
+        self.assertNotIn("Enter", self.keys); self.assertEqual(len(self.sent), 1)
 
     def test_never_accepts(self):
         m = self.m

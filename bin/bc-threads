@@ -350,6 +350,41 @@ DIALOG_DECLINE_MIN = int(os.environ.get("BC_DIALOG_DECLINE_MIN", "30"))
 HOLD_NAG_HOURS = float(os.environ.get("BC_HOLD_NAG_HOURS", "2"))
 
 
+BRIDGE_PREFIXES = ("Basecamp \u2014", "From _dashboard", "Client-doc gap", "Task from Mansoor (via _dashboard)",
+                   "STOP, from _dashboard", "Standing order from Mansoor via _dashboard", "Doc maintenance",
+                   "RULE from Mansoor", "Correction from _dashboard", "URGENT context from _dashboard")
+
+
+def person_driving(name, hours=6.0):
+    """Has a PERSON (not the bridge) typed into this session in the last `hours`?
+
+    A session Mansoor is directing himself must not have its dialogs declined or its work
+    second-guessed by the bridge: he told aws-bill to build a store, the bridge declined the
+    resulting Supabase confirm as "read-only" (2026-11-02). Same test session-sleep uses.
+    """
+    for f in glob.glob(os.path.expanduser("~/.claude*/sessions/*.json")):
+        try: d = json.load(open(f))
+        except Exception: continue
+        if (d.get("tmux") or "").split(":")[0] != name or not d.get("sessionId"): continue
+        if not (d.get("pid") and os.path.exists("/proc/%d" % d["pid"])): continue
+        cfg = os.path.dirname(os.path.dirname(f))
+        proj = (d.get("cwd") or "").replace("/", "-").replace(".", "-").replace("_", "-")
+        path = os.path.join(cfg, "projects", proj, d["sessionId"] + ".jsonl")
+        cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - hours * 3600))
+        try: fh = open(path, "rb")
+        except OSError: continue
+        for raw in fh:
+            if b'"type":"user"' not in raw and b'"type": "user"' not in raw: continue
+            try: e = json.loads(raw.decode("utf-8", "replace"))
+            except Exception: continue
+            if e.get("type") != "user" or (e.get("timestamp") or "") < cutoff: continue
+            c = (e.get("message") or {}).get("content")
+            t = c if isinstance(c, str) else " ".join(b.get("text", "") for b in c if isinstance(b, dict)) if isinstance(c, list) else ""
+            t = t.strip()
+            if t and not t.startswith(BRIDGE_PREFIXES) and not t.startswith(("/", "<", "[")): return e.get("timestamp")
+    return None
+
+
 def dialog_sweep(reg, notify, dry=False):
     """Surface MCP elicitation dialogs, and decline the ones nobody answers.
 
@@ -398,6 +433,14 @@ def dialog_sweep(reg, notify, dry=False):
         if rec.get("last_seen", 0) < now - 90: rec["times"] = rec.get("times", 0) + 1   # a fresh appearance
         rec["last_seen"] = now; rec["declined"] = False; dirty = True                   # re-raised: eligible again
         age_min = (now - rec["since"]) / 60.0
+        driven = person_driving(name)
+        if driven and not rec.get("driven_notified") and notify and tmux_has(notify) and not dry:
+            deliver(notify, "Session %s (which a person was directing at %s) is waiting on an MCP dialog from %s: %s \u2014 invisible from the app. "
+                            "The bridge will NOT decline it: accept or decline it in the pane or at the session's claude.ai link."
+                            % (name, driven[:16], rec["server"], body or "(no text captured)"))
+            rec["driven_notified"] = True; rec["notified"] = True; dirty = True
+        if driven:
+            print("-- %s: MCP dialog up %d min; a person is driving this session — left alone" % (name, int(age_min))); continue
         if not rec["notified"] and notify and tmux_has(notify) and not dry:
             deliver(notify, "Session %s is parked on an MCP dialog from %s: %s \u2014 invisible from the app. "
                             "Auto-DECLINED once it has been up %d min in total (blinking out and re-raising no longer resets the clock). Accept it in the pane to let it through."
