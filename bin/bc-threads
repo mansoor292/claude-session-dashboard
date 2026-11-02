@@ -433,7 +433,10 @@ def dialog_sweep(reg, notify, dry=False):
         if rec.get("last_seen", 0) < now - 90: rec["times"] = rec.get("times", 0) + 1   # a fresh appearance
         rec["last_seen"] = now; rec["declined"] = False; dirty = True                   # re-raised: eligible again
         age_min = (now - rec["since"]) / 60.0
-        driven = person_driving(name)
+        # Sticky: once a dialog was seen in a person-driven session it stays theirs, even
+        # after the six-hour window lapses — aws-bill's confirm was declined at 358 min
+        # because Mansoor's last message had aged past the window (2026-11-02).
+        driven = person_driving(name) or (rec.get("driven_notified") and "earlier")
         if driven and not rec.get("driven_notified") and notify and tmux_has(notify) and not dry:
             deliver(notify, "Session %s (which a person was directing at %s) is waiting on an MCP dialog from %s: %s \u2014 invisible from the app. "
                             "The bridge will NOT decline it: accept or decline it in the pane or at the session's claude.ai link."

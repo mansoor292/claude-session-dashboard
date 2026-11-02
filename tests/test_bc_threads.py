@@ -362,6 +362,15 @@ class DialogTests(unittest.TestCase):
         self.now += 45 * 60; m.dialog_sweep(self.reg, "_dashboard")
         self.assertNotIn("Enter", self.keys); self.assertEqual(len(self.sent), 1)
 
+    def test_driven_dialog_stays_theirs_after_window_lapses(self):
+        m = self.m; calls = {"n": 0}
+        def pd(name, hours=6.0):
+            calls["n"] += 1; return "2026-11-02T17:43:00" if calls["n"] == 1 else None
+        m.person_driving = pd
+        self.pane = self.DIALOG; m.dialog_sweep(self.reg, "_dashboard")
+        self.now += 400 * 60; m.dialog_sweep(self.reg, "_dashboard")
+        self.assertNotIn("Enter", self.keys)
+
     def test_never_accepts(self):
         m = self.m
         self.pane = self.DIALOG.replace("❯ Accept    Decline", "Accept    Decline")   # cursor nowhere
