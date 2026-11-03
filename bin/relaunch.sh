@@ -3,6 +3,10 @@
 # (rows: name<TAB>session_id<TAB>cwd<TAB>config_dir) and resumes each EXISTING session id
 # via `claude --resume <id> --remote-control '<name>'` WITHOUT --fork-session, so the
 # same online (claude.ai) session reconnects instead of minting a duplicate.
+# Shared API keys ride into every session as process environment (same source the
+# dashboard uses when it spawns or wakes a session). Without this a boot-restored session
+# came up keyless until someone re-woke it (2026-11-03).
+if [ -f "$HOME/.claude/secrets/.env" ]; then set -a; . "$HOME/.claude/secrets/.env"; set +a; fi
 LOG="$HOME/relaunch.log"
 MANIFEST="$HOME/relaunch_sessions.tsv"
 LOCK="$HOME/.relaunch-in-progress"

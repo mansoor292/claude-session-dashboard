@@ -14,6 +14,10 @@ SOCK=admin
 NAME=_dashboard
 DIR=/home/ubuntu/session-dashboard
 CLAUDE="$HOME/.local/bin/claude"
+# Shared API keys ride into every session as process environment (same source the
+# dashboard uses when it spawns or wakes a session). Without this a boot-restored session
+# came up keyless until someone re-woke it (2026-11-03).
+if [ -f "$HOME/.claude/secrets/.env" ]; then set -a; . "$HOME/.claude/secrets/.env"; set +a; fi
 STATE="$HOME/.dashboard-session"
 PROJ="$HOME/.claude/projects/$(echo "$DIR" | sed 's#[/._]#-#g')"
 
