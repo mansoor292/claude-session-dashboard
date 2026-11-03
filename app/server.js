@@ -360,6 +360,9 @@ function sessions(){
     s.canBranch = !!(m && m.sid && inGitRepo(s.cwd));   // forking needs a live Claude conversation; a worktree needs git
     s.canSplit  = !!(m && m.sid);                      // a split needs a conversation to distil, nothing more
     s.screen = screenFor(s.name);                       // a viewable Chrome, if chrome-for started one
+    // A child inherits its parent's Claude title ("catipult_for_coaches" ×9), which is useless
+    // on a wall of cards. If the session owns a Basecamp thread, that thread's title is its name.
+    const owned = bcOwned(s.name); if(owned){ s.title = owned; s.cname = owned; }
   });
   rc.forEach(s=>{ s.mem = 0; s.cpu = 0; });
   // Asleep: no process, no pane, but a seat. Shown so it can be woken; never listed as
@@ -383,6 +386,15 @@ function inGitRepo(cwd){
     const up=path.dirname(d); if(up===d) break; d=up;
   }
   return false;
+}
+function bcOwned(name){
+  try{ const reg=JSON.parse(fs.readFileSync(HOMEDIR+'/.claude/bc-threads.json','utf8'));
+    const leaf=new Set(['Message','Todo','Document','Upload','Card','Inbox::Forward']);
+    const mine=Object.values(reg.places||{}).filter(p=>p.session===name && leaf.has(p.kind) && p.title);
+    if(mine.length===1) return mine[0].title.slice(0,60);
+    if(mine.length>1) return mine.length+' threads · '+mine[0].title.slice(0,40);
+  }catch{}
+  return '';
 }
 // ---- Basecamp bridge state (written by bin/bc-threads) ----
 const BC_STORE   = HOMEDIR+'/.claude/bc-threads.json';

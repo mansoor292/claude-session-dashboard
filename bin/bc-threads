@@ -654,7 +654,7 @@ def nearest_session(reg, project, thread_id):
         # peeled off the next time it is engaged (Mansoor, 2026-09-24). The owner is the
         # closest relative — its cwd, its account, its client document — so the child is
         # spawned from it and the thread re-bound before anything is delivered.
-        if reg.get("spawn_per_task", True) and len(leaves_of(reg, rec["session"])) > 1:
+        if reg.get("spawn_per_task", True) and len(leaves_of(reg, rec["session"])) > 1 and not is_topic(reg, rec["session"]):
             return rec["session"], ("it owns this thread among %d; peeling it off into a session of its own"
                                     % len(leaves_of(reg, rec["session"]))), True, rec["session"]
         return rec["session"], "it already tracks this thread", True, ""
@@ -831,9 +831,16 @@ def leaves_of(reg, session):
                   if r.get("session") == session and is_leaf(r.get("kind")))
 
 
+def is_topic(reg, session):
+    """A session Mansoor named as the home for a TOPIC may own several threads — by his word,
+    never by accretion. `bc-threads topic <session>` declares it; audit lists them."""
+    return bool(session) and session in (reg.get("topic_sessions") or {})
+
+
 def assert_one_leaf(reg, session, pid, kind):
     """Refuse a binding that would give `session` a second thread, or give one to an internal session."""
     if not session or not is_leaf(kind): return
+    if is_topic(reg, session): return
     if session.startswith("_"):
         sys.exit("REFUSED: %s is an internal session and cannot own a thread. Pass --session <owner>, "
                  "or spawn one: bc-threads spawn %s" % (session, pid))
@@ -1705,11 +1712,25 @@ def audit_violations(reg):
     by = {}
     for pid, r in reg["places"].items():
         if r.get("session") and is_leaf(r.get("kind")): by.setdefault(r["session"], []).append(pid)
-    return sorted((s, sorted(v)) for s, v in by.items() if len(v) > 1 or s.startswith("_"))
+    return sorted((s, sorted(v)) for s, v in by.items() if (len(v) > 1 and not is_topic(reg, s)) or s.startswith("_"))
+
+
+def cmd_topic(a):
+    """Declare (or revoke) a session as the home for a topic: it may then own several threads."""
+    reg = load(); ts = reg.setdefault("topic_sessions", {})
+    if a.off:
+        if ts.pop(a.session, None) is None: sys.exit("%s was not a topic session" % a.session)
+        save(reg); print("%s is back to one thread per session" % a.session); return
+    if a.session.startswith("_"): sys.exit("internal sessions own no threads")
+    ts[a.session] = {"topic": a.topic or "", "by": a.by, "since": int(time.time())}
+    save(reg); note("topic", session=a.session, why=a.by, text=a.topic or "")
+    print("%s is the TOPIC session for %r (declared by %s) — it may own several threads; the audit lists it" % (a.session, a.topic or "", a.by))
 
 
 def cmd_audit(a):
     reg = load()
+    for s, t in sorted((reg.get("topic_sessions") or {}).items()):
+        print("topic %-40s %-30s owns %d thread(s)" % (s, (t.get("topic") or "")[:30], len(leaves_of(reg, s))))
     bad = audit_violations(reg)
     if not bad:
         print("one thread per session: holds (%d threads, %d sessions)"
@@ -2037,6 +2058,9 @@ sp = sub.add_parser("orphans"); sp.set_defaults(fn=cmd_orphans)
 sp = sub.add_parser("spawn", help="give a thread a session of its own (fresh, from the client document)")
 sp.add_argument("thread"); sp.add_argument("--from", dest="frm", help="session whose cwd/account the child takes"); sp.add_argument("--project")
 sp.set_defaults(fn=cmd_spawn)
+sp = sub.add_parser("topic", help="declare a session the home for a topic (may own several threads) — a person's act")
+sp.add_argument("session"); sp.add_argument("topic", nargs="?"); sp.add_argument("--by", default="Mansoor Razzaq"); sp.add_argument("--off", action="store_true")
+sp.set_defaults(fn=cmd_topic)
 sp = sub.add_parser("audit", help="one thread per session: report any session owning more than one")
 sp.add_argument("--notify", help="also ping this session when the rule is broken"); sp.set_defaults(fn=cmd_audit)
 sp = sub.add_parser("gap", help="record what the client document should have told this session")

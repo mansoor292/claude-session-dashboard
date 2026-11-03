@@ -254,6 +254,13 @@ class RoutingTests(unittest.TestCase):
         s, why, owned, spawn_from = self.m.nearest_session(self.reg, "P", "DOC")
         self.assertEqual((s, owned, spawn_from), ("parent", True, "parent"))
 
+    def test_topic_session_may_own_several_threads(self):
+        self.reg["topic_sessions"] = {"multi": {"topic": "franchise", "by": "Mansoor"}}
+        self.m.assert_one_leaf(self.reg, "multi", "M9", "Todo")          # allowed: declared topic
+        s, why, owned, spawn_from = self.m.nearest_session(self.reg, "P", "M1")
+        self.assertEqual(spawn_from, "", "a topic session is not peeled")
+        self.assertEqual(self.m.audit_violations(self.reg), [])
+
     def test_one_leaf_per_session(self):
         with self.assertRaises(SystemExit): self.m.assert_one_leaf(self.reg, "owner", "L9", "Todo")
         with self.assertRaises(SystemExit): self.m.assert_one_leaf(self.reg, "_dashboard", "L9", "Message")
