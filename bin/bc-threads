@@ -308,6 +308,20 @@ def ensure_bridge(name, wait=30):
     claude.ai or a phone, so turn it on before delivering rather than after."""
     if sessions().get(name, {}).get("bridge"): return True
     sock = socket_for(name)
+    # The registry lags: a fresh session can already show "remote-control is active" before
+    # bridgeSessionId is written. Typing /remote-control then opens the RC MENU, which blocks
+    # the pane until someone presses Esc (catholic-shop, 2026-11-03). Read the pane first.
+    try:
+        pane = subprocess.run([TMUX, "-L", sock, "capture-pane", "-p", "-t", name + ":"],
+                              capture_output=True, text=True, timeout=15).stdout
+        if "remote-control is active" in pane or "Remote Control" in pane and "Esc to continue" in pane:
+            if "Esc to continue" in pane: subprocess.run([TMUX, "-L", sock, "send-keys", "-t", name + ":", "Escape"], check=False)
+            for _ in range(wait):
+                time.sleep(1)
+                if sessions().get(name, {}).get("bridge"): return True
+            return False
+    except Exception:
+        pass
     subprocess.run([TMUX, "-L", sock, "send-keys", "-t", name, "-l", "/remote-control"], check=False)
     time.sleep(0.4)
     subprocess.run([TMUX, "-L", sock, "send-keys", "-t", name, "Enter"], check=False)
@@ -344,7 +358,7 @@ def deliver(name, text):
 
 
 BLOCKED_STATUS = ("busy", "waiting")   # a tool call is running, or a dialog has the keyboard
-OVERLAY = re.compile(r"esc to cancel|Yes, I accept|trust this folder|requests your input", re.I)
+OVERLAY = re.compile(r"esc to cancel|Esc to continue|Yes, I accept|trust this folder|requests your input", re.I)
 ELICIT = re.compile(r"MCP server .(.+?). requests your input", re.I)
 DIALOG_DECLINE_MIN = int(os.environ.get("BC_DIALOG_DECLINE_MIN", "30"))
 HOLD_NAG_HOURS = float(os.environ.get("BC_HOLD_NAG_HOURS", "2"))

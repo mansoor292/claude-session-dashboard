@@ -156,6 +156,7 @@ class SweepTests(unittest.TestCase):
         self.assertFalse(self.m.OVERLAY.search("❯ build it here\n  new task? /clear to save 126k tokens"))
         self.assertTrue(self.m.OVERLAY.search("  MCP server “x” requests your input\n  Esc to cancel"))
         self.assertTrue(self.m.OVERLAY.search("Yes, I accept"))
+        self.assertTrue(self.m.OVERLAY.search("  \u276f Continue\n  Enter to select \u00b7 Esc to continue"), "the Remote Control menu blocks the pane")
 
     # -- a mention held past the nag threshold is reported once -------------------------
     def test_long_hold_is_reported_once(self):
