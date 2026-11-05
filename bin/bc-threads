@@ -663,6 +663,8 @@ def nearest_session(reg, project, thread_id):
     # A quarantined owner is no owner: its mentions queue for a human instead of waking it.
     if rec and rec.get("session") and quarantined(rec["session"]):
         return "", "its owner %s is quarantined; a person must reassign this thread" % rec["session"], False, ""
+    if rec and rec.get("session") and rec.get("kind") == CAMPFIRE_KIND:
+        return rec["session"], "it stands for this project; its Campfire is delivered in place", True, ""
     if rec and rec.get("session"):
         # A session that owns several threads is not migrated by hand; each thread is
         # peeled off the next time it is engaged (Mansoor, 2026-09-24). The owner is the
@@ -849,6 +851,86 @@ def is_topic(reg, session):
     """A session Mansoor named as the home for a TOPIC may own several threads — by his word,
     never by accretion. `bc-threads topic <session>` declares it; audit lists them."""
     return bool(session) and session in (reg.get("topic_sessions") or {})
+
+
+CAMPFIRE_KIND = "Chat::Transcript"
+
+
+def is_campfire(reg, tid):
+    return (reg["places"].get(str(tid)) or {}).get("kind") == CAMPFIRE_KIND
+
+
+def campfire_of(reg, project):
+    """The project's Campfire id, cached ("" when the project has none)."""
+    cache = reg.setdefault("campfires", {})
+    if str(project) in cache: return cache[str(project)]
+    d = bc("api", "get", "/projects/%s.json" % project, check=False) or {}
+    chat = ""
+    for t in (d.get("dock") or []):
+        if t.get("name") == "chat" and t.get("enabled", True): chat = str(t.get("id") or "")
+    cache[str(project)] = chat
+    reg.setdefault("campfire_names", {})[str(project)] = d.get("name") or ""
+    return chat
+
+
+def project_session(reg, project):
+    """The session that stands for a whole project: the owner of its board or another
+    container, else the owner of most of its places. Quarantined sessions do not count."""
+    counts = {}
+    for pid, r in reg["places"].items():
+        if str(r.get("project")) != str(project) or not r.get("session"): continue
+        if quarantined(r["session"]) or r["session"].startswith("_"): continue
+        w = 100 if (not is_leaf(r.get("kind")) and r.get("kind") != CAMPFIRE_KIND) else 1
+        counts[r["session"]] = counts.get(r["session"], 0) + w
+    return max(counts, key=counts.get) if counts else ""
+
+
+def campfire_lines(project, chat):
+    """Every line of a Campfire, oldest first (the API hands back one page of the newest)."""
+    out = []
+    for pg in range(1, 10):
+        d = bc("api", "get", "/buckets/%s/chats/%s/lines.json?page=%d" % (project, chat, pg), check=False)
+        if not isinstance(d, list) or not d: break
+        out += d
+        if len(d) < 50: break
+    return sorted(out, key=lambda c: int(c["id"]))
+
+
+def sweep_campfires(reg):
+    """Campfire lines that may @mention the agent, shaped like comments.
+
+    Mansoor's "AI grab beachfront updates from my email and make the november version" sat
+    in the Beachfront Campfire (2026-11-05) until he asked why nothing had happened: the
+    sweep read comments, posts and assignments, never chat. A Campfire is a running chat,
+    not a thread, so a mention there is delivered IN PLACE to the session that stands for
+    the project (the owner of its board), never spawns a child, and the Campfire itself is
+    registered as a place of kind Chat::Transcript — neither leaf nor container, so the
+    one-thread rule is untouched. Only projects with a tracked place are read.
+
+    Returns (records, registry_changed).
+    """
+    out, changed = [], False
+    projects = sorted({str(r.get("project")) for r in reg["places"].values() if r.get("project")})
+    for proj in projects:
+        chat = campfire_of(reg, proj)
+        if not chat: continue
+        lines = bc("api", "get", "/buckets/%s/chats/%s/lines.json" % (proj, chat), check=False)
+        if not isinstance(lines, list): continue
+        if chat not in reg["places"]:
+            sess = project_session(reg, proj)
+            if sess:
+                register(reg, chat, proj, sess, kind=CAMPFIRE_KIND,
+                         title="Campfire · %s" % ((reg.get("campfire_names") or {}).get(proj) or proj),
+                         url=(lines[0].get("app_url") if lines else "") or "", quiet=True)
+                changed = True
+        title = (reg["places"].get(chat) or {}).get("title") or "Campfire"
+        for l in lines:
+            out.append({"id": l["id"], "created_at": l.get("created_at"), "updated_at": l.get("created_at"),
+                        "creator": l.get("creator") or {}, "bucket": l.get("bucket") or {"id": proj},
+                        "content": l.get("content") or "", "app_url": l.get("app_url") or "",
+                        "_post": True, "_campfire": True,
+                        "parent": {"id": chat, "title": title, "type": CAMPFIRE_KIND, "url": ""}})
+    return out, changed
 
 
 def assert_one_leaf(reg, session, pid, kind):
@@ -1141,7 +1223,8 @@ def sync_transcript(reg, project, thread_id, title="", url="", write=True, edite
     Returns (path, first_new_comment_id, n_new).
     """
     tid = str(thread_id)
-    cl = thread_comments(project, tid)
+    campfire = is_campfire(reg, tid)
+    cl = campfire_lines(project, tid) if campfire else thread_comments(project, tid)
     tr = reg.setdefault("transcripts", {}).setdefault(tid, {"last_id": 0})
     path = transcript_path(tid)
     os.makedirs(TRDIR, exist_ok=True)
@@ -1155,7 +1238,7 @@ def sync_transcript(reg, project, thread_id, title="", url="", write=True, edite
             # A message thread's opening post is not one of its comments. Without it the
             # file would start mid-conversation, so the post body is the first entry.
             try:
-                m = bc("api", "get", "/buckets/%s/messages/%s.json" % (project, tid), check=False) or {}
+                m = {} if campfire else (bc("api", "get", "/buckets/%s/messages/%s.json" % (project, tid), check=False) or {})
                 if m.get("id"):
                     f.write("\n#### %s · %s · %s (post)\n\n%s\n"
                             % (m["id"], (m.get("creator") or {}).get("name") or "someone",
@@ -1217,6 +1300,18 @@ def cmd_watch(a):
     comments = sweep_comments(a.limit) + sweep_posts()
     try: comments += sweep_assignments(reg)
     except Exception as e: print("!! assignment sweep failed: %s" % str(e)[:120])
+    try:
+        cf, ch = sweep_campfires(reg)
+        comments += cf
+        if ch: dirty = True
+    except Exception as e: print("!! campfire sweep failed: %s" % str(e)[:120])
+    # Campfire lines are a third stream with their own watermark (their ids interleave with
+    # comments and posts). First run learns the newest line and delivers nothing.
+    cfl = [int(c["id"]) for c in comments if c.get("_campfire")]
+    if "campfire_last_id" not in reg:
+        reg["campfire_last_id"] = max(cfl) if cfl else 0; dirty = True
+    seen_c = int(reg.get("campfire_last_id") or 0)
+    newest_c = seen_c
 
     first = "mention_last_id" not in reg
     seen_m = int(reg.get("mention_last_id") or 0)
@@ -1224,7 +1319,7 @@ def cmd_watch(a):
     # Posts are a second stream with their own watermark: ids interleave with comments, and
     # the comment watermark has usually already passed a fresh post. First run starts a day
     # back so the post that exposed the gap is caught, not seeded away.
-    posts = [c for c in comments if c.get("_post")]
+    posts = [c for c in comments if c.get("_post") and not c.get("_campfire")]
     if "post_last_id" not in reg:
         cutoff = time.strftime("%Y-%m-%dT%H:%M", time.gmtime(time.time() - 86400))
         old = [int(c["id"]) for c in posts if (c.get("created_at") or "") < cutoff]
@@ -1251,6 +1346,9 @@ def cmd_watch(a):
         cid = int(c["id"]); live_ids.add(str(cid))
         if c.get("_assigned"):
             if str(cid) in delivered or str(cid) in reg.get("orphans", {}): continue
+        elif c.get("_campfire"):
+            if cid > newest_c: newest_c = cid
+            if cid <= seen_c: continue
         elif c.get("_post"):
             if cid > newest_p: newest_p = cid
             if cid <= seen_p and str(cid) in delivered: continue
@@ -1417,6 +1515,9 @@ def cmd_watch(a):
     except Exception as e:
         print("!! hold nag failed: %s" % str(e)[:120])
     if held: newest_m = min(newest_m, min(held) - 1)
+    held_cf = [h for h in held if h in {int(c["id"]) for c in comments if c.get("_campfire")}]
+    if held_cf: newest_c = min(newest_c, min(held_cf) - 1)
+    if newest_c != seen_c: reg["campfire_last_id"] = newest_c; dirty = True
     if not first and newest_m > seen_m:
         reg["mention_last_id"] = newest_m; dirty = True
     held_p = [h for h in held if str(h) in {str(c["id"]) for c in posts}]
@@ -1491,7 +1592,14 @@ def cmd_reply(a):
     if not a.no_track and sess and reg["places"].get(rid) is None and tmux_has(sess):
         pre = fetch(a.project, rid) if a.project else {}
         assert_one_leaf(reg, sess, rid, pre.get("type") or "Message")
-    d = bc("comments", "create", rid, a.text, *(["--in", a.project] if a.project else [])) or {}
+    if is_campfire(reg, rid):
+        # A Campfire has lines, not comments. Same wrapper, same gates, same transcript.
+        cproj = str(a.project or reg["places"][rid].get("project") or "")
+        d = bc("api", "post", "/buckets/%s/chats/%s/lines.json" % (cproj, rid),
+               "--data", json.dumps({"content": a.text})) or {}
+        if not d.get("bucket"): d["bucket"] = {"id": cproj}
+    else:
+        d = bc("comments", "create", rid, a.text, *(["--in", a.project] if a.project else [])) or {}
     project = str(a.project or (d.get("bucket") or {}).get("id") or "")
     rec = reg["places"].get(rid)
     if a.no_track and rec is None:

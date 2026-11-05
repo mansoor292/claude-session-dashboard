@@ -141,6 +141,59 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(len(h.to("a__child")), 1)
         self.assertEqual(reg["post_last_id"], 103)
 
+    # -- a Campfire mention is delivered in place to the project's session, never spawns ---
+    def test_campfire_mention_delivers_in_place_to_project_session(self):
+        h = Harness(self.m, {"a": "idle"},
+                    {"B1": {"session": "a", "kind": "Message::Board", "project": "11789795"},
+                     "T8": {"session": "a", "kind": "Message", "project": "11789795"},
+                     "T9": {"session": "a", "kind": "Message", "project": "11789795"}})
+        self.m.campfire_of = lambda reg, p: "7001"
+        lines = [{"id": 500, "created_at": "2026-11-05T19:53:00.000Z", "creator": {"id": 2, "name": "Christy"},
+                  "bucket": {"id": "11789795"}, "content": "post the updates for AI or send them to you?", "app_url": ""}]
+        self.m.bc = lambda *a, **k: list(lines) if (len(a) > 2 and "lines.json" in a[2]) else {}
+        reg = h.sweep()
+        self.assertEqual(h.deliveries, [], "first run learns the newest line and delivers nothing")
+        self.assertEqual(reg["campfire_last_id"], 500)
+        self.assertEqual(reg["places"]["7001"]["kind"], "Chat::Transcript")
+        self.assertEqual(reg["places"]["7001"]["session"], "a", "the board's owner stands for the project")
+        lines.append({"id": 501, "created_at": "2026-11-05T20:14:00.000Z", "creator": {"id": 3, "name": "Mansoor"},
+                      "bucket": {"id": "11789795"}, "content": mention("grab beachfront updates from my email"), "app_url": ""})
+        lines.append({"id": 502, "created_at": "2026-11-05T20:15:00.000Z", "creator": {"id": 3, "name": "Mansoor"},
+                      "bucket": {"id": "11789795"}, "content": "no mention here", "app_url": ""})
+        reg = h.sweep()
+        self.assertEqual(len(h.to("a")), 1, "the mention is delivered to a in place")
+        self.assertIn("Campfire", h.to("a")[0])
+        self.assertEqual(h.spawns, [], "a owns two leaves, yet a Campfire mention never peels off a child")
+        self.assertEqual(reg["campfire_last_id"], 502)
+        self.assertEqual(reg["post_last_id"], 0, "campfire lines do not move the post watermark")
+        self.assertEqual(self.m.leaves_of(reg, "a"), ["T8", "T9"], "a Campfire is not a leaf")
+        # a held campfire mention pins its own watermark
+        h.sessions["a"] = "busy"
+        lines.append({"id": 503, "created_at": "2026-11-05T20:16:00.000Z", "creator": {"id": 3, "name": "Mansoor"},
+                      "bucket": {"id": "11789795"}, "content": mention("and the december one"), "app_url": ""})
+        reg = h.sweep()
+        self.assertEqual(reg["campfire_last_id"], 502, "held: watermark pinned below 503")
+        h.sessions["a"] = "idle"; reg = h.sweep()
+        self.assertEqual(len(h.to("a")), 2); self.assertEqual(reg["campfire_last_id"], 503)
+
+    # -- a reply to a Campfire is a chat line, through the same wrapper ---------------------
+    def test_reply_to_campfire_posts_a_line(self):
+        h = Harness(self.m, {"a": "idle"},
+                    {"7001": {"session": "a", "kind": "Chat::Transcript", "project": "11789795", "title": "Campfire"}})
+        calls = []
+        def fake_bc(*a, **k):
+            calls.append(a)
+            if a[:2] == ("api", "post"): return {"id": 9001, "bucket": {"id": "11789795"}}
+            return {}
+        self.m.bc = fake_bc
+        self.m.cmd_reply(argparse.Namespace(text="- on it: reading the mailbox now", recording="7001", session="a",
+                                            project=None, no_track=False, long=None, proven=None))
+        posts = [c for c in calls if c[:2] == ("api", "post")]
+        self.assertEqual(len(posts), 1)
+        self.assertIn("/buckets/11789795/chats/7001/lines.json", posts[0][2])
+        self.assertFalse(any(c[:2] == ("comments", "create") for c in calls), "never a comment on a chat")
+        self.assertIn(9001, self.m.load()["places"]["7001"]["ours"])
+
     # -- a quarantined owner is no owner: the mention queues, nothing is woken ------------
     def test_quarantined_owner_queues_instead_of_waking(self):
         h = Harness(self.m, {}, {"T1": {"session": "rogue", "kind": "Message", "project": "49228821"}})
