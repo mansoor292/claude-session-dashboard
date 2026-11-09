@@ -194,6 +194,13 @@ class SweepTests(unittest.TestCase):
         self.assertFalse(any(c[:2] == ("comments", "create") for c in calls), "never a comment on a chat")
         self.assertIn(9001, self.m.load()["places"]["7001"]["ours"])
 
+    # -- pings: an explicit empty ping_from means everyone may reach the anchor -------------
+    def test_ping_allow_empty_list_means_everyone(self):
+        self.assertEqual(self.m.ping_allow({}), [x.lower() for x in self.m.PING_FROM])
+        self.assertEqual(self.m.ping_allow({"ping_from": []}), [], "[] = no allowlist = everyone")
+        self.assertEqual(self.m.ping_allow({"ping_from": ["Christy Biggs"]}), ["christy biggs"])
+        self.assertIn("ping-reply", self.m.ANCHOR_RULE)
+
     # -- a quarantined owner is no owner: the mention queues, nothing is woken ------------
     def test_quarantined_owner_queues_instead_of_waking(self):
         h = Harness(self.m, {}, {"T1": {"session": "rogue", "kind": "Message", "project": "49228821"}})

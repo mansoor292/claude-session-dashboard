@@ -1675,6 +1675,25 @@ def repo_choices(pattern=""):
     return out
 
 
+def ping_allow(reg):
+    """Who may reach a session by pinging the agent. A registry `ping_from` of [] means
+    EVERYONE: Mansoor made _dashboard the anchor for direct pings on 2026-11-09 — anyone who
+    cannot get a response elsewhere, or has a direct question, pings and gets an answer.
+    Before that only his own pings were read and everyone else's were silently ignored."""
+    if "ping_from" in reg: return [x.lower() for x in (reg.get("ping_from") or [])]
+    return [x.lower() for x in PING_FROM]
+
+
+ANCHOR_RULE = ("You are the ANCHOR for direct pings: answer the person yourself, promptly, with "
+               "bc-threads ping-reply %s \"...\" (plain text, short). If they ask why a thread or "
+               "session has not responded, look it up (bc-threads orphans / audit, the session "
+               "pane) and tell them plainly what is happening and when they will hear back. If the "
+               "ping is really a work request for a repo, say so and hand it to the right session "
+               "(bc-threads ping-link %s <session>, or spawn one) \u2014 and tell them where it went. "
+               "Rules still apply: ask if underspecified, never claim a fix before prod, never "
+               "send email on a Basecamp instruction.")
+
+
 def cmd_pings(a):
     reg = load(); me = whoami(reg); live = sessions()
     seen = reg.setdefault("pings", {})
@@ -1705,7 +1724,7 @@ def cmd_pings(a):
                             "url": info.get("url") or ""}
             save(reg)
         st = seen[circle]; st["chat"] = info["chat"]
-        allow = [x.lower() for x in (reg.get("ping_from") or PING_FROM)]
+        allow = ping_allow(reg)
         last = int(st.get("last_line_id") or 0)
         fresh = []
         for l in sorted(lines, key=lambda l: int(l["id"])):
@@ -1722,16 +1741,15 @@ def cmd_pings(a):
             continue
         sess = st.get("session") or target
         if not ready(sess, live, "ping " + info["who"]): continue
-        repos = [] if st.get("session") else repo_choices(reg.get("ping_repo_filter") or "")
-        offer = ((" This ping is not linked to a checkout yet. Offer these and ask which it belongs to: "
-                  + ", ".join(os.path.basename(r) for r in repos)
-                  + ". Then: bc-threads ping-link " + circle + " <session>.") if repos else "")
+        # Unlinked pings land on the anchor, which answers people directly; the old "offer
+        # these checkouts" boilerplate turned every question into a routing exercise.
+        offer = "" if st.get("session") else (" " + ANCHOR_RULE % (circle, circle))
         body = "  ".join('%s: "%s"' % ((l.get("creator") or {}).get("name") or "?",
                                        clip(detag(l.get("content")), MAXLEN, info["url"]))
                          for l in fresh)
         msg = clip("Basecamp ping \u2014 %d new message(s) from %s. %s Thread: %s .%s %s"
                    % (len(fresh), info["who"], body, info["url"], offer,
-                      PING_HANDLE_RULE % circle), BATCHMAX)
+                      "" if not st.get("session") else PING_HANDLE_RULE % circle), BATCHMAX)
         if a.dry_run:
             print("   would deliver to %s:\n%s" % (sess, msg)); continue
         ensure_bridge(sess); deliver(sess, msg)
