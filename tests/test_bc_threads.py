@@ -376,6 +376,32 @@ class GateTests(unittest.TestCase):
         self.assertFalse(self.m.CLAIM_RE.search("looking at this now"))
 
 
+class SocketTests(unittest.TestCase):
+    """`_` sessions live on the admin socket by design, but a hand restart can land one on
+    the default socket; the lookup must follow the session, or every ping to it is held."""
+
+    def setUp(self):
+        self.m = load_module(tempfile.mkdtemp())
+
+    def _stub(self, present):
+        def run(args, **kw):
+            sock, name = args[2], args[-1].lstrip("=")
+            return types.SimpleNamespace(returncode=0 if (sock, name) in present else 1)
+        self.m.subprocess.run = run
+
+    def test_underscore_session_found_on_default_socket(self):
+        self._stub({("default", "_dashboard")})
+        self.assertEqual(self.m.socket_for("_dashboard"), "default")
+
+    def test_underscore_session_prefers_admin(self):
+        self._stub({("admin", "_dashboard"), ("default", "_dashboard")})
+        self.assertEqual(self.m.socket_for("_dashboard"), "admin")
+
+    def test_plain_session_never_probes(self):
+        self._stub(set())
+        self.assertEqual(self.m.socket_for("beachfronts"), "default")
+
+
 class DialogTests(unittest.TestCase):
     """The MCP dialog sweep against a scripted pane and a controllable clock."""
 

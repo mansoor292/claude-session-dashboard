@@ -234,7 +234,16 @@ def socket_for(name):
     "not on the default tmux socket", held, and no ping was ever delivered. The `_` name
     prefix is the marker on both sides.
     """
-    return ADMIN_SOCKET if (name or "").startswith("_") else SOCKET
+    if not (name or "").startswith("_"):
+        return SOCKET
+    # A `_` session belongs on the admin socket, but a restart by hand (2026-11-09) put
+    # `_dashboard` on the default one and every ping to it was held again. Prefer admin,
+    # take wherever the session actually lives.
+    for sock in (ADMIN_SOCKET, SOCKET):
+        if subprocess.run([TMUX, "-L", sock, "has-session", "-t", "=" + name],
+                          capture_output=True).returncode == 0:
+            return sock
+    return ADMIN_SOCKET
 
 
 def tmux_has(name):
