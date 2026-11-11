@@ -322,6 +322,24 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(spawn_from, "", "a topic session is not peeled")
         self.assertEqual(self.m.audit_violations(self.reg), [])
 
+    def test_project_scope_delivers_everything_in_place(self):
+        """A session scoped to a whole project gets every mention there: owned threads are
+        not peeled, containers do not fork, unknown threads are claimed, and only there."""
+        self.reg["project_sessions"] = {"P": {"session": "multi", "by": "Mansoor"}}
+        self.m.quarantined = lambda n: False
+        for tid in ("M1", "L2", "ZZZ", "L1"):
+            s, why, owned, spawn_from = self.m.nearest_session(self.reg, "P", tid)
+            self.assertEqual((s, owned, spawn_from), ("multi", True, ""), tid)
+        self.assertFalse(self.m.nearest_session(self.reg, "Q", "ZZZ")[2], "another project is untouched")
+        self.m.assert_one_leaf(self.reg, "multi", "M9", "Todo")
+        self.assertEqual(self.m.audit_violations(self.reg), [])
+        self.assertEqual(self.m.project_session(self.reg, "P"), "multi")
+
+    def test_project_scope_quarantined_queues(self):
+        self.reg["project_sessions"] = {"P": {"session": "multi", "by": "Mansoor"}}
+        self.m.quarantined = lambda n: n == "multi"
+        self.assertFalse(self.m.nearest_session(self.reg, "P", "L1")[2])
+
     def test_one_leaf_per_session(self):
         with self.assertRaises(SystemExit): self.m.assert_one_leaf(self.reg, "owner", "L9", "Todo")
         with self.assertRaises(SystemExit): self.m.assert_one_leaf(self.reg, "_dashboard", "L9", "Message")

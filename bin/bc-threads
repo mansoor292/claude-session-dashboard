@@ -668,6 +668,11 @@ def nearest_session(reg, project, thread_id):
     answers — worst case with the fallback session, whose job is to tell a human.
     """
     project, thread_id = str(project), str(thread_id)
+    scoped = project_scope(reg, project)
+    if scoped:
+        if quarantined(scoped):
+            return "", "the project's session %s is quarantined; a person must reassign" % scoped, False, ""
+        return scoped, "it is scoped to this whole project; delivered in place", True, ""
     rec = reg["places"].get(thread_id)
     # A quarantined owner is no owner: its mentions queue for a human instead of waking it.
     if rec and rec.get("session") and quarantined(rec["session"]):
@@ -858,8 +863,21 @@ def leaves_of(reg, session):
 
 def is_topic(reg, session):
     """A session Mansoor named as the home for a TOPIC may own several threads — by his word,
-    never by accretion. `bc-threads topic <session>` declares it; audit lists them."""
-    return bool(session) and session in (reg.get("topic_sessions") or {})
+    never by accretion. `bc-threads topic <session>` declares it; audit lists them. A session
+    scoped to a whole project (`bc-threads scope`) is a topic session for the same reason."""
+    if not session: return False
+    if session in (reg.get("topic_sessions") or {}): return True
+    return session in {v.get("session") for v in (reg.get("project_sessions") or {}).values()}
+
+
+def project_scope(reg, project):
+    """The session Mansoor scoped to a WHOLE project, or "". Binding a session to a project
+    was retired in 2026-08 because one link dragged every thread of a busy client project
+    into one session; it is back only as an explicit per-project act by a person, for a
+    project that is one piece of work (Checkwright.ai, 2026-11-11). Every mention anywhere
+    in the project — board, to-dos, docs, Campfire, new threads — is delivered to that
+    session in place: no child is forked and nothing is peeled off."""
+    return ((reg.get("project_sessions") or {}).get(str(project)) or {}).get("session") or ""
 
 
 CAMPFIRE_KIND = "Chat::Transcript"
@@ -885,6 +903,8 @@ def campfire_of(reg, project):
 def project_session(reg, project):
     """The session that stands for a whole project: the owner of its board or another
     container, else the owner of most of its places. Quarantined sessions do not count."""
+    scoped = project_scope(reg, project)
+    if scoped and not quarantined(scoped): return scoped
     counts = {}
     for pid, r in reg["places"].items():
         if str(r.get("project")) != str(project) or not r.get("session"): continue
@@ -1876,8 +1896,34 @@ def cmd_topic(a):
     print("%s is the TOPIC session for %r (declared by %s) — it may own several threads; the audit lists it" % (a.session, a.topic or "", a.by))
 
 
+def cmd_scope(a):
+    """Scope a session to a WHOLE project (or revoke it) — a person's act, never the sweep's."""
+    reg = load(); ps = reg.setdefault("project_sessions", {})
+    project = str(a.project)
+    if a.off:
+        if ps.pop(project, None) is None: sys.exit("project %s had no scoped session" % project)
+        save(reg); print("project %s is back to one session per thread" % project); return
+    if not a.session or a.session.startswith("_"): sys.exit("internal sessions own no threads")
+    if not project.isdigit(): sys.exit("give the project id, not its name")
+    if quarantined(a.session): sys.exit("%s is quarantined; it cannot stand for a project" % a.session)
+    p = bc("api", "get", "/projects/%s.json" % project, check=False)
+    if not isinstance(p, dict) or not p.get("name"): sys.exit("project %s not found as the agent" % project)
+    ps[project] = {"session": a.session, "by": a.by, "since": int(time.time()), "name": p.get("name", "")}
+    # Register the message board so the project's webhook exists and the audit shows the tie;
+    # the scope itself is what routes, so nothing else needs tracking.
+    for t in p.get("dock") or []:
+        if t.get("name") == "message_board" and t.get("enabled"):
+            register(reg, t["id"], project, a.session, kind="Message::Board", title=t.get("title") or "Message Board",
+                     url=t.get("app_url") or "", quiet=True)
+    save(reg); note("scope", session=a.session, why=a.by, text=p.get("name", ""))
+    print("%s is scoped to the WHOLE project %r (%s), declared by %s — every mention in it is delivered there in place"
+          % (a.session, p.get("name", ""), project, a.by))
+
+
 def cmd_audit(a):
     reg = load()
+    for pj, t in sorted((reg.get("project_sessions") or {}).items()):
+        print("scope %-40s whole project %s (%s)" % (t.get("session"), pj, (t.get("name") or "")[:30]))
     for s, t in sorted((reg.get("topic_sessions") or {}).items()):
         print("topic %-40s %-30s owns %d thread(s)" % (s, (t.get("topic") or "")[:30], len(leaves_of(reg, s))))
     bad = audit_violations(reg)
@@ -2207,6 +2253,9 @@ sp = sub.add_parser("orphans"); sp.set_defaults(fn=cmd_orphans)
 sp = sub.add_parser("spawn", help="give a thread a session of its own (fresh, from the client document)")
 sp.add_argument("thread"); sp.add_argument("--from", dest="frm", help="session whose cwd/account the child takes"); sp.add_argument("--project")
 sp.set_defaults(fn=cmd_spawn)
+sp = sub.add_parser("scope", help="scope a session to a WHOLE project: every mention there is delivered to it in place — a person's act")
+sp.add_argument("project"); sp.add_argument("session", nargs="?"); sp.add_argument("--by", default="Mansoor Razzaq"); sp.add_argument("--off", action="store_true")
+sp.set_defaults(fn=cmd_scope)
 sp = sub.add_parser("topic", help="declare a session the home for a topic (may own several threads) — a person's act")
 sp.add_argument("session"); sp.add_argument("topic", nargs="?"); sp.add_argument("--by", default="Mansoor Razzaq"); sp.add_argument("--off", action="store_true")
 sp.set_defaults(fn=cmd_topic)
