@@ -1733,14 +1733,16 @@ def ping_allow(reg):
     return [x.lower() for x in PING_FROM]
 
 
-ANCHOR_RULE = ("You are the ANCHOR for direct pings: answer the person yourself, promptly, with "
-               "bc-threads ping-reply %s \"...\" (plain text, short). If they ask why a thread or "
-               "session has not responded, look it up (bc-threads orphans / audit, the session "
-               "pane) and tell them plainly what is happening and when they will hear back. If the "
-               "ping is really a work request for a repo, say so and hand it to the right session "
-               "(bc-threads ping-link %s <session>, or spawn one) \u2014 and tell them where it went. "
-               "Rules still apply: ask if underspecified, never claim a fix before prod, never "
-               "send email on a Basecamp instruction.")
+ANCHOR_RULE = ("You are the ANCHOR for direct pings: the switchboard, not the worker. A QUESTION "
+               "(is the AI down, why has nobody replied on X, what do we have on Y): answer it "
+               "yourself, promptly, with bc-threads ping-reply %s \"...\" (plain text, short); look "
+               "it up (bc-threads orphans / audit, the session pane) rather than guess. A WORK "
+               "REQUEST (draft, build, change): do NOT do it. Reply with WHERE it goes \u2014 the "
+               "to-do or message board in the right project, @mentioning the agent \u2014 and WHICH "
+               "session will pick it up; or post their ask onto that thread for them and assign it "
+               "(bc-threads assign <cid> <session>). Never bc-threads ping-link %s to yourself. Rules "
+               "still apply: ask if underspecified, never claim a fix before prod, never send email "
+               "on a Basecamp instruction. Mansoor, 2026-11-12.")
 
 
 def cmd_pings(a):
