@@ -491,5 +491,46 @@ class DialogTests(unittest.TestCase):
         self.assertNotIn("Enter", self.keys, "Enter is only pressed with the cursor verifiably on Decline")
 
 
+
+class TranscriptOpeningTests(unittest.TestCase):
+    """The first entry of a transcript is the record the thread hangs off, whatever its kind."""
+
+    def setUp(self):
+        self.m = load_module(tempfile.mkdtemp())
+
+    def _bc(self, records):
+        def fake(*a, **k):
+            path = a[2] if len(a) > 2 else ""
+            if "comments.json" in path: return []
+            for frag, rec in records.items():
+                if frag in path: return rec
+            return {"ok": False, "error": "not found"}
+        self.m.bc = fake
+
+    def test_todo_description_is_the_first_entry(self):
+        self._bc({"/todos/77.json": {"id": 77, "created_at": "2026-11-09T16:22:00.000Z",
+                                     "creator": {"name": "Christy"},
+                                     "description": "<p>Pull the catalog from <a href='x'>the PDF</a> and prepare the feed.</p>"}})
+        reg = {"places": {"77": {"kind": "Todo", "project": "10642794", "session": "v"}}}
+        path, first, n = self.m.sync_transcript(reg, "10642794", "77", title="Spring 2027 SEED")
+        body = open(path).read()
+        self.assertIn("#### 77 · Christy · 2026-11-09 16:22 (to-do)", body)
+        self.assertIn("Pull the catalog from", body, "the to-do body is the ask; it must be in the file")
+        self.assertEqual(n, 0, "the opening record is not a comment and is never 'new'")
+
+    def test_message_post_still_opens_the_file(self):
+        self._bc({"/messages/88.json": {"id": 88, "created_at": "2026-11-01T10:00:00.000Z",
+                                        "creator": {"name": "Mansoor"}, "content": "<p>the v2 post</p>"}})
+        reg = {"places": {"88": {"kind": "Message", "project": "1", "session": "v"}}}
+        path, _, _ = self.m.sync_transcript(reg, "1", "88", title="Post")
+        self.assertIn("(post)\n\nthe v2 post", open(path).read())
+
+    def test_kind_unknown_falls_through_to_the_record_that_answers(self):
+        self._bc({"/documents/99.json": {"id": 99, "created_at": "2026-11-01T10:00:00.000Z",
+                                         "creator": {"name": "Pamela"}, "content": "<p>spec</p>"}})
+        path, _, _ = self.m.sync_transcript({"places": {}}, "1", "99", title="Doc")
+        self.assertIn("(document)\n\nspec", open(path).read())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

@@ -1229,6 +1229,23 @@ HEADER = (
     "Full rules: ~/.claude/CLAUDE.md.\n")
 
 
+# One endpoint per kind of record a thread can be. The registry's `kind` picks the first
+# try; the rest are fallbacks for a thread tracked before its kind was recorded.
+OPENING = [("Todo", "todos", "to-do"), ("Message", "messages", "post"),
+           ("Document", "documents", "document"), ("Card", "card_tables/cards", "card")]
+
+
+def opening_record(project, tid, kind=None):
+    """The record a thread hangs off — its title, creator and body — or {} if none answers."""
+    order = sorted(OPENING, key=lambda t: 0 if t[0] == (kind or "") else 1)
+    for _k, path, what in order:
+        m = bc("api", "get", "/buckets/%s/%s/%s.json" % (project, path, tid), check=False)
+        if isinstance(m, dict) and m.get("id"):
+            m["_what"] = what
+            return m
+    return {}
+
+
 def brief_hint(tid):
     """Point at the distilled brief when bc-epoch has one — goal, decisions, open asks.
 
@@ -1264,14 +1281,17 @@ def sync_transcript(reg, project, thread_id, title="", url="", write=True, edite
         with open(path, "w") as f:
             f.write(HEADER % (title or "Basecamp thread " + tid, tid, project,
                               (" · " + url) if url else "", tid))
-            # A message thread's opening post is not one of its comments. Without it the
-            # file would start mid-conversation, so the post body is the first entry.
+            # A thread's opening record is not one of its comments. Without it the file
+            # would start mid-conversation, so the body is the first entry. For a to-do the
+            # ask usually IS the body: Christy's "pull this PDF" sat in a to-do description
+            # for three days (2026-11-09) while the owner read an "empty to-do" and idled.
             try:
-                m = {} if campfire else (bc("api", "get", "/buckets/%s/messages/%s.json" % (project, tid), check=False) or {})
+                m = {} if campfire else opening_record(project, tid, (reg.get("places", {}).get(tid) or {}).get("kind"))
                 if m.get("id"):
-                    f.write("\n#### %s · %s · %s (post)\n\n%s\n"
+                    f.write("\n#### %s · %s · %s (%s)\n\n%s\n"
                             % (m["id"], (m.get("creator") or {}).get("name") or "someone",
-                               (m.get("created_at") or "")[:16].replace("T", " "), detag(m.get("content"))))
+                               (m.get("created_at") or "")[:16].replace("T", " "), m.get("_what") or "post",
+                               detag(m.get("content") or m.get("description"))))
             except Exception: pass
     if fresh:
         with open(path, "a") as f:
