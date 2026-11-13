@@ -1,0 +1,10 @@
+[Unit]
+Description=Once a day: the head session reviews every session and thread
+
+[Timer]
+OnCalendar=*-*-* 12:30:00
+Persistent=true
+AccuracySec=2min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly: nothing from Basecamp sits unanswered unnoticed
+
+[Timer]
+OnCalendar=*-*-* *:47:00
+Persistent=true
+AccuracySec=2min
+
+[Install]
+WantedBy=timers.target

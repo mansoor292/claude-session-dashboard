@@ -1,0 +1,9 @@
+[Unit]
+Description=Tell _dashboard about @mentions that have sat over an hour with no reply
+
+[Service]
+Type=oneshot
+User=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/session-dashboard/bin/daily-review --hourly

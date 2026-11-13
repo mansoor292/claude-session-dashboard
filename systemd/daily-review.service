@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily stock-take of sessions, code and Basecamp threads, handed to _dashboard
+
+[Service]
+Type=oneshot
+User=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Gathers and points only: writes ~/.claude/daily-review/<date>.md and types one line into
+# _dashboard, which does the judging. Mansoor's standing order, 2026-11-13.
+ExecStart=/home/ubuntu/session-dashboard/bin/daily-review

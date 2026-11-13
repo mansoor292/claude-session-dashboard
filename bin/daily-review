@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""daily-review — the head session's once-a-day stock-take, and the hourly "is anything sitting".
+
+Mansoor, 2026-11-13: _dashboard reviews the open sessions daily (which are behind in code,
+which threads need distilling or an epoch update) and makes sure everything from Basecamp is
+accounted for; anything sitting over an hour is put to him.
+
+This script only GATHERS and POINTS. It writes a report and types one line into _dashboard;
+the judgment (nudging an owner, asking Mansoor, running `bc-epoch sync-all` as his delegate)
+is the session's. It never posts to Basecamp, never cuts an epoch, never touches a repo
+beyond `git fetch`.
+
+  daily-review              full report -> ~/.claude/daily-review/<date>.md, then tell _dashboard
+  daily-review --hourly     only: mentions unanswered > 1h; speaks only when the list changes
+  daily-review --print      full report to stdout, tell nobody
+"""
+import datetime, glob, json, os, re, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+OUT = os.path.join(HOME, ".claude/daily-review")
+STATE = os.path.join(OUT, "state.json")
+TMUX = "/usr/bin/tmux"
+THANKS = re.compile(r"^\W*(perfect|great|sweet|ok(ay)?|got it|understood|thank(s| you)|appreciate)[^?]{0,80}$", re.I)
+OURS = re.compile(r"\(us\)|^(AI|CatalogsAI)\b")
+
+
+def sh(cmd, timeout=120):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def live_sessions():
+    """name -> (cwd, claude code version) for every live tmux session on the default socket."""
+    ver = {}
+    for f in glob.glob(os.path.join(HOME, ".claude*/sessions/*.json")):
+        try: d = json.load(open(f))
+        except Exception: continue
+        if d.get("pid") and os.path.exists("/proc/%d" % d["pid"]):
+            ver[(d.get("tmux") or "").split(":")[0]] = d.get("version") or "?"
+    out = {}
+    for n in sh([TMUX, "-L", "default", "list-sessions", "-F", "#{session_name}"]).split():
+        cwd = sh([TMUX, "-L", "default", "display-message", "-p", "-t", n + ":", "#{pane_current_path}"]).strip()
+        out[n] = (cwd, ver.get(n, "?"))
+    return out
+
+
+def code_state(sessions):
+    """One row per distinct checkout: behind/ahead of the default branch, unpushed, uncommitted."""
+    by = {}
+    for n, (cwd, _) in sessions.items():
+        by.setdefault(cwd, []).append(n)
+    rows = []
+    for cwd, names in sorted(by.items()):
+        g = lambda *a: sh(["git", "-C", cwd] + list(a), 30).strip()
+        if not cwd or not g("rev-parse", "--git-dir"): continue
+        sh(["git", "-C", cwd, "fetch", "-q", "origin"], 40)
+        default = g("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or "origin/main"
+        lr = g("rev-list", "--left-right", "--count", default + "...HEAD").split()
+        behind, ahead = (int(lr[0]), int(lr[1])) if len(lr) == 2 else (0, 0)
+        unpushed = g("rev-list", "--count", "@{u}..HEAD") or "no upstream"
+        dirty = len([l for l in g("status", "--porcelain").splitlines() if l])
+        if behind or dirty or unpushed not in ("0",):
+            rows.append("- `%s` (%s) — %d behind / %d ahead of %s, unpushed %s, %d uncommitted file(s) — %s"
+                        % (cwd.replace(HOME, "~"), g("rev-parse", "--abbrev-ref", "HEAD"), behind, ahead,
+                           default, unpushed, dirty, ", ".join(sorted(names))))
+    return rows
+
+
+def places():
+    own = {}
+    for l in sh(["bc-threads", "places"]).splitlines():
+        m = re.match(r"\s*(\d+)\s+(\S+)\s+(.*?)\s+->\s+(\S+)\s+\[([^\]]*)\]", l)
+        if m: own[m.group(1)] = (m.group(4), m.group(5), m.group(3).strip())
+    return own
+
+
+def unanswered(own, min_hours=1.0, max_days=30):
+    """Threads whose latest @mention of the agent has no later entry of ours."""
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    rows = []
+    for tid, (sess, st, title) in own.items():
+        p = os.path.join(HOME, ".claude/bc-transcripts/%s.md" % tid)
+        try: s = open(p).read()
+        except OSError: continue
+        ents = re.findall(r"^#### (\d+) · (.*?) · (\d{4}-\d\d-\d\d \d\d:\d\d)\n(.*?)(?=^#### |\Z)", s, re.S | re.M)
+        last = None
+        for i, (cid, who, ts, body) in enumerate(ents):
+            if not OURS.search(who) and re.search(r"@(AI|CatalogsAI)\b", body): last = i
+        if last is None or any(OURS.search(e[1]) for e in ents[last + 1:]): continue
+        cid, who, ts, body = ents[last]
+        text = " ".join(re.sub(r"<[^>]+>", " ", body).split())
+        if THANKS.match(re.sub(r"@(AI|CatalogsAI)\b", "", text).strip()): continue
+        age = (now - datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M")).total_seconds() / 3600
+        if age < min_hours or age > max_days * 24: continue
+        rows.append((age, tid, cid, sess, st, title[:40], who, text[:160]))
+    return sorted(rows)
+
+
+def fmt_unanswered(rows):
+    return ["- %.0fh — %s on \"%s\" (thread %s, owner `%s` [%s]): %s" % (a, who, title, tid, sess, st, text)
+            for a, tid, cid, sess, st, title, who, text in rows]
+
+
+def epochs():
+    behind, noinit, asks = [], [], []
+    for l in sh(["bc-epoch", "status-all"], 180).splitlines():
+        if "closed" in l: continue
+        tid = l.split()[0].rstrip(":") if l.split() else ""
+        if "no epoch state" in l: noinit.append(tid); continue
+        m = re.search(r"(\d+) chars behind", l)
+        if m: behind.append((int(m.group(1)), l.split(": epoch")[0]))
+        m = re.search(r"(\d+) open ask\(s\) \(oldest (\d+)d\)", l)
+        if m: asks.append((int(m.group(2)), int(m.group(1)), l.split(": epoch")[0]))
+    return sorted(behind, reverse=True), noinit, sorted(asks, reverse=True)
+
+
+def tell(line):
+    sock = "admin" if "_dashboard" in sh([TMUX, "-L", "admin", "list-sessions", "-F", "#{session_name}"]) else "default"
+    subprocess.run([TMUX, "-L", sock, "send-keys", "-t", "_dashboard", "-l", " ".join(line.split())])
+    time.sleep(0.6)
+    subprocess.run([TMUX, "-L", sock, "send-keys", "-t", "_dashboard", "Enter"])
+
+
+def main():
+    os.makedirs(OUT, exist_ok=True)
+    try: state = json.load(open(STATE))
+    except Exception: state = {}
+    sh(["bc-threads", "sync"], 600)
+    own = places()
+    if "--hourly" in sys.argv:
+        rows = unanswered(own, 1.0, 3)
+        sig = sorted(r[2] for r in rows)
+        if rows and sig != state.get("hourly"):
+            tell("Sitting > 1h (daily-review --hourly): %d mention(s) with no reply from us — %s. Check the owner's pane; "
+                 "nudge it, or put the decision to Mansoor with the question UI and your own suggestion."
+                 % (len(rows), " ; ".join(l[2:] for l in fmt_unanswered(rows))))
+        state["hourly"] = sig; json.dump(state, open(STATE, "w"))
+        print("%d sitting" % len(rows)); return
+    sess = live_sessions()
+    latest = sh(["claude", "--version"]).split()[0] if sh(["claude", "--version"]) else "?"
+    old = sorted("%s (%s)" % (n, v) for n, (_, v) in sess.items() if v not in (latest, "?"))
+    behind, noinit, asks = epochs()
+    R = ["# Daily review — %s" % time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()), "",
+         "## Mentions with no reply from us (over 1h)"] + (fmt_unanswered(unanswered(own)) or ["- none"])
+    R += ["", "## Unrouted / held", "```", sh(["bc-threads", "orphans"]).strip() or "none", "```",
+          "", "## Code — checkouts behind, unpushed or uncommitted"] + (code_state(sess) or ["- all level"])
+    R += ["", "## Claude Code version (installed %s)" % latest, "- behind: " + (", ".join(old) or "none")]
+    R += ["", "## Epochs — briefs behind their transcript (run `bc-epoch sync-all`)"] + \
+         (["- %d chars — %s" % b for b in behind] or ["- none"])
+    R += ["", "## Threads never distilled (%d)" % len(noinit), "- " + (" ".join(noinit) or "none")]
+    R += ["", "## Open asks, oldest first (cut or close candidates when stale)"] + \
+         (["- %dd, %d ask(s) — %s" % a for a in asks] or ["- none"])
+    R += ["", "## Audit", "```", sh(["bc-threads", "audit"]).strip(), "```",
+          "", "## Client-doc gaps (last 5)", "```", "\n".join(sh(["bc-threads", "gaps"]).splitlines()[-5:]), "```"]
+    text = "\n".join(R) + "\n"
+    if "--print" in sys.argv: print(text); return
+    path = os.path.join(OUT, time.strftime("%Y-%m-%d") + ".md")
+    open(path, "w").write(text)
+    tell("Daily review from the timer (Mansoor's standing order 2026-11-13): read %s. Then: nudge owners of unanswered "
+         "mentions, run bc-epoch sync-all as his delegate (never a cut), and put every decision that is his to him "
+         "with the question UI, each with your own recommendation. Report in a short summary." % path)
+    print(path)
+
+
+if __name__ == "__main__":
+    main()
