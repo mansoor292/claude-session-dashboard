@@ -13,12 +13,18 @@ beyond `git fetch`.
   daily-review              full report -> ~/.claude/daily-review/<date>.md, then tell _dashboard
   daily-review --hourly     only: mentions unanswered > 1h; speaks only when the list changes
   daily-review --print      full report to stdout, tell nobody
+  daily-review --no-reply <comment id> [why]
+                            mark one mention as needing no reply; it stops being listed.
+                            The mark is on that comment only: a later mention on the same
+                            thread is listed as usual. A person's or the head session's
+                            judgment, never automatic (Mansoor 2026-11-19).
 """
 import datetime, glob, json, os, re, subprocess, sys, time
 
 HOME = os.path.expanduser("~")
 OUT = os.path.join(HOME, ".claude/daily-review")
 STATE = os.path.join(OUT, "state.json")
+NOREPLY = os.path.join(OUT, "no-reply.json")
 TMUX = "/usr/bin/tmux"
 THANKS = re.compile(r"^\W*(perfect|great|sweet|ok(ay)?|got it|understood|thank(s| you)|appreciate)[^?]{0,80}$", re.I)
 OURS = re.compile(r"\(us\)|^(AI|CatalogsAI)\b")
@@ -80,6 +86,8 @@ def unanswered(own, min_hours=1.0, max_days=30):
     """Threads whose latest @mention of the agent has no later entry of ours."""
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     rows = []
+    try: noreply = json.load(open(NOREPLY))
+    except Exception: noreply = {}
     for tid, (sess, st, title) in own.items():
         p = os.path.join(HOME, ".claude/bc-transcripts/%s.md" % tid)
         try: s = open(p).read()
@@ -90,6 +98,7 @@ def unanswered(own, min_hours=1.0, max_days=30):
             if not OURS.search(who) and re.search(r"@(AI|CatalogsAI)\b", body): last = i
         if last is None or any(OURS.search(e[1]) for e in ents[last + 1:]): continue
         cid, who, ts, body = ents[last]
+        if cid in noreply: continue
         text = " ".join(re.sub(r"<[^>]+>", " ", body).split())
         if THANKS.match(re.sub(r"@(AI|CatalogsAI)\b", "", text).strip()): continue
         age = (now - datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M")).total_seconds() / 3600
@@ -123,8 +132,18 @@ def tell(line):
     subprocess.run([TMUX, "-L", sock, "send-keys", "-t", "_dashboard", "Enter"])
 
 
+def mark_no_reply(args):
+    if not args or not args[0].isdigit(): sys.exit("usage: daily-review --no-reply <comment id> [why]")
+    try: d = json.load(open(NOREPLY))
+    except Exception: d = {}
+    d[args[0]] = {"why": " ".join(args[1:]), "at": time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime())}
+    json.dump(d, open(NOREPLY, "w"), indent=1)
+    print("no reply needed: comment %s" % args[0])
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
+    if "--no-reply" in sys.argv: return mark_no_reply(sys.argv[sys.argv.index("--no-reply") + 1:])
     try: state = json.load(open(STATE))
     except Exception: state = {}
     sh(["bc-threads", "sync"], 600)
